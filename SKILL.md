@@ -771,6 +771,14 @@ Two consequences worth acting on:
   rather than the first. Every binding names its own escape hatch; whichever it is, **prove access
   with a cheap read before relying on this workflow** — an analyst that cannot file its issue has
   done the work and lost it.
+- **The board serializes claims, not machine resources.** Two runs holding two different issues are
+  each doing exactly what the workflow asks — and when they share one machine, their heavy phases
+  share its RAM and CPU, which no tracker can see. Three habits soften it: say in a heartbeat when
+  you enter a machine-heavy phase; skim the other in-progress heartbeats before launching your own;
+  and when a collision kills a run anyway, **re-run the work alone before reading anything into the
+  failure** — a death by contention is coordination friction, not evidence about the change. It has
+  happened live: a parallel A/B died of OOM against another run's measurement phase, and the
+  sequential re-run passed clean.
 - **This skill moves tasks; it does not judge them.** Whether something is worth doing was decided
   by the domain rules the ANALYST ran under, and is recorded in the issue. A dev running standalone
   inherits that judgement rather than re-making it — which is precisely why it needs no domain of
