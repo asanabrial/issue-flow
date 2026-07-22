@@ -13,7 +13,7 @@ Read this alongside `SKILL.md` when the operator configuration names `linear` as
 | A single-valued **state** per item | ✓ — native workflow states, one per issue | "exactly one state" is **enforced by the tracker**, not by discipline. `transition` cannot leave an ambiguous item |
 | A **claim** applied server-side | ⚠️ — `assignee` is **singular**; `assigneeId` overwrites | **last write wins.** Re-reading the assignee does NOT detect a lost race — see *The claim hazard* below |
 | **Last activity**, timestamped by the server | ✓ — `updatedAt`, plus per-comment timestamps | the stale-claim rule works as written |
-| A stable, short **identity** | ✓ — `<team key>-<number>`, e.g. `ENG-123` | usable verbatim in branch and worktree names |
+| A stable, short **identity** | ✓ — `<team key>-<number>`, e.g. `ENG-123` | usable verbatim in branch and worktree names — and a branch carrying the identifier is what Linear's GitHub integration auto-links to the issue, so the naming rule IS the branch link |
 | **Comments**, append-only and ordered | ✓ | heartbeats, blockers and hand-offs land here — and they are what makes claiming auditable |
 | A native **priority** | ✓ — integer `0`–`4` (0 none, 1 urgent, 4 low) | but the DOMAIN owns the scale, so the label stays the source of truth; mirror into the native field only for human sorting |
 

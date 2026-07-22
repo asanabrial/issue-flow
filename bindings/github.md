@@ -84,6 +84,15 @@ ones.
 | `unassign` | `gh issue edit <n> --remove-assignee @me --remove-label "dev:<runtime>"` — one call, both halves |
 | `close` | `transition` to `done` **first**, then `gh issue close <n> --comment "<what was verified>"` — the label is what the board and every query read; closing is GitHub's own bookkeeping |
 
+**Link the branch to the issue the moment it exists.** GitHub has a native way that also happens to
+fit this workflow's git flow exactly: `gh issue develop <n> --name <branch> --base <base>` creates
+the branch **server-side, from the fresh base, already linked** in the issue's Development sidebar —
+then `git fetch origin <branch>` and build the worktree from it. One command replaces branch
+creation AND recording. Where the branch already exists locally, push it and comment
+`Branch: <name>` instead — prose is the fallback, the sidebar is the record. And the closing comment
+names the delivering commit SHA: branches get deleted after merge, and the SHA is the join that
+survives deletion.
+
 **`transition` must add and remove in the same invocation.** Two calls leave a window in which the
 issue carries two states, and any run reading the board during that window sees an ambiguous item.
 **Then re-read the labels**: exactly one `status:*` must remain. Two means the removal failed or

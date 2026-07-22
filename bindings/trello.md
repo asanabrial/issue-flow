@@ -106,6 +106,12 @@ Two conveniences worth knowing, because they remove the read-modify-write dance 
 others, and adding a member does not evict whoever was there — which records a race when agents are
 distinct members, and either way keeps `unassign` from trampling anyone.
 
+## Recording the branch
+
+Trello has no development sidebar: the branch is recorded as a comment the moment it exists
+(`Branch: <name>`), and the closing comment names the delivering commit SHA — the card outlives the
+branch, so the SHA is the join that survives.
+
 ## Reading comments
 
 Comments are card *actions*, not a first-class collection:
