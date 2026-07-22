@@ -3,7 +3,7 @@ name: issue-flow
 description: "Trigger — Claude Code: /issue-flow analyst <domain> | /issue-flow dev. Codex: $issue-flow analyst <domain> | $issue-flow dev (Codex uses $, never /). Also: analyst, developer, move tasks between states, file an analysis issue, pick up a ready issue, claim an issue. Global two-role workflow over a shared issue tracker (GitHub, Linear or Trello): an ANALYST that only analyses and files a specified issue (never touches code), and a DEV that claims a ready issue and implements it. Domain-agnostic: an ANALYST over the whole project must be composed with domain rules that define what to analyse (over a bounded target such as a diff or PR review it needs none); the DEV runs standalone, since the issue already carries its scope, and takes domain rules only when a project has extra requirements for what counts as done."
 metadata:
   author: asanabrial
-  version: "1.0"
+  version: "1.1.0"
 ---
 
 # Issue Flow — Analyst / Dev over a shared issue tracker
