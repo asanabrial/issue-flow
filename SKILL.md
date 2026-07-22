@@ -225,10 +225,17 @@ So the routing is **data, not inference**. The analyst records the domain on the
 - a label `domain:<name>` — queryable, and lets a dev filter to work it is equipped for;
 - a line in the metadata block: `domain: <analysis-rules> → <implementation-rules>`.
 
-The dev **reads that field and loads the named rule book** before starting. If the field is absent
-(a legacy issue, or one filed by hand), do not guess silently: say which rules you are proceeding
-under — including "none, building to the acceptance criteria as written" — so the choice is on the
-record and reviewable.
+**The arrow has sides, and the sides are not interchangeable.** The analyst loads the LEFT-hand
+book; the dev loads the RIGHT-hand one. An analysis rule book defines what is worth *filing* — its
+priorities and its evidence bar — not what makes an implementation *done*; a dev that loads it has
+not made a smaller mistake than loading nothing, it has adopted the wrong job's rules while
+believing itself covered. When the line carries only one name, that name is the book the analysis
+ran under: the dev does NOT load it. It proceeds as if the field were absent, and says so.
+
+If the field is absent entirely (a legacy issue, or one filed by hand), do not guess silently: say
+which rules you are proceeding under — including "none, building to the acceptance criteria as
+written" — so the choice is on the record and reviewable. **The `domain:<name>` label alone is not
+routing**: it is a query key, and nothing guarantees the name matches any loadable rule book.
 
 A project with a single domain can leave this implicit; a repo where several independent subsystems all file into one
 board cannot, and that is the case worth designing for.
