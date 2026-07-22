@@ -19,19 +19,18 @@ finds, and — run again later — **upgrades in place while preserving your con
 
 ```sh
 # macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/asanabrial/issue-flow/main/scripts/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.sh | sh
 ```
 
 ```powershell
 # Windows
-irm https://raw.githubusercontent.com/asanabrial/issue-flow/main/scripts/bootstrap.ps1 | iex
+irm https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.ps1 | iex
 ```
 
-**What actually runs out of the pipe is a ~50-line bootstrap you can read at that URL.** It checks
-for git, clones, and hands over to the installer *from disk* — nothing of substance executes that is
-not on your machine first, and the settings that remove confirmation steps only ever hold the values
-you put there yourself. Prefer to see everything before anything runs? The bootstrap is just this,
-by hand:
+**The piped script is the installer itself**, and the first thing it does with no skill beside it is
+clone the repository and hand over to its on-disk copy — so everything of substance executes from
+files on your machine, and the settings that remove confirmation steps only ever hold the values you
+put there yourself. Prefer to see everything before anything runs? Same result by hand:
 
 ```sh
 git clone https://github.com/asanabrial/issue-flow ~/.agents/skills/issue-flow

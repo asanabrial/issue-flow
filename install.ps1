@@ -20,9 +20,9 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Position = 0, Mandatory = $true)]
+    [Parameter(Position = 0)]
     [ValidateSet('install', 'sync', 'uninstall', 'status', 'config')]
-    [string]$Command,
+    [string]$Command = 'install',
 
     [string]$From,
 
@@ -41,6 +41,48 @@ $EndMark   = '<!-- issue-flow:config:end -->'
 
 # The skill's real home is wherever this script sits.
 $Canonical = $PSScriptRoot
+
+# Piped (`irm | iex`) there is no script location at all; run from elsewhere, no skill next to it.
+# Either way the installer acquires itself - clone on first contact, upgrade after - and hands over
+# to the on-disk copy, so everything of substance always executes from files you can read. All file
+# shuffling uses Copy-Item and git itself, never PowerShell redirection, which on Windows
+# PowerShell 5.1 re-encodes text (UTF-16, BOMs) and corrupts what it touches.
+if (-not $Canonical -or -not (Test-Path (Join-Path $Canonical 'SKILL.md'))) {
+    $Repo = 'https://github.com/asanabrial/issue-flow.git'
+    $Dest = Join-Path $HOME '.agents\skills\issue-flow'
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        throw 'git is required - install it (winget install Git.Git) and re-run.'
+    }
+    if ((Test-Path $Dest) -and -not (Test-Path (Join-Path $Dest '.git'))) {
+        throw "$Dest exists and is not a git clone - move it aside and re-run."
+    }
+    if (-not (Test-Path $Dest)) {
+        Write-Host "installing into $Dest"
+        git clone -q --depth 1 $Repo $Dest
+        # The operator edits the config block inside SKILL.md; skip-worktree marks it
+        # local-on-purpose so status stays clean and pulls never clobber the settings.
+        git -C $Dest update-index --skip-worktree SKILL.md 2>$null
+    } else {
+        Write-Host "upgrading $Dest"
+        $Up = Join-Path $env:TEMP ("issue-flow-" + [guid]::NewGuid().ToString('n').Substring(0, 8))
+        New-Item -ItemType Directory -Path $Up | Out-Null
+        try {
+            Copy-Item (Join-Path $Dest 'SKILL.md') (Join-Path $Up 'local.md')
+            git -C $Dest fetch -q origin
+            git -C $Dest update-index --no-skip-worktree SKILL.md 2>$null
+            git -C $Dest checkout -q origin/main -- .
+            git -C $Dest reset -q origin/main
+            Copy-Item (Join-Path $Dest 'SKILL.md') (Join-Path $Up 'upstream.md')
+            Copy-Item (Join-Path $Up 'local.md') (Join-Path $Dest 'SKILL.md')
+            & (Join-Path $Dest 'install.ps1') sync -From (Join-Path $Up 'upstream.md')
+            git -C $Dest update-index --skip-worktree SKILL.md 2>$null
+        } finally {
+            Remove-Item -Recurse -Force $Up -ErrorAction SilentlyContinue
+        }
+    }
+    & (Join-Path $Dest 'install.ps1') $Command
+    return
+}
 
 # Per-runtime skill directories that must point at the canonical one. `.agents/skills/` is
 # the cross-runtime convention; Claude Code does NOT read it (anthropics/claude-code#31005),

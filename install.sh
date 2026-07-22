@@ -9,6 +9,7 @@
 #
 # Mirror of install.ps1. Keep the two in step: they share the marker contract, not code.
 #
+#   curl -fsSL https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.sh | sh
 #   ./install.sh status
 #   ./install.sh install [--dry-run]
 #   ./install.sh sync --from <path/to/newer/SKILL.md> [--dry-run]
@@ -23,7 +24,45 @@ START='<!-- issue-flow:config:start -->'
 END='<!-- issue-flow:config:end -->'
 
 # The skill's real home is wherever this script sits.
-CANONICAL=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+CANONICAL=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || CANONICAL=''
+
+# Piped (`curl | sh`) or run from outside a checkout, there is no skill next to this script.
+# Then the installer acquires itself - clone on first contact, upgrade after - and hands over to
+# the on-disk copy, so everything of substance always executes from files you can read.
+if [ ! -f "$CANONICAL/SKILL.md" ] || [ ! -f "$CANONICAL/install.sh" ]; then
+    REPO='https://github.com/asanabrial/issue-flow.git'
+    DEST="$HOME/.agents/skills/issue-flow"
+    command -v git >/dev/null 2>&1 || {
+        printf 'error: git is required - install it and re-run.
+' >&2; exit 1; }
+    if [ -e "$DEST" ] && [ ! -e "$DEST/.git" ]; then
+        printf 'error: %s exists and is not a git clone - move it aside and re-run.
+' "$DEST" >&2
+        exit 1
+    fi
+    if [ ! -e "$DEST" ]; then
+        printf 'installing into %s
+' "$DEST"
+        git clone -q --depth 1 "$REPO" "$DEST"
+        # The operator edits the config block inside SKILL.md; skip-worktree marks it
+        # local-on-purpose so status stays clean and pulls never clobber the settings.
+        git -C "$DEST" update-index --skip-worktree SKILL.md 2>/dev/null || true
+    else
+        printf 'upgrading %s
+' "$DEST"
+        UP=$(mktemp -d); trap 'rm -rf -- "$UP"' EXIT
+        cp "$DEST/SKILL.md" "$UP/local.md"                    # settings-bearing copy, byte-exact
+        git -C "$DEST" fetch -q origin
+        git -C "$DEST" update-index --no-skip-worktree SKILL.md 2>/dev/null || true
+        git -C "$DEST" checkout -q origin/main -- .
+        git -C "$DEST" reset -q origin/main
+        cp "$DEST/SKILL.md" "$UP/upstream.md"                 # upstream's SKILL.md, byte-exact
+        cp "$UP/local.md" "$DEST/SKILL.md"                    # local back...
+        sh "$DEST/install.sh" sync --from "$UP/upstream.md"   # ...merge: new prose, old settings
+        git -C "$DEST" update-index --skip-worktree SKILL.md 2>/dev/null || true
+    fi
+    exec sh "$DEST/install.sh" "${1:-install}"
+fi
 
 # Per-runtime skill directories that must point at the canonical one. `.agents/skills/` is the
 # cross-runtime convention; Claude Code does NOT read it (anthropics/claude-code#31005), so for that
@@ -262,8 +301,8 @@ cmd_status() {
 
 # --- entry --------------------------------------------------------------------------------------
 
-[ $# -ge 1 ] || die 'usage: install.sh install|sync|uninstall|status|config [--from <path>] [--set <k=v>] [--dry-run]'
-COMMAND=$1; shift
+COMMAND=${1:-install}
+[ $# -gt 0 ] && shift
 
 while [ $# -gt 0 ]; do
     case "$1" in
