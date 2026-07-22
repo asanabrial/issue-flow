@@ -14,23 +14,29 @@ commands live in its own binding file.
 
 ## Install
 
-The skill is a directory — a workflow, three bindings, an example and the installers — so getting it
-is a clone, not a download:
+One line. It clones the skill into `~/.agents/skills/issue-flow`, links it into each runtime it
+finds, and — run again later — **upgrades in place while preserving your configuration block**:
+
+```sh
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/asanabrial/issue-flow/main/scripts/bootstrap.sh | sh
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/asanabrial/issue-flow/main/scripts/bootstrap.ps1 | iex
+```
+
+**What actually runs out of the pipe is a ~50-line bootstrap you can read at that URL.** It checks
+for git, clones, and hands over to the installer *from disk* — nothing of substance executes that is
+not on your machine first, and the settings that remove confirmation steps only ever hold the values
+you put there yourself. Prefer to see everything before anything runs? The bootstrap is just this,
+by hand:
 
 ```sh
 git clone https://github.com/asanabrial/issue-flow ~/.agents/skills/issue-flow
 ~/.agents/skills/issue-flow/install.sh install
 ```
-
-```powershell
-git clone https://github.com/asanabrial/issue-flow "$HOME\.agents\skills\issue-flow"
-& "$HOME\.agents\skills\issue-flow\install.ps1" install
-```
-
-**There is deliberately no `curl | sh` or `irm | iex` one-liner.** Piping a remote script straight
-into a shell runs code you have not read, and this skill ships a setting that can authorise an agent
-to push without asking — that is precisely the kind of thing you want to have read first. A clone
-costs one extra line and leaves the files on disk where you can inspect them before anything runs.
 
 The skill lives in `~/.agents/skills/issue-flow/` and the installer links it into each runtime's
 skill directory (`~/.claude/skills/`, `~/.codex/skills/`). Run `status` to see what is linked, and
