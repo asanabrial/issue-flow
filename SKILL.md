@@ -417,8 +417,10 @@ Picks up analysed work and implements it.
    One filed finding turns a recurring tax into a decision someone can make once.
 7. **`close` on merge** — which moves the state to `done` and then, on trackers that have one, sets
    their own closed flag. Carry your run identity in the closing comment and state what was actually
-   verified: measured numbers, tests run. Never just the word "done"; the state already says that,
-   and the comment exists to say what it cost to earn it.
+   verified: measured numbers, tests run, **and the delivering commit SHA** — branches get deleted
+   after merge, and the SHA is the join between code and issue that survives the deletion. Never
+   just the word "done"; the state already says that, and the comment exists to say what it cost to
+   earn it.
 
 ### Working in a repository — the default flow
 
@@ -463,6 +465,10 @@ the moment two repositories both have a `fix/login`, and the second `worktree ad
 message about a path that already exists, naming neither repository. Put the repository's name in the
 path. Some tooling adds a third constraint — a per-worktree index or cache that must not be shared —
 so check what your setup expects before settling on a pattern.
+
+**Record the branch on the issue the moment it exists** — natively where the tracker supports it,
+as a comment where it does not; the binding says which. A branch nobody can find from the issue is
+work nobody can follow, and the board's whole value is that following work never requires guessing.
 
 **Name the branch and the worktree after the ISSUE, not after the run.** The issue number is what
 joins the code back to the board without anyone parsing prose, and it survives a run that the
