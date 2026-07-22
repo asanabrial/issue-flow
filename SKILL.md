@@ -783,6 +783,7 @@ two rows below remove confirmation steps.
 | Merge strategy | merge | merge |
 | Worktree location | unset | unset |
 | Tracker | `github` → `bindings/github.md` | `github` (also `linear`, `trello`) |
+| Project board | none | none |
 
 **Delivery pre-authorisation, stated precisely**, because it is the one that removes a safety step: a
 dev whose work has met the issue's acceptance criteria and cleared the project's gates **merges and
