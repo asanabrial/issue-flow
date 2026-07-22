@@ -86,6 +86,9 @@ ones.
 
 **`transition` must add and remove in the same invocation.** Two calls leave a window in which the
 issue carries two states, and any run reading the board during that window sees an ambiguous item.
+**Then re-read the labels**: exactly one `status:*` must remain. Two means the removal failed or
+another run interleaved — fix it on the spot, because a two-state item poisons every query that
+touches either state, and it has happened in live use.
 
 ## Setup
 
@@ -150,9 +153,16 @@ two: project items are references, so title, state, labels and assignees are alw
 custom field lives on the project item and no label touches it. Left alone, a board shows whatever
 someone set by hand the day they set it.
 
-**This applies only to issues that are actually on a board.** An issue with no project item has
-nothing to mirror and needs no extra step — the label is the whole state, and that is the normal
-case. Check first, and skip silently when there is no item; never treat its absence as a failure.
+**Whether to mirror at all is read from the operator configuration, not guessed.** The `Project
+board` row names `owner/number` or `none`. `none` means no board anywhere: skip this section
+entirely. A named board means **a `transition` is not finished until the mirror was attempted** —
+attempted, not necessarily succeeded: an issue not yet on the board, or a missing column, is skipped
+quietly, because the label already carries the truth. What is not acceptable is not trying: every
+skipped attempt is how the board was found lying five states behind the labels.
+
+Resolve the project, field and option ids **once per run** and reuse them for every transition in
+that run — they are stable within a session, and per-transition discovery is the overhead that
+tempts a run to skip the mirror.
 
 **The mirror is part of `transition`, done by the same run that moves the label.** No server-side
 machinery: when this workflow changes a `status:*` label on an issue that has a project item, it
