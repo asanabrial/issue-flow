@@ -154,6 +154,12 @@ someone set by hand the day they set it.
 nothing to mirror and needs no extra step — the label is the whole state, and that is the normal
 case. Check first, and skip silently when there is no item; never treat its absence as a failure.
 
+**The mirror is part of `transition`, done by the same run that moves the label.** No server-side
+machinery: when this workflow changes a `status:*` label on an issue that has a project item, it
+moves the board field in the same step. That costs the agent's token the `project` scope — `gh issue`
+alone never needs it — so prove it once with `gh project list --owner <owner>` before relying on the
+mirror, and where the scope is missing, fall back to label-only exactly as rule 1 below prescribes.
+
 ### Why a mirror is needed at all
 
 **The constraints below were verified against the GitHub API in July 2026** — they are product
@@ -172,119 +178,18 @@ So a board needs the built-in `Status` field, reshaped to mirror your states wit
 `updateProjectV2Field` — one option per state, each option's description naming the label it mirrors.
 Then the board reads like the workflow, and only the syncing is left.
 
-**Prefer the repository Action below.** An agent-side mirror is one more step an agent can skip,
-which is precisely how a board goes stale while the work stays correct, and it costs every agent the
-`project` scope that `gh issue` does not need. The Action runs server-side on every label change,
-cannot be forgotten, and keeps agent tokens scoped to Issues.
+### How the mirror runs
 
-```yaml
-# .github/workflows/mirror-status.yml
-name: Mirror status label to the board
-on:
-  issues:
-    types: [labeled, unlabeled]
 
-jobs:
-  mirror:
-    runs-on: ubuntu-latest
-    steps:
-      - env:
-          # A PAT with `project` scope. GITHUB_TOKEN cannot write Projects v2.
-          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
-          OWNER: ${{ github.repository_owner }}
-          PROJECT_NUMBER: '1'          # your project number
-          ISSUE: ${{ github.event.issue.number }}
-        run: |
-          set -euo pipefail
+Two quiet failure modes worth knowing: for an **organisation-owned** project, `user(login:)` must
+become `organization(login:)` — the query returns null rather than erroring, so the mirror silently
+never fires; and `items(first:100)` stops finding issues once the board passes a hundred items —
+paginate before it grows into that.
 
-          # The state is whichever status:* label is on the issue now. None -> nothing to mirror.
-          STATE=$(gh issue view "$ISSUE" --json labels \
-            --jq '[.labels[].name | select(startswith("status:"))] | first // empty')
-          [ -n "$STATE" ] || { echo "no status label; nothing to mirror"; exit 0; }
-
-          # Board columns are prose ("In Progress"); label values are slugs ("in-progress").
-          NAME=$(printf '%s' "${STATE#status:}" | tr '-' ' ' | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) substr($i,2)}1')
-
-          read -r PROJ_ID FIELD_ID < <(gh api graphql -f query='
-            query($owner:String!, $number:Int!) {
-              user(login:$owner) { projectV2(number:$number) { id
-                field(name:"Status") { ... on ProjectV2SingleSelectField { id } } } } }' \
-            -f owner="$OWNER" -F number="$PROJECT_NUMBER" \
-            --jq '.data.user.projectV2 | "\(.id) \(.field.id)"')
-
-          OPT_ID=$(gh api graphql -f query='
-            query($owner:String!, $number:Int!) {
-              user(login:$owner) { projectV2(number:$number) {
-                field(name:"Status") { ... on ProjectV2SingleSelectField { options { id name } } } } } }' \
-            -f owner="$OWNER" -F number="$PROJECT_NUMBER" \
-            --jq --arg n "$NAME" '.data.user.projectV2.field.options[] | select(.name==$n) | .id')
-
-          ITEM_ID=$(gh api graphql -f query='
-            query($owner:String!, $number:Int!) {
-              user(login:$owner) { projectV2(number:$number) { items(first:100) { nodes { id
-                content { ... on Issue { number } } } } } } }' \
-            -f owner="$OWNER" -F number="$PROJECT_NUMBER" \
-            --jq --argjson i "$ISSUE" '.data.user.projectV2.items.nodes[] | select(.content.number==$i) | .id')
-
-          # No item means this issue is not on the board: nothing to mirror, and that is fine.
-          # No option means the board has no column for this state: say so, do not fail the run.
-          # Either way the label already carries the truth.
-          [ -n "$ITEM_ID" ] || { echo "issue $ISSUE is not on the board; nothing to mirror"; exit 0; }
-          [ -n "$OPT_ID" ]  || { echo "board has no column named '$NAME'"; exit 0; }
-
-          gh project item-edit --project-id "$PROJ_ID" --id "$ITEM_ID" \
-            --field-id "$FIELD_ID" --single-select-option-id "$OPT_ID"
-```
-
-Three adjustments before it works, and each one fails **quietly** if you miss it:
-
-- **`user(login:)` becomes `organization(login:)`** for an organisation-owned project. The query
-  returns null rather than an error, so the mirror simply never fires and nothing tells you.
-- **`items(first:100)`** stops finding issues once the board passes a hundred items. Paginate, or
-  filter server-side, before the board grows into that.
-- **The column names must match.** The script title-cases the label slug, so `status:in-progress`
-  looks for a column called `In Progress`. Rename one side until they agree.
-
-### If you mirror from the agent instead
-
-Only where no Action is possible. Every agent then needs the `project` scope, and these rules stop a
-cosmetic failure from breaking real work.
-
-**Mirror every `status:*` change onto the field in the same step that changes the label**, and only
-for issues that have a project item. Three rules make this safe:
-
-1. **The label goes FIRST and the mirror is BEST-EFFORT.** The label is the state; the field is a
-   picture of it. If the mirror fails — no `project` scope, no board, the item not added yet — say
-   so and carry on. **Never abort the work because a picture did not update**, and never revert a
-   correct label because its mirror failed.
-2. **Discover the IDs; never hardcode them.** Project number, field ID and option IDs differ per
-   project and change when someone edits the field. Look them up each run.
-3. **Tolerate the auto-add lag.** A freshly filed issue reaches the board asynchronously, so the
-   item may not exist yet when you try to set its field. That is normal: skip the mirror, note it,
-   move on — the next transition will correct it.
-
-```bash
-# $1 owner  $2 project-number  $3 issue-number  $4 state (e.g. Ready, "In Progress")
-read -r PROJ_ID FIELD_ID < <(gh api graphql -f query="
-  query { user(login:\"$1\"){ projectV2(number:$2){ id
-    field(name:\"Status\"){ ... on ProjectV2SingleSelectField { id } } } } }"   --jq '.data.user.projectV2 | "\(.id) \(.field.id)"')
-
-OPT_ID=$(gh api graphql -f query="
-  query { user(login:\"$1\"){ projectV2(number:$2){
-    field(name:\"Status\"){ ... on ProjectV2SingleSelectField { options { id name } } } } } }"   --jq ".data.user.projectV2.field.options[] | select(.name==\"$4\") | .id")
-
-ITEM_ID=$(gh api graphql -f query="
-  query { user(login:\"$1\"){ projectV2(number:$2){ items(first:100){ nodes{ id
-    content{ ... on Issue { number } } } } } } }"   --jq ".data.user.projectV2.items.nodes[] | select(.content.number==$3) | .id")
-
-# Empty OPT_ID or ITEM_ID -> skip quietly; the label already carries the truth.
-gh project item-edit --project-id "$PROJ_ID" --id "$ITEM_ID"   --field-id "$FIELD_ID" --single-select-option-id "$OPT_ID"
-```
-
-**This costs every agent the `project` scope**, which `gh issue` alone does not need. If you would
-rather keep tokens down to Issues, do the same mirroring in a repository Action on
-`issues.labeled`/`unlabeled`: identical result, server-side, zero extra permission on any agent.
-Pick one — running both just means two things to debug when the board lags.
+**If your agents cannot hold the `project` scope**, the same mirroring can run server-side in a
+repository Action on `issues.labeled`/`unlabeled` — it needs a PAT stored as a secret, because the
+automatic `GITHUB_TOKEN` cannot write Projects v2. One or the other, never both: two mirrors is two
+things to debug when the board lags.
 
 **Whatever you do, the labels stay authoritative.** They are what agents read and write; the board
 is a view. Invert that and every agent needs the `project` scope and the workflow's transport has to
