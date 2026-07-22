@@ -155,9 +155,12 @@ someone set by hand the day they set it.
 
 **Whether to mirror at all is read from the operator configuration, not guessed.** The `Project
 board` row names `owner/number` or `none`. `none` means no board anywhere: skip this section
-entirely. A named board means **a `transition` is not finished until the mirror was attempted** —
+entirely. A named board means **an operation that sets a state — `create` as much as `transition` — is not
+finished until the mirror was attempted** —
 attempted, not necessarily succeeded: an issue not yet on the board, or a missing column, is skipped
-quietly, because the label already carries the truth. What is not acceptable is not trying: every
+quietly, because the label already carries the truth. `create` is the case everyone forgets: a fresh
+issue reaches the board through auto-add with its Status empty, and no transition ever follows to
+correct it — the analyst that filed it sets the initial column, or the item sits in no column at all. What is not acceptable is not trying: every
 skipped attempt is how the board was found lying five states behind the labels.
 
 Resolve the project, field and option ids **once per run** and reuse them for every transition in
