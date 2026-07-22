@@ -84,6 +84,16 @@ ones.
 | `unassign` | `gh issue edit <n> --remove-assignee @me --remove-label "dev:<runtime>"` — one call, both halves |
 | `close` | `transition` to `done` **first**, then `gh issue close <n> --comment "<what was verified>"` — the label is what the board and every query read; closing is GitHub's own bookkeeping |
 
+**Closing keywords bypass the state machine — do not use them.** A commit or PR whose message says
+`closes #34` or `fixes #34` makes GITHUB close the issue the moment it reaches the default branch:
+no transition to `done`, no mirror, labels frozen wherever they were. The board then shows an open
+column for a closed issue, and it was not any run's doing — it was the tracker's own automation
+acting outside the workflow. Reference issues plainly (`#34` links without closing) and close
+through the workflow's `close`, which moves the state first. If a closing keyword slips through
+anyway, run `transition` to `done` afterwards — the auto-close is not the workflow's close, and the
+state machine does not know it happened. Seen live: an issue closed by its delivery commit sat
+CLOSED wearing `status:ready` until an audit caught it.
+
 **Link the branch to the issue the moment it exists.** GitHub has a native way that also happens to
 fit this workflow's git flow exactly: `gh issue develop <n> --name <branch> --base <base>` creates
 the branch **server-side, from the fresh base, already linked** in the issue's Development sidebar —
