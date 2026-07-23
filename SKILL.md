@@ -136,6 +136,7 @@ this file. Load that one file and ignore the rest; no command for any tracker ap
 | `create` | file a new item in `ready` (or `blocked`) carrying the analyst's body **and every marker the finding supplies** — priority, domain and attribution, not just the state |
 | `list_state` | list unclaimed items in a given state, highest priority first — both roles have a queue to drain |
 | `claim` | take the item server-side, then **verify you actually hold it** by the means the binding names |
+| `verify_claim` | re-read the authoritative control surface for an item you hold and answer two questions: am I still its holder, and has anything been said to this run-id since my claim? — what every heartbeat and every irreversible step checks **before** it writes |
 | `transition` | move to exactly one state, dropping the previous one in the same call |
 | `comment` | append a note the server timestamps |
 | `last_activity` | when the item was last touched — what the stale-claim rule reads |
@@ -405,7 +406,10 @@ Picks up analysed work and implements it.
    a measurement discipline, required benchmarks, ship gates — but never replace them, and their
    absence is not licence to lower the bar the analyst set.
 5. **Get the change reviewed by a context that did not write it**, then **move to `review`**,
-   linking the branch or PR. Where the configuration authorises it, obtain that context yourself — a
+   linking the branch or PR. Renew the claim first — launching a review is one of the boundaries
+   `verify_claim` covers (*A heartbeat is a claim renewal* below), and a run that was displaced
+   during a long build should find out before spending a reviewer, not after. Where the
+   configuration authorises it, obtain that context yourself — a
    sub-agent or a teammate; where it does not, hand the diff to a separately started analyst run and
    say on the issue that you are waiting for it. What the configuration decides is who starts the
    review, never whether it runs.
@@ -423,7 +427,8 @@ Picks up analysed work and implements it.
    It will hit the next task, and the one after that, and each run will re-diagnose it from scratch.
    One filed finding turns a recurring tax into a decision someone can make once.
 7. **`close` on merge** — which moves the state to `done` and then, on trackers that have one, sets
-   their own closed flag. Carry your run identity in the closing comment and state what was actually
+   their own closed flag. Delivery is the last `verify_claim` boundary: renew before you merge, not
+   after. Carry your run identity in the closing comment and state what was actually
    verified: measured numbers, tests run, **and the delivering commit SHA** — branches get deleted
    after merge, and the SHA is the join between code and issue that survives the deletion. Never
    just the word "done"; the state already says that, and the comment exists to say what it cost to
@@ -558,7 +563,42 @@ already timestamps: no daemon, no lock service, nothing to run.
   it turns "no activity" from a judgement call into a comparison.
 - **Comment on progress, not only on completion.** From outside, a dev that has gone quiet for an
   hour and a dev that died look identical. Each comment is a heartbeat carrying a server-side
-  timestamp; that is the entire mechanism.
+  timestamp; that is the liveness half of the mechanism. The other half is the read that precedes
+  the write — see below.
+
+**A heartbeat is a claim renewal: read before you write.** The claim check in step 2 runs once, but
+the control surface it read stays authoritative for the whole build — a late adjudication, a reclaim,
+a stand-down all arrive there while you work. A heartbeat that only writes is deaf to the one channel
+that can revoke the claim. This happened live: on issue #27 a run that had lost the race by five
+seconds was told so in an adjudication comment 33 seconds later, and then posted three more
+heartbeats and worked another ~48 minutes because nothing in its heartbeat loop ever read the
+timeline again. So **every heartbeat runs `verify_claim` first and is written only when the answer is
+"still holder, nothing said"**. The same renewal runs immediately before any expensive or
+irreversible boundary that can fall between heartbeats — starting an evaluation, launching a review,
+delivering — so a long quiet phase cannot bypass it. Two answers mean stop, not retry:
+
+- **A control message naming your run-id** — a stand-down, a reclaim, an adjudication. Stop
+  repository work immediately. If the issue is still open, leave ONE acknowledgement so the record
+  shows the message was received, and release your `dev:<runtime>` marker — it is per-runtime and
+  yours to drop. The assignee is different: where the tracker attributes it to a shared account the
+  winner holds it too, so the binding decides whether it comes off (on all three current bindings it
+  stays — each one's account is shared or singular); follow it rather than assuming. Do not alter the
+  workflow state and do not write a second claim comment — the race record is not yours to edit.
+- **The item is closed, or no longer carries the state you are working under.** Someone else
+  finished or moved it. Stop, release your marker exactly as above, and change nothing about the
+  state — it belongs to whoever moved it.
+
+Renewal does not pretend the control surface is a lock, and it does not try to. It caps the cost of
+losing a race — or being legitimately displaced — at one renewal interval, and it makes "the original
+holder reads your comment and backs off" in *Reclaiming is not a race won* something that actually
+happens rather than something the prose hopes for.
+
+**A failed read is not a failed answer.** If the renewal's read itself fails — network, auth, rate
+limit — the control surface answered nothing, and "nothing" is not a stand-down. Fail closed on the
+write: post no heartbeat, start no evaluation, launch no review, deliver nothing — and retry the
+read. Only a stop answer from a *successful* read ends the work. Treating a timeout as a stand-down
+lets a flaky network halt every run; treating it as clearance lets a run write deaf, which is the
+defect this rule exists to close.
 
 **Reclaiming.** An issue is reclaimable when it is `in-progress` **and** its last activity —
 any comment, label change or referenced commit — is past the declared horizon, or more than a few
@@ -572,8 +612,8 @@ hours old when no horizon was declared. Then:
 3. **Do not discard its work.** A pushed branch, a commented diagnosis, a ruled-out hypothesis are
    all still valid — which is precisely why everything goes on the issue as it happens.
 
-**Reclaiming is not a race won.** If the original holder was alive and merely slow, it finds itself
-unassigned and reads your comment — which is why the comment names who you took it from. It then
+**Reclaiming is not a race won.** If the original holder was alive and merely slow, its next
+`verify_claim` surfaces your comment — which is why the comment names who you took it from. It then
 backs off exactly like the loser of a claim race in step 2. Either way no work is lost, and the
 worst case is one duplicated hour rather than an issue that is stuck forever.
 

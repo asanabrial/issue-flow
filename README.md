@@ -135,7 +135,9 @@ Different runtimes can share one board: attribution labels record which runtime 
 **What happens when two agents claim the same issue at the same time?**
 Both write a claim comment as part of claiming, then read the timeline: the earliest
 server-timestamped claim wins and the loser backs off with a comment. This works even when every
-agent authenticates as the same tracker account, where assignee fields cannot show a collision.
+agent authenticates as the same tracker account, where assignee fields cannot show a collision. The
+timeline stays the control channel for the whole build: every heartbeat re-reads it before writing,
+so a stand-down issued later is actually received.
 
 **What happens when an agent dies mid-task?**
 Claims carry a self-declared report-by horizon and heartbeat comments. An `in-progress` issue whose

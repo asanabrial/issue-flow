@@ -109,11 +109,12 @@ type — resolve both at setup and store both ids.
 | `create` | resolve or `issueLabelCreate` each label first, then `issueCreate(input: { teamId, title, description, stateId: <ready>, labelIds: [priority, domain, analyst] })` |
 | `list_state` | `issues(filter: { state: { id: { eq: <state> } }, assignee: { null: true } })` |
 | `claim` | check state is not `started`-type → `issueUpdate(id, input: { assigneeId, stateId: <in-progress> })` → write the claim comment → **re-read comments for an earlier claim** |
+| `verify_claim` | one read — `issue(id) { state { id type } comments { nodes { createdAt body } } }` — then three checks, any failed check is a stop instruction, not a retry: the state type is not `completed`/`canceled`; the state id is the one you are working under (ids, not types — `in-progress` and `review` share `started`); and no comment created after your own claim comment names your run-id in a stand-down, reclaim or adjudication. Semantics in `SKILL.md`, *A heartbeat is a claim renewal* |
 | `transition` | `issueUpdate(id, input: { stateId })` — single-valued, so nothing to remove |
 | `comment` | `commentCreate(input: { issueId, body })` |
 | `last_activity` | `issue(id) { updatedAt comments { nodes { createdAt body } } }` |
 | `label` | resolve the label id, `issueLabelCreate` if absent, then `issueUpdate(id, input: { labelIds })` — the full set, so read-modify-write |
-| `unassign` | `issueUpdate(id, input: { assigneeId: null, labelIds: <current minus dev:runtime> })` |
+| `unassign` | `issueUpdate(id, input: { assigneeId: null, labelIds: <current minus dev:runtime> })`. **Exception — releasing work another run still holds** (lost race, stand-down): remove only your `dev:<runtime>` label; `assigneeId` is singular and currently names the winner, so nulling it strips the active holder |
 | `close` | `transition` to the `done` state (type `completed`), with a comment stating what was verified |
 
 **`label` replaces the whole set.** Unlike `gh issue edit --add-label`, `labelIds` is the complete

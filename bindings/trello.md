@@ -94,11 +94,12 @@ GET /members/me?key=<key>&token=<token>
 | `create` | ensure the board labels exist (`POST /boards/{board}/labels`), then `POST /cards?idList=<ready>&name=<identity>: <title>&desc=<body>&idLabels=<priority,domain,analyst>` |
 | `list_state` | `GET /lists/<state>/cards?fields=id,idShort,shortLink,name,idMembers,dateLastActivity,labels` then keep those with an empty `idMembers` |
 | `claim` | `POST /cards/{id}/idMembers` with your member id, write the claim comment, then **read the `commentCard` actions** — an earlier claim than yours means you lost. Re-reading `idMembers` catches the race only when every agent is a distinct member |
+| `verify_claim` | one read — `GET /cards/{id}?fields=idList,closed&actions=commentCard` — then three checks, any failed check is a stop instruction, not a retry: `closed` is false (archived is Trello's killed); the card is in the list you are working under; and no `commentCard` action created after your own claim comment names your run-id in a stand-down, reclaim or adjudication. Semantics in `SKILL.md`, *A heartbeat is a claim renewal* |
 | `transition` | `PUT /cards/{id}?idList=<target list>` — single field, nothing to remove |
 | `comment` | `POST /cards/{id}/actions/comments?text=<text>` |
 | `last_activity` | `GET /cards/{id}?fields=dateLastActivity` |
 | `label` | `POST /boards/{board}/labels` if it does not exist yet, then `POST /cards/{id}/idLabels` with its id — **adds**, it does not replace |
-| `unassign` | `DELETE /cards/{id}/idMembers/{memberId}` **and** `DELETE /cards/{id}/idLabels/{devLabelId}` |
+| `unassign` | `DELETE /cards/{id}/idMembers/{memberId}` **and** `DELETE /cards/{id}/idLabels/{devLabelId}`. **Exception — releasing work another run still holds** (lost race, stand-down): remove only your `dev:<runtime>` label; agents usually share one Trello member, so deleting the membership strips the active holder too |
 | `close` | `transition` to **Done**, with a comment stating what was verified |
 
 Two conveniences worth knowing, because they remove the read-modify-write dance Linear forces:

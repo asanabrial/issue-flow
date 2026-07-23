@@ -47,6 +47,64 @@ This is the same mechanism the Linear binding needs, arrived at from the opposit
 because the assignee is overwritten, here because it is shared. The lesson generalises further than
 either: **an identity field cannot adjudicate a race between runs that share that identity.**
 
+## `verify_claim` — the renewal, made concrete
+
+The workflow requires every heartbeat — and every expensive or irreversible step between heartbeats
+— to re-read the control surface before writing. On GitHub that surface is one call, and everything
+the renewal needs is in it:
+
+```bash
+gh issue view <n> --json state,labels,comments
+```
+
+Then three checks, in any order — a failed check is a **stop instruction, not a retry**:
+
+1. **State.** `state` is `OPEN`. A closed issue means someone delivered or killed it: stop, and do
+   not change anything.
+2. **Workflow state.** Exactly one `status:*` label is present and it is the state you are working
+   under (for a dev mid-build, `status:in-progress`). A missing or different state means the item
+   moved without you: stop, and leave the new state alone — it is not yours.
+3. **Control messages.** No comment created *after your own claim comment* names your run-id in a
+   stand-down, a reclaim or an adjudication. Your claim comment is the watermark: anything addressed
+   to your run-id below it is for you (for a reclaimer, the `Reclaiming from <run-id>` comment plays
+   the watermark role — it is that run's first write to the timeline). Finding one means stop,
+   acknowledge once, release your `dev:<runtime>` marker, and write nothing else. A mention is not a
+   control message: another run's heartbeat that names your run-id in passing ("waiting on
+   `<run-id>`'s measurement phase") instructs you to do nothing, and classifying it as a stand-down
+   would have you abandon work nobody asked you to drop. What stops you is a comment that tells you.
+
+Two distinctions keep this safe to run unattended:
+
+- **A failed read is not a failed check.** If the `gh` call itself errors — network, auth, rate
+  limit — the renewal answered nothing. The semantics (*A failed read is not a failed answer* in
+  `SKILL.md`) apply verbatim: fail closed on the write, retry the read.
+- **Do not remove the assignee when another run still holds the item.** Every agent authenticates
+  as the same account, so the single `@me` assignee is the winner's as much as yours — removing it
+  strips the active holder. On a stand-down or a lost race, your `dev:<runtime>` label is
+  per-runtime and comes off; the shared assignee stays. (Plain `unassign` — handing back work you
+  alone hold — still removes both; see the operations table.)
+
+The semantics — what a stop instruction is, what release means, why no second claim comment — live
+in `SKILL.md` under *A heartbeat is a claim renewal*; this section is only the mechanics.
+
+**Worked example — issue #27, 2026-07-22.** The actual timeline, from the issue's comments:
+
+| Time (UTC) | Event |
+|---|---|
+| 14:40:03 | `claude-code-cb8d3f2c` writes its claim comment |
+| 14:40:08 | `claude-code-d7d8a22e` writes its claim comment, 5 s later, before the collision is visible |
+| 14:40:41 | adjudication comment: the earliest claim wins, `claude-code-d7d8a22e` is told to stand down |
+| 14:49–15:24 | `claude-code-d7d8a22e` posts heartbeats 1, 2 and 3 and keeps building — none of its writes re-read the timeline |
+| 15:24:21 | the winner delivers |
+| 15:28:52 | `claude-code-d7d8a22e` finally stands down, retracting a measurement taken on work it no longer held |
+
+Under write-only heartbeats the stand-down sat unread for 48 minutes. Under read-before-write
+renewal, the loser's next heartbeat — 14:49:22 at the latest — runs the three checks first: check 3
+finds the 14:40:41 adjudication naming its run-id, below its own claim comment. The heartbeat is
+never written; the run acknowledges, releases its markers, and heartbeats 1–3 and the duplicate
+build do not happen. The renewal does not prevent losing the race; it caps the cost of having lost
+it at one renewal interval.
+
 ## Prerequisites
 
 **`gh` is the preferred path, not the only one.** It is a separate install — nothing in this skill
@@ -77,11 +135,12 @@ ones.
 | `create` | ensure every label exists (below), then `gh issue create --title "<identity>: <title>" --body-file <file> --label "status:ready" --label "<scale>:<value>" --label "domain:<name>" --label "analyst:<runtime>"` |
 | `list_state` | `gh issue list --label "status:<state>" --search "no:assignee" --json number,title,labels,createdAt` |
 | `claim` | `gh issue edit <n> --add-assignee @me`, write the claim comment, then **read the comment timeline** — an earlier claim than yours means you lost. Re-reading assignees is not enough; see below |
+| `verify_claim` | one read — `gh issue view <n> --json state,labels,comments` — then three checks, any failed check is a stop instruction, not a retry: the issue is OPEN; it carries exactly one `status:*` label and it is the state you are working under; and no comment created after your own claim comment names your run-id in a stand-down, reclaim or adjudication. See *`verify_claim` — the renewal, made concrete* below |
 | `transition` | `gh issue edit <n> --add-label "status:<new>" --remove-label "status:<old>"` — one call, both halves. **If the issue is on a project board, mirroring the board is part of this operation** — see *Keeping a board in sync* |
 | `comment` | `gh issue comment <n> --body "<text>"` |
 | `last_activity` | `gh issue view <n> --json updatedAt,comments` |
 | `label` | `gh label create "<key>:<value>" --force` **then** `gh issue edit <n> --add-label "<key>:<value>"` |
-| `unassign` | `gh issue edit <n> --remove-assignee @me --remove-label "dev:<runtime>"` — one call, both halves |
+| `unassign` | `gh issue edit <n> --remove-assignee @me --remove-label "dev:<runtime>"` — one call, both halves. **Exception — releasing work another run still holds** (lost race, stand-down): remove only your `dev:<runtime>` label; `@me` is the shared account and removing it strips the active holder |
 | `close` | `transition` to `done` **first**, then `gh issue close <n> --comment "<what was verified>"` — the label is what the board and every query read; closing is GitHub's own bookkeeping |
 
 **Closing keywords bypass the state machine — do not use them.** A commit or PR whose message says
