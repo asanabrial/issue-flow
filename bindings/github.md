@@ -132,16 +132,29 @@ ones.
 | Operation | GitHub |
 |---|---|
 | `ensure_states` | `gh label create "status:<s>" --color ededed --force` for each state (see below) |
-| `create` | ensure every label exists (below), then `gh issue create --title "<identity>: <title>" --body-file <file> --label "status:ready" --label "<scale>:<value>" --label "domain:<name>" --label "analyst:<runtime>"` |
+| `create` | ensure every label exists (below), then `gh issue create --title "<identity>: <title>" --body-file <file> --label "status:ready" --label "<scale>:<value>" --label "domain:<name>" --label "analyst:<runtime>"`. **If a project board is configured, mirroring the initial column is part of this operation** — see step 4 of *How the mirror runs* |
 | `list_state` | `gh issue list --label "status:<state>" --search "no:assignee" --json number,title,labels,createdAt` |
 | `claim` | `gh issue edit <n> --add-assignee @me`, write the claim comment, then **read the comment timeline** — an earlier claim than yours means you lost. Re-reading assignees is not enough; see below |
 | `verify_claim` | one read — `gh issue view <n> --json state,labels,comments` — then three checks, any failed check is a stop instruction, not a retry: the issue is OPEN; it carries exactly one `status:*` label and it is the state you are working under; and no comment created after your own claim comment names your run-id in a stand-down, reclaim or adjudication. See *`verify_claim` — the renewal, made concrete* below |
 | `transition` | `gh issue edit <n> --add-label "status:<new>" --remove-label "status:<old>"` — one call, both halves. **If the issue is on a project board, mirroring the board is part of this operation** — see *Keeping a board in sync* |
-| `comment` | `gh issue comment <n> --body "<text>"` |
+| `comment` | write the body to a temp file, then `gh issue comment <n> --body-file <file>` — **never inline `--body "<text>"`**; see below |
 | `last_activity` | `gh issue view <n> --json updatedAt,comments` |
 | `label` | `gh label create "<key>:<value>" --force` **then** `gh issue edit <n> --add-label "<key>:<value>"` |
 | `unassign` | `gh issue edit <n> --remove-assignee @me --remove-label "dev:<runtime>"` — one call, both halves. **Exception — releasing work another run still holds** (lost race, stand-down): remove only your `dev:<runtime>` label; `@me` is the shared account and removing it strips the active holder |
-| `close` | `transition` to `done` **first**, then `gh issue close <n> --comment "<what was verified>"` — the label is what the board and every query read; closing is GitHub's own bookkeeping |
+| `close` | `transition` to `done` **first**, then post the closing note with `gh issue comment <n> --body-file <file>`, then a bare `gh issue close <n>` — `gh issue close` has NO file variant (`-c/--comment` is inline-only, confirmed against `gh issue close --help`), so the note goes through `comment`'s file-based path and the close carries no body at all. Two calls means a partial-failure case: if the comment lands but the close errors, the issue is left open with its closing note already posted — retry only the bare `gh issue close <n>`, never re-post the note |
+
+**Inline `--body`/`--comment` corrupts markdown on a PowerShell runtime — write to a file instead.**
+Seen live: three separate comments, from two different runtimes, posted with the backtick stripped
+or eaten entirely — `` `floor_starvation` `` arrived as `\loor_starvation\` (the backtick-plus-`f`
+was consumed as PowerShell's form-feed escape, taking the `f` with it), `` `status:blocked` `` arrived
+as `\status:blocked\`, and every intended line break arrived as the two literal characters `\n`
+instead of a newline. Backtick is PowerShell's escape character; a double-quoted `--body "<text
+with `code spans`\nand newlines>"` gets expanded by the shell BEFORE `gh` ever sees it, and no amount
+of care in the text itself prevents that — the corruption happens one layer below where the text is
+composed. `create` already does this right (`--body-file <file>`); `comment` and `close` did not, and
+that inconsistency is exactly what let evidence-bearing comments — the ones a stale-claim or
+blocked-condition check reads back later — arrive silently damaged. Write the body to a file on every
+operation that accepts markdown, with no exception for "this one's short."
 
 **Closing keywords bypass the state machine — do not use them.** A commit or PR whose message says
 `closes #34` or `fixes #34` makes GITHUB close the issue the moment it reaches the default branch:
@@ -231,6 +244,18 @@ two: project items are references, so title, state, labels and assignees are alw
 custom field lives on the project item and no label touches it. Left alone, a board shows whatever
 someone set by hand the day they set it.
 
+**The mirror only fires on a `transition` you make — it does not repair drift from before you got
+there.** Seen live: five items sitting on `Ready` in the board days after their labels had moved to
+`in-progress` or `done`, because whatever run transitioned them either predates this section being
+written or hit the missing-scope fallback — and nothing since then ever looked back. There is no
+daemon reconciling the two, by design (see *Why a mirror is needed at all*), which means staleness is
+permanent unless a run that happens to be reading an item's labels for some other reason also checks
+its board column. So: whenever you read an issue's labels and its board item is in view for any
+reason — not only during your own `transition` — compare the two, and if they disagree, correct the
+`Status` field with step 3 of *How the mirror runs* on the spot. It costs one extra mutation call
+using ids you likely already resolved this run, and it is the only thing standing between "the mirror
+sometimes fails" and "the board silently drifts forever."
+
 **Whether to mirror at all is read from the operator configuration, not guessed.** The `Project
 board` row names `owner/number` or `none`. `none` means no board anywhere: skip this section
 entirely. A named board means **an operation that sets a state — `create` as much as `transition` — is not
@@ -249,7 +274,8 @@ tempts a run to skip the mirror.
 machinery: when this workflow changes a `status:*` label on an issue that has a project item, it
 moves the board field in the same step. That costs the agent's token the `project` scope — `gh issue`
 alone never needs it — so prove it once with `gh project list --owner <owner>` before relying on the
-mirror, and where the scope is missing, fall back to label-only exactly as rule 1 below prescribes.
+mirror, and where the scope is missing, fall back to label-only exactly as step 1 of *How the mirror
+runs* below prescribes.
 
 ### Why a mirror is needed at all
 
@@ -271,11 +297,73 @@ Then the board reads like the workflow, and only the syncing is left.
 
 ### How the mirror runs
 
+1. **Resolve the project, its `Status` field and its options — once per run, then reuse for every
+   transition in that run.**
 
-Two quiet failure modes worth knowing: for an **organisation-owned** project, `user(login:)` must
-become `organization(login:)` — the query returns null rather than erroring, so the mirror silently
-never fires; and `items(first:100)` stops finding issues once the board passes a hundred items —
-paginate before it grows into that.
+   ```bash
+   gh api graphql -f query='
+     query($login: String!, $number: Int!) {
+       user(login: $login) {
+         projectV2(number: $number) {
+           id
+           fields(first: 20) {
+             nodes {
+               ... on ProjectV2SingleSelectField { id name options { id name description } }
+             }
+           }
+         }
+       }
+     }' -f login="<owner>" -F number=<board-number>
+   ```
+
+   Keep the returned project id, the `Status` field id, and the option id for each state (matched by
+   the option's name or its description, per *Why a mirror is needed at all* above). **If this call
+   errors on a missing scope, stop here and fall back to label-only** — the label transition already
+   ran and carries the truth; nothing below this step is worth attempting without the `project` scope.
+
+2. **Resolve the project item id for the issue being transitioned**, paginating if the board has grown
+   past a page:
+
+   ```bash
+   gh api graphql -f query='
+     query($login: String!, $number: Int!, $cursor: String) {
+       user(login: $login) {
+         projectV2(number: $number) {
+           items(first: 100, after: $cursor) {
+             pageInfo { hasNextPage endCursor }
+             nodes { id content { ... on Issue { number } } }
+           }
+         }
+       }
+     }' -f login="<owner>" -F number=<board-number>
+   ```
+
+   Follow `pageInfo` until the issue's `number` shows up or the pages run out — each follow-up page is
+   the same call plus `-f cursor="<endCursor from the previous page>"` (the first call simply omits it,
+   leaving `$cursor` null). An issue not found is the quiet skip *Whether to mirror at all* already
+   allows (not yet added to the board, or added but not yet indexed).
+
+3. **Set the field** with the ids resolved above, to the option matching the new label:
+
+   ```bash
+   gh api graphql -f query='
+     mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+       updateProjectV2ItemFieldValue(input: {
+         projectId: $project, itemId: $item, fieldId: $field
+         value: { singleSelectOptionId: $option }
+       }) { projectV2Item { id } }
+     }' -f project="<PROJECT_ID>" -f item="<ITEM_ID>" -f field="<FIELD_ID>" -f option="<OPTION_ID>"
+   ```
+
+4. **`create` runs step 3 too, immediately after filing**, setting the initial column to whatever
+   option mirrors `status:ready` — this is the case *Whether to mirror at all* names as the one
+   everyone forgets, because no `transition` ever follows a fresh issue to correct an empty `Status`.
+
+Two quiet failure modes worth knowing, on top of the scope check in step 1: for an
+**organisation-owned** project, `user(login:)` must become `organization(login:)` in both queries
+above — the query returns null rather than erroring, so the mirror silently never fires; and
+`items(first:100)` in step 2 stops finding issues once the board passes a hundred items — the
+pagination above is what keeps that from going quiet too.
 
 **If your agents cannot hold the `project` scope**, the same mirroring can run server-side in a
 repository Action on `issues.labeled`/`unlabeled` — it needs a PAT stored as a secret, because the
