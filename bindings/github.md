@@ -87,7 +87,7 @@ Two distinctions keep this safe to run unattended:
 The semantics — what a stop instruction is, what release means, why no second claim comment — live
 in `SKILL.md` under *A heartbeat is a claim renewal*; this section is only the mechanics.
 
-**Worked example — issue #27, 2026-07-22.** The actual timeline, from the issue's comments:
+**Worked example — a real claim race, 2026-07-22.** The timeline, from the issue's comment trail:
 
 | Time (UTC) | Event |
 |---|---|

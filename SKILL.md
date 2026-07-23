@@ -569,8 +569,8 @@ already timestamps: no daemon, no lock service, nothing to run.
 **A heartbeat is a claim renewal: read before you write.** The claim check in step 2 runs once, but
 the control surface it read stays authoritative for the whole build — a late adjudication, a reclaim,
 a stand-down all arrive there while you work. A heartbeat that only writes is deaf to the one channel
-that can revoke the claim. This happened live: on issue #27 a run that had lost the race by five
-seconds was told so in an adjudication comment 33 seconds later, and then posted three more
+that can revoke the claim. This happened live: a run that had lost a claim race by five seconds
+was told so in an adjudication comment 33 seconds later, and then posted three more
 heartbeats and worked another ~48 minutes because nothing in its heartbeat loop ever read the
 timeline again. So **every heartbeat runs `verify_claim` first and is written only when the answer is
 "still holder, nothing said"**. The same renewal runs immediately before any expensive or
