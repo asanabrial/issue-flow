@@ -1,11 +1,9 @@
 #!/bin/sh
 # Install, link and upgrade the issue-flow skill. POSIX sh, no dependencies.
 #
-# The design rests on one invariant: the skill file is BOTH the artifact and its own configuration
-# store. Everything between the two `issue-flow:config` markers belongs to the operator; everything
-# outside belongs to the skill. `sync` swaps the outside and puts the inside back, so upgrading never
-# costs you your settings and there is no parallel state file to drift out of agreement with the file
-# you actually read.
+# The versioned skill contains portable defaults. Operator values live in the ignored
+# operator.local.md beside it, so upgrades and publications cannot disclose local permissions,
+# machine paths or tracker identifiers.
 #
 # Mirror of install.ps1. Keep the two in step: they share the marker contract, not code.
 #
@@ -20,6 +18,7 @@ set -eu
 
 SKILL_NAME='issue-flow'
 SKILL_FILE='SKILL.md'
+CONFIG_FILE='operator.local.md'
 START='<!-- issue-flow:config:start -->'
 END='<!-- issue-flow:config:end -->'
 
@@ -44,22 +43,12 @@ if [ ! -f "$CANONICAL/SKILL.md" ] || [ ! -f "$CANONICAL/install.sh" ]; then
         printf 'installing into %s
 ' "$DEST"
         git clone -q --depth 1 "$REPO" "$DEST"
-        # The operator edits the config block inside SKILL.md; skip-worktree marks it
-        # local-on-purpose so status stays clean and pulls never clobber the settings.
-        git -C "$DEST" update-index --skip-worktree SKILL.md 2>/dev/null || true
     else
         printf 'upgrading %s
 ' "$DEST"
-        UP=$(mktemp -d); trap 'rm -rf -- "$UP"' EXIT
-        cp "$DEST/SKILL.md" "$UP/local.md"                    # settings-bearing copy, byte-exact
         git -C "$DEST" fetch -q origin
-        git -C "$DEST" update-index --no-skip-worktree SKILL.md 2>/dev/null || true
         git -C "$DEST" checkout -q origin/main -- .
         git -C "$DEST" reset -q origin/main
-        cp "$DEST/SKILL.md" "$UP/upstream.md"                 # upstream's SKILL.md, byte-exact
-        cp "$UP/local.md" "$DEST/SKILL.md"                    # local back...
-        sh "$DEST/install.sh" sync --from "$UP/upstream.md"   # ...merge: new prose, old settings
-        git -C "$DEST" update-index --skip-worktree SKILL.md 2>/dev/null || true
     fi
     exec sh "$DEST/install.sh" "${1:-install}"
 fi
@@ -242,7 +231,23 @@ cmd_config() {
     # Deliberately generic: it matches a row by its NAME and never carries a list of known settings.
     # Add a row to the skill and this keeps working - a config tool that has to be taught every new
     # setting is a second place to forget one.
-    installed="$CANONICAL/$SKILL_FILE"
+    template="$CANONICAL/$SKILL_FILE"
+    installed="$CANONICAL/$CONFIG_FILE"
+    has_config "$template" || die "no default configuration block in $template."
+
+    if [ ! -f "$installed" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf 'would   create %s from portable defaults\n' "$installed"
+            [ -z "$SET" ] && extract_block "$template" | grep '^|' || true
+            [ -z "$SET" ] && return 0
+            tmp_local=$(mktemp)
+            extract_block "$template" > "$tmp_local"
+            installed="$tmp_local"
+        else
+            extract_block "$template" > "$installed"
+            printf 'created %s from portable defaults\n' "$installed"
+        fi
+    fi
     has_config "$installed" || die "no configuration block in $installed."
 
     if [ -z "$SET" ]; then
@@ -286,12 +291,14 @@ cmd_config() {
 
 cmd_status() {
     printf 'canonical  %s\n' "$CANONICAL"
-    if [ -f "$CANONICAL/$SKILL_FILE" ]; then
-        if has_config "$CANONICAL/$SKILL_FILE"; then
-            printf 'config     present\n'
+    if [ -f "$CANONICAL/$CONFIG_FILE" ]; then
+        if has_config "$CANONICAL/$CONFIG_FILE"; then
+            printf 'config     %s  [local, ignored]\n' "$CANONICAL/$CONFIG_FILE"
         else
-            printf 'config     MISSING - sync would refuse\n'
+            printf 'config     INVALID - markers missing in %s\n' "$CANONICAL/$CONFIG_FILE"
         fi
+    else
+        printf 'config     defaults (no %s)\n' "$CANONICAL/$CONFIG_FILE"
     fi
     for base in $RUNTIME_DIRS; do
         link="$base/$SKILL_NAME"

@@ -3,11 +3,9 @@
     Install, link and upgrade the issue-flow skill. No dependencies beyond Windows itself.
 
 .DESCRIPTION
-    The design rests on one invariant: the skill file is BOTH the artifact and its own
-    configuration store. Everything between the two `issue-flow:config` markers belongs to
-    the operator; everything outside belongs to the skill. `sync` swaps the outside and puts
-    the inside back, so upgrading never costs you your settings — and there is no parallel
-    state file to drift out of agreement with the file you actually read.
+    The versioned skill contains portable defaults. Operator values live in the ignored
+    operator.local.md beside it, so upgrades and publications cannot disclose local permissions,
+    machine paths or tracker identifiers.
 
     Mirror of install.sh. Keep the two in step: they share the marker contract, not code.
 
@@ -36,6 +34,7 @@ $ErrorActionPreference = 'Stop'
 
 $SkillName = 'issue-flow'
 $SkillFile = 'SKILL.md'
+$ConfigFile = 'operator.local.md'
 $StartMark = '<!-- issue-flow:config:start -->'
 $EndMark   = '<!-- issue-flow:config:end -->'
 
@@ -59,26 +58,11 @@ if (-not $Canonical -or -not (Test-Path (Join-Path $Canonical 'SKILL.md'))) {
     if (-not (Test-Path $Dest)) {
         Write-Host "installing into $Dest"
         git clone -q --depth 1 $Repo $Dest
-        # The operator edits the config block inside SKILL.md; skip-worktree marks it
-        # local-on-purpose so status stays clean and pulls never clobber the settings.
-        git -C $Dest update-index --skip-worktree SKILL.md 2>$null
     } else {
         Write-Host "upgrading $Dest"
-        $Up = Join-Path $env:TEMP ("issue-flow-" + [guid]::NewGuid().ToString('n').Substring(0, 8))
-        New-Item -ItemType Directory -Path $Up | Out-Null
-        try {
-            Copy-Item (Join-Path $Dest 'SKILL.md') (Join-Path $Up 'local.md')
-            git -C $Dest fetch -q origin
-            git -C $Dest update-index --no-skip-worktree SKILL.md 2>$null
-            git -C $Dest checkout -q origin/main -- .
-            git -C $Dest reset -q origin/main
-            Copy-Item (Join-Path $Dest 'SKILL.md') (Join-Path $Up 'upstream.md')
-            Copy-Item (Join-Path $Up 'local.md') (Join-Path $Dest 'SKILL.md')
-            & (Join-Path $Dest 'install.ps1') sync -From (Join-Path $Up 'upstream.md')
-            git -C $Dest update-index --skip-worktree SKILL.md 2>$null
-        } finally {
-            Remove-Item -Recurse -Force $Up -ErrorAction SilentlyContinue
-        }
+        git -C $Dest fetch -q origin
+        git -C $Dest checkout -q origin/main -- .
+        git -C $Dest reset -q origin/main
     }
     & (Join-Path $Dest 'install.ps1') $Command
     return
@@ -273,8 +257,27 @@ function Invoke-Config {
         taught every new setting is a second place to forget one.                                #>
     param([string]$Assignment)
 
-    $installed = Join-Path $Canonical $SkillFile
-    $text = Get-Content -LiteralPath $installed -Raw -Encoding UTF8
+    $template = Join-Path $Canonical $SkillFile
+    $installed = Join-Path $Canonical $ConfigFile
+    $templateText = Get-Content -LiteralPath $template -Raw -Encoding UTF8
+    $defaultBlock = (Split-Config -Text $templateText -Origin 'the versioned skill defaults').Block
+
+    if (-not (Test-Path -LiteralPath $installed)) {
+        if ($DryRun) {
+            Write-Host "would   create $installed from portable defaults"
+            if (-not $Assignment) {
+                $defaultBlock -split "`n" | Where-Object { $_ -match '^\|' } | ForEach-Object { Write-Host $_.TrimEnd() }
+                return
+            }
+            $text = $defaultBlock
+        } else {
+            Write-Utf8NoBom -Path $installed -Text $defaultBlock
+            Write-Host "created $installed from portable defaults"
+            $text = $defaultBlock
+        }
+    } else {
+        $text = Get-Content -LiteralPath $installed -Raw -Encoding UTF8
+    }
     $block = (Split-Config -Text $text -Origin 'the installed skill').Block
 
     if (-not $Assignment) {
@@ -316,11 +319,13 @@ function Invoke-Config {
 
 function Invoke-Status {
     Write-Host "canonical  $Canonical"
-    $skill = Join-Path $Canonical $SkillFile
-    if (Test-Path -LiteralPath $skill) {
-        $text = Get-Content -LiteralPath $skill -Raw -Encoding UTF8
-        $state = if (Test-HasConfig $text) { 'present' } else { 'MISSING - sync would refuse' }
+    $config = Join-Path $Canonical $ConfigFile
+    if (Test-Path -LiteralPath $config) {
+        $text = Get-Content -LiteralPath $config -Raw -Encoding UTF8
+        $state = if (Test-HasConfig $text) { "$config  [local, ignored]" } else { "INVALID - markers missing in $config" }
         Write-Host "config     $state"
+    } else {
+        Write-Host "config     defaults (no $config)"
     }
     foreach ($base in $RuntimeDirs) {
         $link = Join-Path $base $SkillName

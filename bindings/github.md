@@ -133,10 +133,15 @@ ones.
 |---|---|
 | `ensure_states` | `gh label create "status:<s>" --color ededed --force` for each state (see below) |
 | `create` | ensure every label exists (below), then `gh issue create --title "<identity>: <title>" --body-file <file> --label "status:ready" --label "<scale>:<value>" --label "domain:<name>" --label "analyst:<runtime>"`. **If a project board is configured, mirroring the initial column is part of this operation** — see step 4 of *How the mirror runs* |
-| `list_state` | `gh issue list --label "status:<state>" --search "no:assignee" --json number,title,labels,createdAt` |
+| `list_state` | `gh issue list --label "status:<state>" --search "no:assignee" --json number,title,labels,createdAt`; partition results by `domain:<name>` and declared priority scale, sort inside each partition by that scale, and expose each partition head with `createdAt` so the workflow can choose the oldest head without comparing scale values |
 | `claim` | `gh issue edit <n> --add-assignee @me`, write the claim comment, then **read the comment timeline** — an earlier claim than yours means you lost. Re-reading assignees is not enough; see below |
 | `verify_claim` | one read — `gh issue view <n> --json state,labels,comments` — then three checks, any failed check is a stop instruction, not a retry: the issue is OPEN; it carries exactly one `status:*` label and it is the state you are working under; and no comment created after your own claim comment names your run-id in a stand-down, reclaim or adjudication. See *`verify_claim` — the renewal, made concrete* below |
-| `transition` | `gh issue edit <n> --add-label "status:<new>" --remove-label "status:<old>"` — one call, both halves. **If the issue is on a project board, mirroring the board is part of this operation** — see *Keeping a board in sync* |
+| `transition` | **If a project board is configured, attempt its `Status` field FIRST** — best-effort, without pre-checking whether the issue is on the board; an issue not on it (or a missing scope) is a quiet no-op, not a precondition (see *Keeping a board in sync*). **Then** move the authoritative label: `gh issue edit <n> --add-label "status:<new>" --remove-label "status:<old>"` — one call, both halves |
+| `publish_review` | push the issue branch, then query `gh pr list --head <branch> --state open --json number,url,headRefOid,baseRefOid`. Reuse the single open PR when present; create one only when none exists with `gh pr create --base <base> --head <branch> --title "<title>" --body-file <file>`. More than one open PR is ambiguous: stop. Do not use closing keywords. Record the PR URL on the issue before `transition(review)` |
+| `review_status` | capture `headRefOid` and `baseRefOid` with `gh pr view <pr> --json headRefOid,baseRefOid,latestReviews,reviewDecision,reviewRequests,mergeStateStatus`. The independent verdict artifact MUST contain `Reviewer-Run: <run-id>`, `Reviewed-Head: <full-head-sha>` and `Reviewed-Base: <full-base-sha>`; re-read both SHAs after review and reject the verdict if either differs. The verdict is mandatory even when every runtime authenticates as the PR author and GitHub cannot supply a distinct native approval |
+| `ci_status` | capture `headRefOid` and `baseRefOid`; run `gh pr checks <pr> --watch --fail-fast`, then separately read `gh pr checks <pr> --json name,workflow,state,bucket` (`--watch` and `--json` are separate invocations). Build the expected set as the union of host-required names and every applicable repository-required lane. For the host set, `gh pr checks <pr> --required --json name` returning exactly `no required checks reported on the '<branch>' branch` means the empty set; every other command error fails closed. When repository policy names workflow job ids rather than visible checks, resolve each id through `jobs.<id>.name` in the workflow file at the captured head SHA before comparing; never compare ids directly with `gh pr checks.name`. Each expected visible name must be present exactly once with `bucket=pass`; `skipping`, `cancel`, a missing name or an unexpected duplicate is not green. Re-read both SHAs afterwards; if either changed, discard review and CI |
+| `merge` | require `reviewed head/base == CI head/base == current headRefOid/baseRefOid`, then run `gh pr merge <pr> --merge --match-head-commit <head-sha>`. Never use `--admin` or `--delete-branch`: deletion can fail after a successful API merge in a multi-worktree checkout and make the result look retryable. If a merge queue owns delivery, first prove its configured method preserves merge commits or stop. Poll `gh pr view <pr> --json state,mergedAt,mergeCommit` until merged and take `.mergeCommit.oid` as the delivered SHA; fetch it and verify it has exactly two parents in order: reviewed base, then reviewed head. A mismatch means the base raced or the host used another strategy: leave the issue in `review` and invoke the repository's fix-forward/revert policy. If exact-delivered-SHA CI is required, locate every required workflow with `gh run list --commit <merge-sha> --workflow <workflow> --json databaseId,headSha,status,conclusion`, wait with `gh run watch <id> --exit-status`, then verify `gh run view <id> --json headSha,status,conclusion,jobs`: the head must equal `<merge-sha>`, the run and every applicable required job must be `completed/success`, never `skipped`. Run `verify_claim` again immediately before `close`; clean up the remote branch and worktree only after confirmed delivery |
+| `publish_version` | after every required delivered-SHA gate, call `verify_claim` BEFORE the first publication write, then detect each component whose declared version changed from `<old>` to `<new>`. Enumerate `git ls-remote --tags origin` — never local tags — to derive the component's established naming convention and previous component tag. Require exactly one convention; if history is empty, require an unambiguous single-product/component classification before using `v<new>` or `<component>/v<new>`. For `<tag>`, inspect both local and remote direct plus peeled refs. A valid annotated tag has a tag object and a `refs/tags/<tag>^{}` target equal to `<merge-sha>`; a lightweight tag, another target or ambiguous state blocks without rewriting anything. If the remote tag is absent, reuse a matching annotated local tag or create it with `git tag -a "<tag>" "<merge-sha>" -m "<component> <new>"`, then attempt `git push origin "refs/tags/<tag>"`. After ANY push result — success, rejection or timeout — re-read the remote: a conclusive peeled target equal to `<merge-sha>` is idempotent success, another target is conflict, and no conclusive read fails closed. When GitHub Releases are required, first reverify the remote peeled target, then query `gh release view "<tag>" --json tagName,isDraft,isPrerelease`. A matching non-draft Release with the SemVer-derived prerelease flag is idempotent success; incompatible metadata blocks. Only a confirmed not-found result permits `gh release create "<tag>" --verify-tag --generate-notes` (add `--prerelease` for a prerelease and add `--notes-start-tag "<previous-component-tag>"` only when that remote component tag exists). After ANY create result, re-read the Release JSON and the remote peeled tag; both must match the expected metadata and `<merge-sha>`. Auth, network or API ambiguity fails closed. Tag/Release failure leaves the issue in `review` even though the merge already exists |
 | `comment` | write the body to a temp file, then `gh issue comment <n> --body-file <file>` — **never inline `--body "<text>"`**; see below |
 | `last_activity` | `gh issue view <n> --json updatedAt,comments` |
 | `label` | `gh label create "<key>:<value>" --force` **then** `gh issue edit <n> --add-label "<key>:<value>"` |
@@ -165,6 +170,17 @@ through the workflow's `close`, which moves the state first. If a closing keywor
 anyway, run `transition` to `done` afterwards — the auto-close is not the workflow's close, and the
 state machine does not know it happened. Seen live: an issue closed by its delivery commit sat
 CLOSED wearing `status:ready` until an audit caught it.
+
+**A shared GitHub account cannot manufacture independent approval.** The workflow's reviewer is a
+fresh reasoning context, but GitHub sees the authenticated account, not that context. When the same
+account authored the PR, record the reviewer verdict and evidence in the PR or issue with
+`Reviewer-Run: <run-id>`, `Reviewed-Head: <full-head-sha>` and
+`Reviewed-Base: <full-base-sha>`; do not claim a native `APPROVED` review that GitHub refused.
+Re-read both PR SHAs after the verdict — matching prose without that race check is still stale
+evidence. This comment proves the workflow review only; if repository protection requires a native
+approval, it does NOT substitute for one and delivery stays blocked until a distinct identity
+supplies it. In repositories with a genuinely distinct reviewer identity, use the native review
+decision and require it normally, still tied to the reviewed revision.
 
 **Link the branch to the issue the moment it exists.** GitHub has a native way that also happens to
 fit this workflow's git flow exactly: `gh issue develop <n> --name <branch> --base <base>` creates
@@ -270,11 +286,17 @@ Resolve the project, field and option ids **once per run** and reuse them for ev
 that run — they are stable within a session, and per-transition discovery is the overhead that
 tempts a run to skip the mirror.
 
-**The mirror is part of `transition`, done by the same run that moves the label.** No server-side
-machinery: when this workflow changes a `status:*` label on an issue that has a project item, it
-moves the board field in the same step. That costs the agent's token the `project` scope — `gh issue`
-alone never needs it — so prove it once with `gh project list --owner <owner>` before relying on the
-mirror, and where the scope is missing, fall back to label-only exactly as step 1 of *How the mirror
+**The mirror is part of `transition`, done by the same run that moves the label — and it runs first.**
+No server-side machinery: on a `transition` for an issue that has a project item, this workflow sets
+the board `Status` field BEFORE it moves the `status:*` label, best-effort and without pre-checking
+board membership — an issue not on the board is the quiet skip below, not a precondition. The fragile,
+easily-skipped half runs before anything can short-circuit it; the reliable one-call label edit
+follows. This trades one failure for a rarer one: the label stays the store queries read, so a run
+that dies between the board write and the label edit leaves the board ahead of a still-stale label —
+far less likely than the board drift that board-last invited, which is the incident this order exists
+to prevent. That costs the agent's token the `project` scope — `gh issue` alone never needs it — so
+prove it once with `gh project list --owner <owner>` before relying on the mirror, and where the scope
+is missing, skip the board attempt and do the label edit alone, exactly as step 1 of *How the mirror
 runs* below prescribes.
 
 ### Why a mirror is needed at all
@@ -318,8 +340,9 @@ Then the board reads like the workflow, and only the syncing is left.
 
    Keep the returned project id, the `Status` field id, and the option id for each state (matched by
    the option's name or its description, per *Why a mirror is needed at all* above). **If this call
-   errors on a missing scope, stop here and fall back to label-only** — the label transition already
-   ran and carries the truth; nothing below this step is worth attempting without the `project` scope.
+   errors on a missing scope, stop the board attempt here and go straight to the label edit** — the
+   label is the authoritative store and carries the truth; nothing on the board is worth attempting
+   without the `project` scope, and the label edit still runs after this section either way.
 
 2. **Resolve the project item id for the issue being transitioned**, paginating if the board has grown
    past a page:
@@ -354,6 +377,10 @@ Then the board reads like the workflow, and only the syncing is left.
        }) { projectV2Item { id } }
      }' -f project="<PROJECT_ID>" -f item="<ITEM_ID>" -f field="<FIELD_ID>" -f option="<OPTION_ID>"
    ```
+
+   For a `transition`, this whole board attempt (steps 1–3) precedes the `status:*` label edit — the
+   authoritative label move from the operations table runs immediately after, whether the board write
+   succeeded, was skipped for a missing item, or fell back on a missing scope.
 
 4. **`create` runs step 3 too, immediately after filing**, setting the initial column to whatever
    option mirrors `status:ready` — this is the case *Whether to mirror at all* names as the one

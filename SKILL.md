@@ -1,9 +1,9 @@
 ---
 name: issue-flow
-description: "Trigger — Claude Code: /issue-flow analyst <domain> | /issue-flow dev. Codex: $issue-flow analyst <domain> | $issue-flow dev (Codex uses $, never /). Also: analyst, developer, move tasks between states, file an analysis issue, pick up a ready issue, claim an issue. Global two-role workflow over a shared issue tracker (GitHub, Linear or Trello): an ANALYST that only analyses and files a specified issue (never touches code), and a DEV that claims a ready issue and implements it. Domain-agnostic: an ANALYST over the whole project must be composed with domain rules that define what to analyse (over a bounded target such as a diff or PR review it needs none); the DEV runs standalone, since the issue already carries its scope, and takes domain rules only when a project has extra requirements for what counts as done."
+description: "Trigger: issue-flow analyst [conditions], issue-flow dev, analyst, developer, claim issue, move task states. Analysts file at most one evidenced issue; without conditions, audit the repository critically."
 metadata:
   author: asanabrial
-  version: "1.1.0"
+  version: "1.9.0"
 ---
 
 # Issue Flow — Analyst / Dev over a shared issue tracker
@@ -20,7 +20,7 @@ role by those rules. The same domain can be read by either role, and a project s
 book per side rather than one skill per role.
 
 ```
-/issue-flow analyst <domain-rules | instructions>    ← domain REQUIRED
+/issue-flow analyst [domain-rules | instructions]    ← conditions OPTIONAL
 /issue-flow dev     [domain-rules] [issue-number]    ← domain OPTIONAL
 ```
 
@@ -29,24 +29,32 @@ book per side rather than one skill per role.
 skill, same arguments, different prefix:
 
 ```
-$issue-flow analyst $<domain-rules>
+$issue-flow analyst [$<domain-rules> | instructions]
 $issue-flow dev
 ```
 
 
-**The two roles need the domain asymmetrically, and the reason is worth knowing.** The analyst's
-input is the whole project: unbounded, so without rules it has no way to decide what is worth
-filing. The dev's input is one already-specified issue: bounded, because the analyst already put
-the scope, the design and the acceptance criteria in it. **The specification IS the scope.**
+**The two roles use conditions asymmetrically.** The analyst accepts optional conditions to focus
+its judgement; without them it audits the repository under the autonomous discovery contract below.
+The dev's input is one already-specified issue, so the issue itself bounds the work. **The
+specification IS the scope.**
 
-- **Analyst over the whole project, without a domain → STOP.** It has nothing to analyse and would
-  invent one; a fabricated backlog is worse than an empty one. If you have not written a domain yet,
-  there is a worked example in `examples/domain-test-coverage.md` — usable as-is, and shaped so you
-  can replace its subject with yours.
-- **Analyst over a bounded target needs no domain**, for exactly the reason the dev does not: the
-  target is the scope. Point it at a diff, a pull request or one issue's implementation and there is
-  nothing to invent — what to look at is already decided, and only the judgement is left. The
-  requirement follows the SHAPE OF THE INPUT, not the role.
+- **Analyst conditions are optional.** Always obey applicable repository instructions and domain
+  rules; they constrain how analysis is performed and never replace its scope. Use explicit
+  conditions or a bounded target such as a diff, PR or issue as the scope. If none was supplied,
+  enter the autonomous repository-discovery mode below. Never stop merely because the caller
+  supplied no domain.
+- **A bounded target is already a scope.** Analyse that target without inventing wider scope.
+- **With no conditions, audit the repository itself.** First discover and obey applicable local
+  rules. Then inspect current code, tests, configuration, documentation, history and tracker context
+  for defensible bugs, security or reliability risks, performance and maintainability problems,
+  missing tests, architectural debt, and concrete product or developer-experience improvements.
+  Treat security as a first-class search axis: inspect authentication and authorization boundaries,
+  input validation and injection paths, secret and sensitive-data exposure, insecure defaults,
+  dependency and supply-chain risk, cryptographic misuse, privilege escalation and abuse cases.
+  Be constructively dissatisfied: challenge assumptions, trace consequences, compare intent with
+  behaviour, and look for evidence that the current solution can be better. Do not manufacture a
+  backlog; file only a finding supported by reproducible evidence and meaningful impact.
 - **`/issue-flow dev` alone is a complete, valid invocation.** Take the highest-priority ready
   issue and build exactly what it specifies, following the target repo's own conventions (its agent
   instructions, or the default flow below where those are silent). Most work needs nothing more.
@@ -119,6 +127,19 @@ to discover it.
 If a domain omits any of these for the ANALYST, say which one is missing and stop. Filling the gap
 by inventing a convention is how two agents end up with two incompatible boards.
 
+**A priority value is not a scale contract.** A scale contract MUST name the scale, enumerate every
+allowed value, define their strict ordering, and state what each value means. Before filing, verify
+that the finding's value belongs to that contract and carries a case-specific rationale. If any part
+is absent or ambiguous, STOP: do not infer `priority`, `severity`, `tier`, or any other vocabulary
+from familiar-looking values.
+
+**Priority is ordered only inside one declared scale.** Never compare values from different scales:
+`tier:2` is neither above nor below `priority:high`. For a mixed-domain `list_state`, partition the
+queue by `domain:<name>` and priority scale, order each partition by its own contract, and use oldest
+first only to choose among partition heads unless the caller selected a domain. This preserves a
+deterministic queue without pretending unrelated business scales share meaning. A binding may expose
+the partitions differently, but it must not manufacture a global priority rank.
+
 **For the DEV role the domain is optional**, and supplies only what an issue cannot carry per-issue:
 tie-breaking when priorities are equal, and what must be TRUE before work is called done — a
 measurement discipline, required benchmarks, ship gates. With no domain, the issue's own acceptance
@@ -134,7 +155,7 @@ this file. Load that one file and ignore the rest; no command for any tracker ap
 |---|---|
 | `ensure_states` | make the state vocabulary exist, once per project |
 | `create` | file a new item in `ready` (or `blocked`) carrying the analyst's body **and every marker the finding supplies** — priority, domain and attribution, not just the state |
-| `list_state` | list unclaimed items in a given state, highest priority first — both roles have a queue to drain |
+| `list_state` | list unclaimed items in a given state; order within a declared domain/scale, and expose mixed-domain partitions without globally comparing their values |
 | `claim` | take the item server-side, then **verify you actually hold it** by the means the binding names |
 | `verify_claim` | re-read the authoritative control surface for an item you hold and answer two questions: am I still its holder, and has anything been said to this run-id since my claim? — what every heartbeat and every irreversible step checks **before** it writes |
 | `transition` | move to exactly one state, dropping the previous one in the same call |
@@ -142,6 +163,7 @@ this file. Load that one file and ignore the rest; no command for any tracker ap
 | `last_activity` | when the item was last touched — what the stale-claim rule reads |
 | `label` | attach a `<key>:<value>` marker queryable without opening the item, **creating the label first where the tracker requires one to exist** |
 | `unassign` | release the item without changing its state, **and drop your runtime's attribution marker** — it records who is holding the work, not who once touched it |
+| `publish_version` | for every delivered version bump, publish and remotely verify an immutable annotated component tag on the delivered revision; declare the capability unavailable and fail closed when the repository host cannot do it |
 | `close` | mark it delivered |
 
 **A binding must also declare what its tracker does NOT provide.** An absent capability that goes
@@ -226,6 +248,14 @@ So the routing is **data, not inference**. The analyst records the domain on the
 - a label `domain:<name>` — queryable, and lets a dev filter to work it is equipped for;
 - a line in the metadata block: `domain: <analysis-rules> → <implementation-rules>`.
 
+**The label's `<name>` is a stable domain identifier, never a skill name.** `<analysis-rules>` and
+`<implementation-rules>` are the two rule books the arrow already carries — they do not need a second
+home. Check `list_state`'s tracker for an existing `domain:<name>` before minting one: reusing
+`domain:engine` across every engine issue is what lets a dev filter to it at all, and a fresh
+`domain:propose-engine` label — a skill name wearing the domain field's shape — is invisible to that
+filter and answers a question nobody asked. One label per subsystem, however many rule books route
+into it.
+
 **The arrow has sides, and the sides are not interchangeable.** The analyst loads the LEFT-hand
 book; the dev loads the RIGHT-hand one. An analysis rule book defines what is worth *filing* — its
 priorities and its evidence bar — not what makes an implementation *done*; a dev that loads it has
@@ -270,7 +300,7 @@ that write only to a scratch directory outside the repo, and read CI, logs and h
 analyses" is not "only reads docs" — run whatever you need to reach a defensible conclusion, as long
 as it leaves no trace in the repo.
 
-Its single output is a **single item on the tracker**.
+Its tracker output is **at most one item**: file the strongest defensible finding, or file nothing when no finding survives verification.
 
 ### Before analysing anything new, drain `analysis`
 
@@ -315,12 +345,44 @@ definition's `skills` field is not applied when it runs as a teammate**, so the 
 cannot be pinned there; name it in the spawn prompt instead. That is the same routing problem the
 issue solves with its `domain:` field, arriving one layer earlier.
 
+### Autonomous discovery when no conditions are supplied
+
+Use this fallback contract only when neither the caller nor the repository supplies a domain scale:
+
+- Domain identifier and label: `general`; routing metadata: `domain: issue-flow#autonomous-discovery → none`, naming this built-in analysis contract and explicitly declaring that no implementation rule book exists.
+- Priority scale: `priority`, ordered `critical > high > medium > low`. `critical` means immediate
+  material harm or unusability; `high` means major correctness, security, reliability or performance
+  impact; `medium` means bounded user or engineering impact; `low` means worthwhile improvement with
+  minor impact. Give a finding-specific rationale.
+- Identity: derive a stable key from the affected subsystem and failure or opportunity, not from the
+  current run or wording.
+- Search broadly but converge on ONE strongest evidenced finding. Confirm it is not already tracked,
+  intentionally accepted, or contradicted by repository history before filing.
+- Prefer root causes and leverage over cosmetic symptoms. Absence of an obvious defect is not proof
+  that the repository has no opportunity; inspect boundaries, failure paths, invariants, tests,
+  performance hotspots and mismatches between documentation and behaviour.
+- If no defensible finding survives verification, report that no issue was filed and list the areas
+  and evidence checked. Never lower the evidence bar merely to produce an item.
+
 ### What the analyst produces
 
 An issue a developer can pick up **without redoing the analysis**. If the dev has to re-derive your
 reasoning, the analysis bought nothing.
 
 ```markdown
+## Description for dumb humans
+
+> [!NOTE]
+> One or two sentences, plain language, no jargon, no file paths, no metrics — what this issue is
+> about, for someone who will never read past this line. Written in whatever language the operator
+> configuration names for this installation (see the table at the end of this file). The header
+> itself is the fixed, literal title above — always in English, always that exact phrase, never
+> reworded per issue. `> [!NOTE]` is GitHub's native alert syntax — it renders as a bordered,
+> coloured callout, which is the point: this has to be visually impossible to miss on an issue
+> otherwise full of technical prose.
+
+This is the first thing on the issue, before `## Problem`.
+
 ## Problem
 What is wrong or missing, and how you know. Evidence, not assertion:
 file:line references, measured numbers, logs, reproduction steps.
@@ -362,8 +424,8 @@ blocker is useful. A silent gap is not.
 Picks up analysed work and implements it.
 
 1. **Select — but drain `review` first.** `list_state(review)` for unassigned items before you look
-   at `ready`. Those are changes that are **already built, verified and reviewed**, parked because
-   delivery was refused, and every one of them is closer to shipping than anything you could start
+   at `ready`. Those are changes that are **already built and published**, parked somewhere in
+   review, CI or delivery, and every one of them is closer to shipping than anything you could start
    today. **Finishing beats starting**: an unclaimed `review` item outranks the whole `ready` queue
    regardless of priority, because its cost is already sunk and its branch rots while it waits.
    Re-read what blocked it — a permission, a gate, a decision — and check whether it still holds
@@ -371,9 +433,12 @@ Picks up analysed work and implements it.
    exactly like a `ready` item** — step 2 applies unchanged — before touching anything: parked work
    is still contended work.
 
-   Only when nothing is parked in `review`: `list_state(ready)`, highest priority, no assignee. If you were given
-   domain rules, honour their priority scale; with none — or where they are silent — prefer the
-   oldest ready issue over the newest.
+   Only when nothing is parked in `review`: call `list_state(ready)` for unassigned work. For every
+   candidate with a valid scale contract, partition by `domain:<name>` and scale, select the highest
+   value inside each partition, then choose the oldest partition head; never compare the values of
+   two heads. If the caller selected a domain, choose that partition's highest-ranked oldest item
+   instead. Only when no candidate has a valid scale contract, prefer the oldest ready issue over
+   the newest. Do not silently treat a legacy or malformed priority marker as a valid contract.
 2. **`claim`**, then **verify the claim held**. A server-side tracker is the shared board, which is
    what makes this work at all; it is not a mutex.
    **How you verify is the binding's business, and it is not the same everywhere.** Where claims
@@ -392,32 +457,70 @@ Picks up analysed work and implements it.
    below). If yours is not the earliest, you lost: release the item, comment that you are backing
    off, and take the next one. Losing is cheap and takes seconds; two runs building the same issue
    is not.
-3. **`transition` to `in-progress`** (which drops `ready` in the same call). The claim comment was
-   already written in step 2 — **do not write a second one**: the race is adjudicated by the
-   EARLIEST claim comment, so a late "re-claim" comment muddies the very record you may need to
-   prove you won.
+
+   **A claim binds only what the tracker can see, so renew it before the first thing it cannot.**
+   Creating a branch, adding a worktree, writing any file — those are writes outside the board, and a
+   run that lost the race by seconds has typically not re-read the timeline by the time it makes
+   them. Run `verify_claim` immediately before that first write and treat the answer as binding:
+   nothing has been created yet, so standing down costs one comment. Seen live (2026-07-24, issue
+   #58): two runs claimed 1m46s apart, both derived the SAME worktree path from the same convention,
+   and the loser — which never re-read after claiming — wrote its model, its migration and its tests
+   into the winner's checkout while the winner was mid-build. **One task is one agent, and this
+   renewal is where that is actually enforced**; the claim comment only records who asked first.
+   When the claimed item already carries `review`, keep it there and resume at step 6. Transition it
+   back to `in-progress` only if addressing review or CI requires a code change; after that change,
+   publish the new head and repeat review plus CI. A delivery-only resume must not pretend the code
+   is being built again.
+3. **For a `ready` item, `transition` to `in-progress`** (dropping `ready` in the same call), **and attach
+   `dev:<runtime>` in the same step** (see *Why this cannot be left to the tracker* above). Seen
+   live: an issue correctly assigned, claimed and transitioned, with the `dev:<runtime>` label added
+   only later at close — which means for the entire build, the one query the label exists to answer
+   ("what is that runtime holding right now") could not find it. The claim comment was already
+   written in step 2 — **do not write a second one**: the race is adjudicated by the EARLIEST claim
+   comment, so a late "re-claim" comment muddies the very record you may need to prove you won.
 4. **Load the domain named on the issue** (`domain:` label or metadata line) before touching
    anything — see Routing above — then **implement under the target repository's own rules**, whatever they are — branching, review,
    versioning, testing. Read that repo's agent instructions (`AGENTS.md` or equivalent) and follow
    them. This skill has no opinion on how a project *builds* — testing, review, versioning, release
    are all its business. Where the repo is silent about how work is **isolated and integrated**, use
    the default flow below rather than inventing one.
+   **"Load" means you read it, not that you tell a delegate to.** If your plan is to hand
+   implementation to a sub-agent and your only contact with the domain is a line in that sub-agent's
+   prompt saying "also read X", you have not loaded the domain — you have asked someone who cannot
+   see or change your delegation plan to load it after that plan is already fixed. This matters
+   because a domain is not always just priorities and a definition of done: some name their OWN
+   orchestration contract — a fixed phase structure, a step that must never be delegated (a
+   measurement run, a git operation), a specific sub-agent division of labour. That contract can only
+   shape how you build if you read it BEFORE deciding whether and how to delegate, not after handing
+   the work off. Read the domain yourself, first; only then decide your delegation strategy — and if
+   the domain prescribes its own orchestration, follow that structure instead of substituting a flat
+   one-shot delegation that happens to produce a similar-looking diff.
    **Done is defined by the issue's acceptance criteria.** Domain rules, when supplied, add to them —
    a measurement discipline, required benchmarks, ship gates — but never replace them, and their
    absence is not licence to lower the bar the analyst set.
-5. **Get the change reviewed by a context that did not write it**, then **move to `review`**,
-   linking the branch or PR. Renew the claim first — launching a review is one of the boundaries
-   `verify_claim` covers (*A heartbeat is a claim renewal* below), and a run that was displaced
-   during a long build should find out before spending a reviewer, not after. Where the
+5. **Publish the review target, then move to `review`**, linking the branch or pull request. Renew
+   the claim first — publishing review is one of the boundaries `verify_claim` covers (*A heartbeat
+   is a claim renewal* below), and a run displaced during a long build must find out before it
+   publishes anything. When the configured delivery route is `pull request`, push the branch and
+   open or reuse the PR BEFORE transitioning: `review` must point to the head and base SHAs the
+   reviewer and CI are about to judge, not to an unshared local tree. A resumed issue reuses its
+   existing open PR; creating a duplicate is not recovery.
+6. **Get the published change reviewed by a context that did not write it, then require green CI on
+   the latest PR head.** Capture the head and base SHAs before review and require the verdict artifact
+   to name both explicitly; a floating "approved" is not evidence for any particular revision or
+   diff. Where the
    configuration authorises it, obtain that context yourself — a
-   sub-agent or a teammate; where it does not, hand the diff to a separately started analyst run and
-   say on the issue that you are waiting for it. What the configuration decides is who starts the
-   review, never whether it runs.
-6. **If delivery is blocked, STOP THERE and leave it in `review`.** Work that is built and
-   verified but cannot be shipped — a gate refuses it, a permission is missing, two project rules
-   contradict each other — is *finished work awaiting delivery*, which is exactly what
-   `review` means. Do not move it to `done`: that state says delivered. Do not work around the blocker
-   either; a rule you bypass to ship is a rule that stops meaning anything.
+   sub-agent or teammate; where it does not, hand the PR to a separately started analyst run and say
+   on the issue that you are waiting for it. What the configuration decides is who starts the
+   review, never whether it runs. Every push invalidates the prior verdict and CI result: re-review
+   the changed surface and wait for the required checks again.
+
+   If review, CI or delivery is blocked, STOP THERE and leave it in `review`. Work that is built and
+   published but cannot be shipped — a reviewer requests changes, a check fails, required native
+   approval cannot be supplied by a distinct identity, a permission is
+   missing, two project rules contradict each other — is *finished work awaiting delivery*, which
+   is exactly what `review` means. Do not move it to `done`: that state says delivered. Do not work
+   around the blocker either; a rule you bypass to ship is a rule that stops meaning anything.
 
    Comment the blocker precisely — what refused it, what that thing expects, what the project
    requires instead — then unassign so another actor can complete the delivery. Restore any local
@@ -426,13 +529,40 @@ Picks up analysed work and implements it.
    **A blocker that comes from two project rules contradicting each other deserves its own issue.**
    It will hit the next task, and the one after that, and each run will re-diagnose it from scratch.
    One filed finding turns a recurring tax into a decision someone can make once.
-7. **`close` on merge** — which moves the state to `done` and then, on trackers that have one, sets
-   their own closed flag. Delivery is the last `verify_claim` boundary: renew before you merge, not
-   after. Carry your run identity in the closing comment and state what was actually
-   verified: measured numbers, tests run, **and the delivering commit SHA** — branches get deleted
-   after merge, and the SHA is the join between code and issue that survives the deletion. Never
-   just the word "done"; the state already says that, and the comment exists to say what it cost to
-   earn it.
+7. **Merge only the reviewed PR head after its required CI is green, publish any version tags, then
+   `close`.** Renew the claim
+   immediately before merging, require `reviewed head/base == CI head/base == current head/base`,
+   bind the merge to the reviewed head SHA, and refuse if either side moved. Use the configured merge strategy; a `merge commit`
+   preserves the branch boundary and PR ancestry, while squash and rebase deliberately discard that
+   information. Retrieve the delivered SHA after merge and verify it has exactly the reviewed base
+   and reviewed head as its parents; do not claim topology preservation from a command flag alone.
+   A merge queue is eligible only when its configured method guarantees that same topology. If the
+   project requires CI on the exact delivered SHA, wait for that post-merge gate.
+
+   **A version bump is not delivered until its immutable tag exists on the remote.** After the exact
+   delivered-SHA gate is green, inspect the final change for every app or project whose declared
+   version increased. For each one, create an annotated tag pointing to the delivered SHA and push
+   that exact tag. Reuse the repository's established component tag convention. Exactly one
+   historical convention must match: competing conventions, an unclear component identity, or
+   uncertainty over single-product versus independently versioned monorepo components is a naming
+   blocker and stays in `review`. Only when history is empty and classification is unambiguous, use
+   `vX.Y.Z` for a single-product repository or `<component>/vX.Y.Z` for an independently versioned
+   component. Never move, overwrite or force-push an existing version tag. A tag that already points
+   elsewhere is a delivery blocker, not permission to rewrite release history.
+
+   A Git tag and a GitHub Release are different artifacts: the tag is mandatory; create the Release
+   too only when the repository already publishes Releases for that component or its configuration
+   requires one. In that case, build the Release from the already-pushed tag and verify the tag
+   exists remotely rather than letting GitHub create an implicit tag against the wrong target.
+   **Renew the claim again after every post-merge or publication wait and immediately before
+   `close`**; merge, version publication and close are separate irreversible boundaries.
+
+   `close` moves the state to `done` and then, on trackers that have one, sets their own closed flag.
+   Carry your run identity in the closing comment and state what was actually verified: review
+   verdict, CI run or checks, measured numbers, tests run, PR, **the delivering commit SHA**, and
+   every version tag or Release published.
+   Never write just "done"; the state already says that, and the comment exists to show what earned
+   it.
 
 ### Working in a repository — the default flow
 
@@ -482,10 +612,20 @@ so check what your setup expects before settling on a pattern.
 as a comment where it does not; the binding says which. A branch nobody can find from the issue is
 work nobody can follow, and the board's whole value is that following work never requires guessing.
 
-**Name the branch and the worktree after the ISSUE, not after the run.** The issue number is what
-joins the code back to the board without anyone parsing prose, and it survives a run that the
-attribution can no longer explain. Where the repo's naming convention allows it, carry the run-id
-too — but the number is the part that must be there.
+**Name the BRANCH after the issue; make the WORKTREE PATH unique per RUN.** The issue number is what
+joins the code back to the board without anyone parsing prose, and it survives a run whose
+attribution nobody can explain any more — so the branch carries it, and the branch is what the PR,
+the development sidebar and the merge all key on.
+
+The worktree path is a different question with a different answer. It is a *local directory* joined
+to nothing, and deriving it purely from the issue means two runs that both want issue 58 compute the
+same path and share one checkout. Git will not save you: `worktree add` refuses a branch already
+checked out elsewhere, but **nothing refuses a second process writing into a directory that already
+exists**. So put the run-id in the path — `<root>/<repo>/<issue>-<slug>-<run-id>` — and the collision
+becomes impossible instead of merely unlikely. The cost is one stale directory when a run dies; the
+cost of the shared path is two agents editing one tree with no record anywhere that it happened
+(seen live on #58, 2026-07-24: model, migration and test files appearing in a checkout their author
+had created clean minutes earlier).
 
 **A fresh worktree does not have the files git never tracked.** Everything gitignored — environment
 files, secrets, credentials, local settings — is simply absent, and the failure it produces is
@@ -500,9 +640,23 @@ it; the dev that starts working confirms it is in one before touching a file. Sk
 working in the shared tree clobbers whoever else is building — and unlike two devs on one issue,
 **nothing on the board records it**. That is precisely why this rule cannot be left to a domain.
 
-**3. Integrate the base before delivering, then verify again.** Your branch was verified against the
-base as it stood when you started; every merge landed since then ages that result. Bring the base in,
-resolve honestly, and **re-run the verification**:
+**Verify it again the moment the tree surprises you.** A file you did not write, a modification to a
+file you never touched, a tool reporting that something changed under you — inside a worktree that is
+supposed to be yours alone, every one of those means another process is in your directory. Stop
+writing and run `verify_claim`; the timeline, not the filesystem, decides who continues:
+
+- **You are not the earliest claimant** → stand down. Leave what is there, change no state, and say
+  on the issue what you saw and where your own work is, so the holder can pick it up.
+- **You are** → say so on the issue naming the other run, and **adopt what it left rather than
+  deleting it**. Its work is real even though the coordination failed, and two runs converging on one
+  issue usually converge on a similar design.
+
+What is never right is editing around the intruder. That produces one tree holding two designs and a
+build that belongs to nobody — strictly worse than either run's work alone.
+
+**3. Integrate the base before publishing the PR, then verify again.** Your branch was verified
+against the base as it stood when you started; every merge landed since then ages that result. Bring
+the base in, resolve honestly, and **re-run the verification**:
 
 ```bash
 git fetch origin
@@ -523,17 +677,24 @@ tells you never to perform on the base, applied to work someone else is holding.
 Rebase only where the repository asks for it and nothing points at the SHAs. A repo rule outranks
 this default like every other.
 
-**4. Land the reviewed commit, not a new one.** Where the flow has you merge the work yourself,
-merge so the base fast-forwards: what arrives on the base is then exactly the commit that was
-verified. A merge commit is by definition a commit nobody reviewed, and it leaves the delivery one
-step away from the thing that was checked — enough for a gate that verifies the tip to refuse the
-whole thing, correctly. If it will not fast-forward, the base moved while you worked: that is step 3
-again — integrate, re-verify, retry. Do not reach for a flag that forces it through.
+**4. Preserve the reviewed history through the configured delivery route.** For a pull-request
+route, push the branch, open the PR, and bind review and required CI to its latest head SHA. Merge
+with a merge commit when preservation of merge information is configured: the merge commit records
+the branch boundary and the PR retains the review and CI evidence. Never squash or rebase in that
+mode; both replace the reviewed topology with a different history.
 
-**Whether you may land it at all is a project decision, not yours.** Some repositories want a pull
-request and a human; some pre-authorise the delivery. **Default to asking** unless the repository or
-your configuration says otherwise, and when a permission gate refuses the push, report it — never
-open a pull request as a silent workaround for a rule you could not satisfy.
+The merge commit itself is a new SHA, so distinguish two gates instead of pretending otherwise:
+pre-merge CI proves the PR head (and, where the host provides it, its merge candidate); a repository
+that requires the exact delivered SHA must also run its post-merge gate before the issue closes.
+For both gates, the expected set is the union of host-required checks and every applicable lane the
+repository names; a missing or skipped expected lane is not green. If the base or PR head moves
+before merge, return to step 3, re-verify, re-review the changed surface, and re-run required CI.
+Never bypass the race with an administrative override.
+
+**Whether you may land it at all is a project decision, not yours.** Some repositories require a
+human decision; some pre-authorise delivery after review and CI. **Default to asking** unless the
+repository or configuration says otherwise. A pull request is a configured delivery route, not a
+silent workaround for a refused direct push.
 
 **5. Clean up what you created.** Remove the worktree once the work is delivered or abandoned. An
 orphaned worktree keeps its branch checked out, and the next run that tries to use that branch gets a
@@ -549,6 +710,17 @@ A run dies. The process is killed, the sandbox expires, the budget runs out mid-
 `in-progress` with an assignee, and selection never surfaces it — step 1 drains `review` and
 `ready`, never `in-progress` — so **nobody ever picks it up again**. This is not an exotic failure — it is the ordinary end of
 a long autonomous run, and it is the one way this board rots without anyone doing anything wrong.
+
+**The same death can land one step earlier, before the state ever moved.** Step 2 (claim: assignee +
+comment) and step 3 (`transition` to `in-progress`) are two separate calls — a run that dies between
+them leaves an issue with an assignee and a claim comment that still carries `status:ready`, because
+the label swap never ran. The same gap exists at the other end: a run that dies after step 4 (the work
+is done) but before step 5's `transition` to `review` leaves finished, working code sitting on an issue
+that still says `in-progress`. Seen live: five issues claimed and commented, none ever relabeled — the
+dead runs' horizons had long passed, but every one of them still read `status:ready` to anyone
+scanning labels. In every case `list_state` still filters correctly (`no:assignee` excludes it from its
+queue), but the label lies to anyone reading it directly, and — unless the rule below is read for what
+it actually covers — the issue looks neither claimed nor reclaimable.
 
 Worth knowing before you assume you are missing something obvious: **nothing else solves it either.**
 Claude Code's agent teams document the same failure — *"teammates sometimes fail to mark tasks as
@@ -600,17 +772,25 @@ read. Only a stop answer from a *successful* read ends the work. Treating a time
 lets a flaky network halt every run; treating it as clearance lets a run write deaf, which is the
 defect this rule exists to close.
 
-**Reclaiming.** An issue is reclaimable when it is `in-progress` **and** its last activity —
-any comment, label change or referenced commit — is past the declared horizon, or more than a few
-hours old when no horizon was declared. Then:
+**Reclaiming.** An issue is reclaimable when it carries an assignee and/or a claim comment naming a
+run-id — **in any state, not only `in-progress`** — and its last activity — any comment, label
+change or referenced commit — is past the declared horizon, or more than a few hours old when no
+horizon was declared. The state label is deliberately not part of the precondition: it is exactly
+what a dead run may never have gotten to write, so a claimed issue still wearing `status:ready` or
+`status:review` is reclaimable by the same rule as one caught mid-build under `in-progress`. Then:
 
 1. **Comment before touching anything**: `Reclaiming from <run-id>; last activity <timestamp>,
    horizon <declared or none>.` The record of the takeover matters more than the takeover.
 2. Replace the assignee with your own, **and remove the dead run's attribution marker as you add
    yours** — it cannot do it itself, which is the whole reason you are here. Skip this and the item
    ends up claiming two runtimes hold it. Then continue from whatever the dead run left on the issue.
-3. **Do not discard its work.** A pushed branch, a commented diagnosis, a ruled-out hypothesis are
-   all still valid — which is precisely why everything goes on the issue as it happens.
+3. **Do not discard its work, and do not assume the label is where the work actually got to.** A
+   pushed branch, a commented diagnosis, a ruled-out hypothesis are all still valid — which is
+   precisely why everything goes on the issue as it happens. If what the dead run left shows the
+   work is further along than the label says — a linked PR or a finished diff sitting there while
+   the issue still reads `ready` — transition straight to the state the evidence supports instead of
+   restarting from `in-progress`; re-doing already-finished work is the exact waste this rule exists
+   to avoid.
 
 **Reclaiming is not a race won.** If the original holder was alive and merely slow, its next
 `verify_claim` surfaces your comment — which is why the comment names who you took it from. It then
@@ -710,7 +890,7 @@ never reconstructed after it to match what you happened to build.
 | `analysis` | being analysed, or returned by a dev as wrong | analyst |
 | `ready` | specified, unassigned, implementable | analyst |
 | `in-progress` | claimed and being built | dev |
-| `review` | built, verified and reviewed; awaiting delivery | dev |
+| `review` | built and published; awaiting or undergoing independent review, CI and delivery | dev |
 | `blocked` | needs something external and nothing is built yet; the blocker and its discharger are named in the issue | either |
 | `done` | merged and verified | dev |
 
@@ -827,50 +1007,25 @@ Two consequences worth acting on:
 <!-- issue-flow:config:start -->
 ---
 
-## Operator configuration — LOCAL to this installation
+## Operator configuration
 
-Everything above is the skill. What follows is **this installation's answers** to the choices the
-skill deliberately leaves open, written down so a run has them without having to ask. It is
-configuration, not portable guidance.
-
-⚠️ **Reset this table to the skill defaults (or remove the section) before sharing or publishing a
-configured copy.** Shipping your values hands your permissions to whoever installs the file — and
-two rows below remove confirmation steps.
+The table below contains portable defaults only. Before using it, look for `operator.local.md`
+beside this file. When present, read it and let its same-named rows override this table; its
+additional instructions are local policy too. That file contains permissions and machine-specific
+paths, is ignored by Git, and MUST NOT be committed or published.
 
 | Setting | Value here | Skill default |
 |---|---|---|
 | Delivery authorisation | ask | ask |
+| Delivery route | direct | direct |
 | Review delegation | ask | ask |
-| Merge strategy | merge | merge |
+| Merge strategy | merge commit | merge commit |
 | Worktree location | unset | unset |
-| Tracker | `github` → `bindings/github.md` | `github` (also `linear`, `trello`) |
+| Tracker | `github` | `github` (also `linear`, `trello`) |
 | Project board | none | none |
-
-**Delivery pre-authorisation, stated precisely**, because it is the one that removes a safety step: a
-dev whose work has met the issue's acceptance criteria and cleared the project's gates **merges and
-pushes it on its own** — no pull request, no confirmation, no "shall I proceed?". If a permission
-gate refuses the push, the authorisation still stands: report the refusal and stop there. Never open
-a pull request as a quiet workaround for a push you were not allowed to make.
-
-**Review delegation** authorises a dev run to obtain its own reviewer — a sub-agent or a teammate —
-rather than stopping to ask or waiting on a session someone else has to start. It buys unattended
-delivery in one pass. It does not buy a cheaper review: the reviewer is still a context that did not
-write the code, and a run that reviews itself has satisfied nothing regardless of what this row says.
-
-**It authorises one direction only.** A dev obtaining a reviewer is safe: the reviewer is read-only,
-bounded by the diff, and reports back to the run that asked. The reverse — an analyst starting a dev
-— is not the mirror image and is never authorised here. It would let the actor that judged a piece of
-work create the actor that implements it, which is exactly the separation this workflow exists to
-hold. Analysts hand work over by **filing it in `ready`**; a dev run started independently picks it
-up. The board is the handoff, and that is why neither role needs to know the other exists.
-
-Nothing here lowers the bar. Work that has not met the acceptance criteria is not eligible for
-delivery, authorised or not — the authorisation removes the question, not the gate.
+| "Description for dumb humans" sentence language | English | English |
 
 <!-- issue-flow:config:end -->
 
-> The two markers around this section are a contract, not decoration: `install.sh sync` (or
-> `install.ps1 sync` on Windows) replaces
-> everything OUTSIDE them with a newer version of the skill and puts what is INSIDE back untouched.
-> Edit the values freely — by hand, or with `install.sh config --set "<Setting>=<value>"` — but do
-> not move or delete the markers, and do not put anything you want kept outside them.
+> The two markers delimit the default template used when the installer creates
+> `operator.local.md`. Configure the ignored local file, never this versioned block.

@@ -115,6 +115,7 @@ type — resolve both at setup and store both ids.
 | `last_activity` | `issue(id) { updatedAt comments { nodes { createdAt body } } }` |
 | `label` | resolve the label id, `issueLabelCreate` if absent, then `issueUpdate(id, input: { labelIds })` — the full set, so read-modify-write |
 | `unassign` | `issueUpdate(id, input: { assigneeId: null, labelIds: <current minus dev:runtime> })`. **Exception — releasing work another run still holds** (lost race, stand-down): remove only your `dev:<runtime>` label; `assigneeId` is singular and currently names the winner, so nulling it strips the active holder |
+| `publish_version` | unavailable: Linear is the task tracker, not the repository host. A version bump cannot close until the active repository-host binding publishes and verifies its tag; if no such binding is available, fail closed |
 | `close` | `transition` to the `done` state (type `completed`), with a comment stating what was verified |
 
 **`label` replaces the whole set.** Unlike `gh issue edit --add-label`, `labelIds` is the complete

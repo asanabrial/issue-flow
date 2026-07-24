@@ -32,8 +32,8 @@ analysis ──> ready ──> in-progress ──> review ──> done
 - **ready** — specified, unassigned, implementable. Drained by devs, highest priority first.
 - **in-progress** — claimed and being built. Guarded by a stale-claim rule: a run that dies holding
   an issue is detected by its silence and the work is reclaimed, never stuck forever.
-- **review** — built, verified and reviewed; awaiting delivery. Unassigned items here outrank the
-  whole `ready` queue: finishing beats starting.
+- **review** — built and published; awaiting or undergoing independent review, CI and delivery.
+  Unassigned items here outrank the whole `ready` queue: finishing beats starting.
 - **blocked** — waiting on something external, with the blocker *and who can discharge it* named.
 - **done** — merged and verified, stated with evidence, never just the word "done".
 
@@ -158,9 +158,9 @@ its priorities, its evidence requirements and its identity scheme — and never 
 which is what keeps it portable.
 
 **How is my configuration kept across upgrades?**
-Settings live between two markers inside `SKILL.md`. The installer's `sync` replaces everything
-outside the markers and puts what is inside back untouched, backing the file up first. Re-running
-the install one-liner upgrades the same way.
+Portable defaults live between two markers inside `SKILL.md`. Operator values live separately in
+the ignored `operator.local.md`, so updating or publishing the skill cannot disclose permissions,
+machine paths or tracker identifiers.
 
 ## Layout
 
@@ -175,9 +175,14 @@ install.sh / install.ps1          self-acquiring installers (pipe them or run th
 
 ## Configuration
 
-Settings live in one marked block at the end of `SKILL.md` — tracker, merge strategy, worktree
-location, and whether delivery is pre-authorised. It is a table with the defaults written next to
-each value, so it reads on its own.
+Settings live in the ignored `operator.local.md` beside `SKILL.md` — tracker, delivery route, merge
+strategy, worktree location, and whether delivery is pre-authorised. The installer creates it from
+the marked defaults in `SKILL.md` on first use. A pull-request route publishes the branch
+for independent review, waits for required CI on the latest head, and then merges using the selected
+strategy. When that delivery changes an app or project version, issue-flow creates an annotated,
+immutable tag on the delivered commit and pushes it to the remote before closing the work. GitHub
+Releases remain a separate publication layer and follow the repository's existing convention. The
+configuration is a table with the defaults written next to each value, so it reads on its own.
 
 Edit it by hand, or from the installer:
 
@@ -186,22 +191,19 @@ Edit it by hand, or from the installer:
 ./install.sh config --set "Worktree location=/wt/<repo>/<branch>"
 ```
 
-The installer matches a setting **by its name** and carries no list of its own, so a row added to the
-skill is settable immediately without touching either script. It backs the file up first, refuses a
-name that matches no row or more than one, and refuses a value containing `|`, which would split the
-cell and corrupt the table.
+The installer matches a setting **by its name** and carries no list of its own, so a default row
+added to the skill is settable immediately without touching either script. It backs the local file
+up first, refuses a name that matches no row or more than one, and refuses a value containing `|`,
+which would split the cell and corrupt the table.
 
-`sync` upgrades the skill while keeping that block:
+`sync` upgrades the versioned skill while leaving `operator.local.md` untouched:
 
 ```sh
 ./install.sh sync --from ./newer-SKILL.md
 ```
 
-It backs the file up first, and refuses outright if it cannot find the markers rather than risk
-dropping your settings.
-
-**Reset the block to the defaults (or remove it) before sharing a configured copy.** Your values are
-your permissions, including whether an agent may push without asking.
+It backs the skill up first. Never force-add `operator.local.md`: its values are permissions,
+including whether an agent may publish or merge without asking.
 
 ## Status
 
