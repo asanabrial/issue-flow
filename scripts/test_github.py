@@ -197,6 +197,81 @@ check("bold is stripped", parsed["delivery route"], "pull request")
 check("`delivery route` is not shadowed by `delivery authorisation`",
       m.cfg(parsed, "delivery route"), "pull request")
 
+# --------------------------------------------------------------------------------------
+# Changelog extraction. A tag is immutable, so notes attached to the wrong entry cannot be
+# corrected afterwards. The defect below was caught against a real changelog: an entry whose
+# whole point was that a version did NOT ship in it was matched for that version, ahead of the
+# genuine entry, because the version was found anywhere on the heading line.
+# --------------------------------------------------------------------------------------
+
+CHANGELOG = """# Changelog — Engine
+
+### 2026-07-25 — (sin bump de versión) #69: asesor oscuro (comportamiento sin cambios, sigue en v6.9.8)
+- No shipped behaviour change.
+
+### v6.9.8 (2026-07-25) — PATCH: the real entry
+- The genuine note.
+- A second line.
+
+### v6.9.7 (2026-07-24) — PATCH: older
+- Older note.
+
+### v1.2.30 (2026-07-01) — decoy for prefix matching
+- Should never be returned for 1.2.3.
+"""
+
+got = m.changelog_section(CHANGELOG, "6.9.8")
+check("the version must OPEN the heading, not merely appear in it",
+      got[0].startswith("### v6.9.8"), True)
+check("the wrong entry's body is not returned", "No shipped behaviour change." in got[1], False)
+check("the right entry's body is returned", "The genuine note." in got[1], True)
+check("the heading is the whole line, not truncated at the version",
+      got[0].endswith("PATCH: the real entry"), True)
+check("the section stops at the next same-level heading", "Older note." in got[1], False)
+
+check("a `v` prefix on the query is tolerated",
+      m.changelog_section(CHANGELOG, "v6.9.8")[0], got[0])
+check("1.2.3 does not match 1.2.30", m.changelog_section(CHANGELOG, "1.2.3"), None)
+check("an absent version returns nothing, rather than a near miss",
+      m.changelog_section(CHANGELOG, "9.9.9"), None)
+
+KEEP_A_CHANGELOG = "## [1.2.3] - 2026-01-01\n- Bracketed style.\n\n## [1.2.2] - 2025-12-01\n- Older.\n"
+check("Keep a Changelog bracketed headings work",
+      "Bracketed style." in m.changelog_section(KEEP_A_CHANGELOG, "1.2.3")[1], True)
+
+# A pre-release entry sitting ABOVE the real one must not be picked up for the release version.
+# `(?![0-9.])` allowed it, because `-` is neither a digit nor a dot.
+PRERELEASE = """# Changelog
+
+### v6.9.8-rc1 (2026-07-20) — draft, never shipped
+- Release candidate note.
+
+### v6.9.8 (2026-07-25) — the real release
+- The genuine note.
+"""
+check("a -rc suffix does not satisfy a query for the release version",
+      "Release candidate note." in m.changelog_section(PRERELEASE, "6.9.8")[1], False)
+check("the real release entry is the one returned",
+      "The genuine note." in m.changelog_section(PRERELEASE, "6.9.8")[1], True)
+check("a build-metadata suffix is likewise a different version",
+      m.changelog_section("### v1.0.0+build5\n- x\n", "1.0.0"), None)
+check("querying the pre-release explicitly still works",
+      "Release candidate note." in m.changelog_section(PRERELEASE, "6.9.8-rc1")[1], True)
+
+# Two headings for one version must not be resolved by silently taking the first: whichever is
+# chosen becomes a permanent tag message.
+DUPLICATE = "### v2.0.0 — superseded draft\n- Draft.\n\n### v2.0.0 — the real one\n- Real.\n"
+try:
+    m.changelog_section(DUPLICATE, "2.0.0")
+    check("a duplicated version heading is refused, not silently resolved", False, True)
+except m.Stop as stop:
+    check("a duplicated version heading is refused, not silently resolved",
+          stop.payload["reason"], "ambiguous-changelog-entry")
+
+# Case folding must follow the filesystem, or two distinct POSIX worktrees collapse to one key.
+check("path case is folded only where the filesystem folds it",
+      m.normalise_path("/tmp/A") == m.normalise_path("/tmp/a"), os.name == "nt")
+
 print()
 print(f"{len(FAILURES)} failure(s)" + (f": {FAILURES}" if FAILURES else ""))
 sys.exit(1 if FAILURES else 0)
