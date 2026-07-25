@@ -169,9 +169,24 @@ SKILL.md                          the workflow: roles, states, claiming, deliver
 bindings/github.md                how each operation is performed, per tracker
 bindings/linear.md
 bindings/trello.md
+scripts/github.py                 the GitHub binding's reversible operations, executable
 examples/domain-test-coverage.md  a worked domain rule book
 install.sh / install.ps1          self-acquiring installers (pipe them or run them)
 ```
+
+**Why an operation is a script and not a paragraph.** The failures this workflow keeps recording are
+not wrong decisions — they are steps that were never executed. A run moved labels correctly through
+the whole state machine and mirrored the project board zero times in an entire session, with the
+permission it needed present the whole way. Five issues were claimed, commented, and never relabeled.
+Every instruction involved was present and correct. So the operations that are **mechanical and
+verifiable** — state written to two surfaces and read back, a claim race adjudicated by timestamp, a
+per-run worktree path, PR reuse, the closing-keyword scan — execute as code, and the ones that need
+**judgement** stay in prose. Irreversible remote writes (merge, version tags, close) are deliberately
+left to the agent: a defect in a script must not be able to merge, tag or close anything.
+
+The script needs Python 3 and `gh`. Its exit codes separate "a check said stop" from "the read
+failed" — treating a timeout as a stand-down halts every run, treating it as clearance lets a run
+write deaf, and it never collapses the two.
 
 ## Configuration
 

@@ -2,3 +2,4 @@
 operator.local.md
 # Local AI runtime state
 .atl/
+__pycache__/

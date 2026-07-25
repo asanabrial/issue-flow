@@ -3,7 +3,7 @@ name: issue-flow
 description: "Trigger: issue-flow analyst [conditions], issue-flow dev, analyst, developer, claim issue, move task states. Analysts file at most one evidenced issue; without conditions, audit the repository critically."
 metadata:
   author: asanabrial
-  version: "1.9.0"
+  version: "1.10.0"
 ---
 
 # Issue Flow — Analyst / Dev over a shared issue tracker
@@ -150,6 +150,24 @@ criteria are the definition of done, and the repo's conventions govern how you b
 Everything below is written in **operations**, not commands. Which tracker performs them, and how,
 lives in one file per tracker under `bindings/`, selected by the operator configuration at the end of
 this file. Load that one file and ignore the rest; no command for any tracker appears outside it.
+
+**A binding may implement an operation as an executable rather than as prose, and where it does, run
+it instead of composing the calls yourself.** This is not a convenience: the failures this workflow
+keeps recording are not wrong decisions but *steps that were never executed* — a board mirrored zero
+times in a whole session, five issues claimed and never relabeled, a heartbeat loop that never
+re-read the timeline. Every one of those instructions was present and correct. A run that skips a
+step it was asked to remember produces no error and no signal, which is precisely what an executable
+removes: the read-back either ran or the command did not exit cleanly. It is the same move as
+declaring the analyst with a read-only tool allowlist instead of asking it nicely, applied to the
+half of the workflow that is mechanical.
+
+**Which half that is, is the whole design.** An operation belongs in an executable when it is
+mechanical and verifiable — a state written to two surfaces and read back, a race adjudicated by
+timestamp, a path derived from configuration. It stays in prose when it needs judgement: what is
+worth analysing, whether a blocker is discharged, whether a diff passes review. A binding that
+scripts a judgement has not automated it, it has hidden it. A binding SHOULD also declare which
+operations it deliberately leaves unscripted and why — an irreversible remote write is a reasonable
+thing to keep in an agent's hands, and an undeclared gap reads as an oversight.
 
 | Operation | What it must do |
 |---|---|
@@ -962,6 +980,11 @@ flow noticed, because nothing read the board back. The operator only found out b
 That is the failure this rule exists to make impossible, and note what it was NOT: not a missing
 permission, not an unclear config, not a tracker limitation. The instruction was present and the
 run simply never executed it, which is the failure mode a read-back catches and a reminder does not.
+
+**And a read-back only catches it if the read-back itself runs**, which is the same problem one
+level up. Where the binding implements `transition` as an executable, the mirror and both reads are
+inside it and cannot be dropped separately from the label edit — see *A binding may implement an
+operation as an executable* above. That is the durable fix; this section is why it was needed.
 
 ## Optional: running this alongside an in-session agent team
 
