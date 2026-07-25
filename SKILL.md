@@ -158,7 +158,7 @@ this file. Load that one file and ignore the rest; no command for any tracker ap
 | `list_state` | list unclaimed items in a given state; order within a declared domain/scale, and expose mixed-domain partitions without globally comparing their values |
 | `claim` | take the item server-side, then **verify you actually hold it** by the means the binding names |
 | `verify_claim` | re-read the authoritative control surface for an item you hold and answer two questions: am I still its holder, and has anything been said to this run-id since my claim? — what every heartbeat and every irreversible step checks **before** it writes |
-| `transition` | move to exactly one state, dropping the previous one in the same call |
+| `transition` | move to exactly one state, dropping the previous one in the same call — **and, where the configuration names a board, move its column in the same operation, then read BOTH back**. A transition is not one write; it is every projection of the state, verified |
 | `comment` | append a note the server timestamps |
 | `last_activity` | when the item was last touched — what the stale-claim rule reads |
 | `label` | attach a `<key>:<value>` marker queryable without opening the item, **creating the label first where the tracker requires one to exist** |
@@ -944,6 +944,24 @@ whatever extra permission the board API demands, and this workflow's transport h
 What that costs on a given tracker — which parts are API-reachable, which need a human to click
 once, and how a board is kept in step without becoming the source of truth — belongs to its
 binding, because none of it generalises.
+
+**A board the configuration names is part of `transition`, and it is VERIFIED, not remembered.**
+This is the one projection of state with no natural feedback: a wrong label is caught by the very
+next `list_state`, a wrong claim by the next `verify_claim`, but a column nobody looks at simply
+stays wrong forever, and the run that skipped it sees nothing. Prose asking a run to remember an
+extra call is exactly what a long run drops. So the rule is mechanical: **after every `transition`,
+re-read the state from BOTH surfaces and require them to agree** — the same read-back the label
+already gets, extended to cover the board. Where no board is configured, that half is a no-op and
+costs nothing.
+
+Seen live (2026-07-25, issues #61 and #62): a run moved labels correctly through `ready` →
+`in-progress` → `review` → `done`, closed the issue, merged and tagged — and mirrored the board
+**zero times in an entire session**, with the `project` scope present the whole way. Both cards sat
+on `Ready` while one issue was closed-and-delivered and the other was in review. Nothing in the
+flow noticed, because nothing read the board back. The operator only found out by looking at it.
+That is the failure this rule exists to make impossible, and note what it was NOT: not a missing
+permission, not an unclear config, not a tracker limitation. The instruction was present and the
+run simply never executed it, which is the failure mode a read-back catches and a reminder does not.
 
 ## Optional: running this alongside an in-session agent team
 

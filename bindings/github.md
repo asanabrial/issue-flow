@@ -136,7 +136,7 @@ ones.
 | `list_state` | `gh issue list --label "status:<state>" --search "no:assignee" --json number,title,labels,createdAt`; partition results by `domain:<name>` and declared priority scale, sort inside each partition by that scale, and expose each partition head with `createdAt` so the workflow can choose the oldest head without comparing scale values |
 | `claim` | `gh issue edit <n> --add-assignee @me`, write the claim comment, then **read the comment timeline** — an earlier claim than yours means you lost. Re-reading assignees is not enough; see below |
 | `verify_claim` | one read — `gh issue view <n> --json state,labels,comments` — then three checks, any failed check is a stop instruction, not a retry: the issue is OPEN; it carries exactly one `status:*` label and it is the state you are working under; and no comment created after your own claim comment names your run-id in a stand-down, reclaim or adjudication. See *`verify_claim` — the renewal, made concrete* below |
-| `transition` | **If a project board is configured, attempt its `Status` field FIRST** — best-effort, without pre-checking whether the issue is on the board; an issue not on it (or a missing scope) is a quiet no-op, not a precondition (see *Keeping a board in sync*). **Then** move the authoritative label: `gh issue edit <n> --add-label "status:<new>" --remove-label "status:<old>"` — one call, both halves |
+| `transition` | **If a project board is configured, attempt its `Status` field FIRST** — best-effort, without pre-checking whether the issue is on the board; an issue not on it (or a missing scope) is a quiet no-op, not a precondition (see *Keeping a board in sync*). **Then** move the authoritative label: `gh issue edit <n> --add-label "status:<new>" --remove-label "status:<old>"` — one call, both halves. **Then READ BOTH BACK in one step** (see *The transition read-back* below): exactly one `status:*` label, and — when a board is configured — a `Status` column that matches it. An unverified mirror is the one that never happened |
 | `publish_review` | push the issue branch, then query `gh pr list --head <branch> --state open --json number,url,headRefOid,baseRefOid`. Reuse the single open PR when present; create one only when none exists with `gh pr create --base <base> --head <branch> --title "<title>" --body-file <file>`. More than one open PR is ambiguous: stop. Do not use closing keywords. Record the PR URL on the issue before `transition(review)` |
 | `review_status` | capture `headRefOid` and `baseRefOid` with `gh pr view <pr> --json headRefOid,baseRefOid,latestReviews,reviewDecision,reviewRequests,mergeStateStatus`. The independent verdict artifact MUST contain `Reviewer-Run: <run-id>`, `Reviewed-Head: <full-head-sha>` and `Reviewed-Base: <full-base-sha>`; re-read both SHAs after review and reject the verdict if either differs. The verdict is mandatory even when every runtime authenticates as the PR author and GitHub cannot supply a distinct native approval |
 | `ci_status` | capture `headRefOid` and `baseRefOid`; run `gh pr checks <pr> --watch --fail-fast`, then separately read `gh pr checks <pr> --json name,workflow,state,bucket` (`--watch` and `--json` are separate invocations). Build the expected set as the union of host-required names and every applicable repository-required lane. For the host set, `gh pr checks <pr> --required --json name` returning exactly `no required checks reported on the '<branch>' branch` means the empty set; every other command error fails closed. When repository policy names workflow job ids rather than visible checks, resolve each id through `jobs.<id>.name` in the workflow file at the captured head SHA before comparing; never compare ids directly with `gh pr checks.name`. Each expected visible name must be present exactly once with `bucket=pass`; `skipping`, `cancel`, a missing name or an unexpected duplicate is not green. Re-read both SHAs afterwards; if either changed, discard review and CI |
@@ -171,6 +171,41 @@ anyway, run `transition` to `done` afterwards — the auto-close is not the work
 state machine does not know it happened. Seen live: an issue closed by its delivery commit sat
 CLOSED wearing `status:ready` until an audit caught it.
 
+**Write this, so the wording is not improvised per PR.** Knowing the rule is demonstrably not enough
+— `Fixes #<n>` is the muscle-memory opening of a PR body, and a run reaches for it while composing
+the caveat that forbids it. Seen live (2026-07-25, PR #97): the first line read, verbatim,
+`Fixes #61 (link only — closing keywords are not used per project workflow; state is moved via the
+tracker)`. The parenthetical states the rule and the sentence breaks it, which is what makes this
+worth a template rather than another warning. The safe form:
+
+```
+Refs #<n> — a plain reference, deliberately NOT a closing keyword.
+```
+
+The forbidden set is not just `fixes`: GitHub honours **`close`, `closes`, `closed`, `fix`, `fixes`,
+`fixed`, `resolve`, `resolves`, `resolved`**, case-insensitively, in a PR body or any commit message
+on the branch. `Refs`, `Implements`, `Part of` and a bare `#<n>` all link without closing.
+
+**Then verify it mechanically, because reading your own prose is how it slipped through:**
+
+```bash
+gh api graphql -f query='query{repository(owner:"<owner>",name:"<repo>"){
+  issue(number:<n>){ closedByPullRequestsReferences(first:5){ nodes{ number state } } } }}'
+```
+
+A **non-empty** result means a closing keyword is live somewhere in the PR and the issue WILL
+auto-close on merge, bypassing `transition` and the mirror. Fix the body and re-query — editing the
+body does remove the link, though the value can lag a few seconds, so re-read rather than trusting
+the first response. Run this once after publishing the PR and again before merging; the branch's
+commit messages can introduce one after the body is already clean.
+
+**One consequence to state rather than rediscover.** A board's native *Linked pull requests* column
+is populated BY those keywords, so obeying this rule leaves that column empty by design. Do not
+"fix" it by adding a keyword — that trades a cosmetic gap for the exact automation this section
+forbids. The durable joins are the timeline cross-reference (`#<n>` in the PR body), the branch
+linkage from `gh issue develop`, and the delivering SHA in the close comment. If a project wants that
+column populated, that is a decision about the workflow, not a licence to bypass it per-issue.
+
 **A shared GitHub account cannot manufacture independent approval.** The workflow's reviewer is a
 fresh reasoning context, but GitHub sees the authenticated account, not that context. When the same
 account authored the PR, record the reviewer verdict and evidence in the PR or issue with
@@ -196,6 +231,72 @@ issue carries two states, and any run reading the board during that window sees 
 **Then re-read the labels**: exactly one `status:*` must remain. Two means the removal failed or
 another run interleaved — fix it on the spot, because a two-state item poisons every query that
 touches either state, and it has happened in live use.
+
+### The transition read-back
+
+The label half above has always been verified. **The board half must be verified by the same read**,
+because it is the half with no other feedback loop — and left unverified it is the half that silently
+never runs (see *Seen live* in `SKILL.md`'s board section: an entire session of correct labels and a
+board frozen on `Ready`).
+
+One call answers both, and it needs no ids resolved in advance:
+
+```bash
+gh issue view <n> --json labels --jq '[.labels[].name] | map(select(startswith("status:")))'
+```
+
+…and, when the configuration names a board, the column for that item:
+
+```bash
+gh api graphql -f query='
+  query($login: String!, $number: Int!, $cursor: String) {
+    user(login: $login) {
+      projectV2(number: $number) {
+        items(first: 100, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            content { ... on Issue { number labels(first: 20) { nodes { name } } } }
+            fieldValueByName(name: "Status") {
+              ... on ProjectV2ItemFieldSingleSelectValue { name }
+            }
+          }
+        }
+      }
+    }
+  }' -f login="<owner>" -F number=<board-number>
+```
+
+Keep every brace on its own line as above. That is not style: a compacted `} } }` tail is one brace
+short of closing `query` itself, and GraphQL reports it as `Expected NAME, actual: (none)` pointing
+at the line AFTER the real mistake — which reads like a field-name problem and sends you looking in
+the wrong place. This exact snippet was first written compacted, and failed that way.
+
+Pulling `labels` in the same query is deliberate: the comparison needs the label and the column
+together, and fetching them separately invites comparing a fresh column against a stale label.
+
+`fieldValueByName` is what makes this cheap: it returns the column by name, so a verification needs
+no field or option ids at all — only the mirror WRITE needs those.
+
+Match the returned `Status` against the state you just set **by option name OR description**, the
+same either/or the mirror write already uses — not by description alone. Real boards do not label
+that last column consistently: one observed board describes `Analysis`…`Blocked` with their exact
+`status:*` labels and then describes `Done` as `closed`, because that column also tracks the
+tracker's own closed flag. A verifier demanding `status:done` there would fail on the one transition
+that matters most and send a run chasing a mirror that had worked. Resolve the option set once per
+run (step 1 of *How the mirror runs*) and compare against that, so the board's own vocabulary
+decides rather than an assumption about it. Three outcomes:
+
+- **Agree** → done.
+- **Disagree** → the mirror did not land. Set it now with step 3 of *How the mirror runs*; you already
+  know the item id from this very read.
+- **Item absent from the board** → the quiet skip *Whether to mirror at all* already allows. Say so
+  once rather than silently, so "not on the board" is never indistinguishable from "never mirrored".
+
+**Audit cheaply when you are already there.** The same paginated query returns every card, so
+comparing each item's `Status` against its own `status:*` label is one pass over data you have
+already fetched. A run that finds its own drift should check for others while it has the response in
+hand — on 2026-07-25 that pass over 83 cards found exactly the two the run itself had left stale,
+which is also how you learn the problem was yours and not systemic.
 
 ## Setup
 
@@ -261,7 +362,11 @@ custom field lives on the project item and no label touches it. Left alone, a bo
 someone set by hand the day they set it.
 
 **The mirror only fires on a `transition` you make — it does not repair drift from before you got
-there.** Seen live: five items sitting on `Ready` in the board days after their labels had moved to
+there.** *(Since the read-back became mandatory, drift from your OWN transitions is caught within the
+same operation. What remains uncovered is drift a PREVIOUS run left behind, which is what this
+section is about — and note that the read-back's own paginated query already returns every card, so
+auditing the rest costs a comparison over a response you are holding, not another call.)* Seen live:
+five items sitting on `Ready` in the board days after their labels had moved to
 `in-progress` or `done`, because whatever run transitioned them either predates this section being
 written or hit the missing-scope fallback — and nothing since then ever looked back. There is no
 daemon reconciling the two, by design (see *Why a mirror is needed at all*), which means staleness is
