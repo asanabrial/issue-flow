@@ -789,7 +789,14 @@ def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
         "run_id": run_id,
         "state": expect_state,
         "claim_watermark": watermark or None,
-        "checked": ["issue-open", "single-expected-state", "no-control-message"],
+        # Report what was actually checked. Saying "issue-open" about an issue that is closed —
+        # even legitimately, by your own merge — is the kind of small untruth that later gets
+        # quoted as evidence.
+        "checked": [
+            f"closed-by-own-pr-{allow_closed_by_pr}" if closed_by_own_pr else "issue-open",
+            "single-expected-state",
+            "no-control-message",
+        ],
     }
 
 
