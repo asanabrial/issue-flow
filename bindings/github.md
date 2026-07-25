@@ -37,11 +37,18 @@ resolved — run it once if you are unsure what the board or worktree row curren
 | `0` | the operation completed **and its read-back verified** | continue |
 | `1` | **STOP** — a check answered stop (lost race, stand-down, wrong state, closed issue) | follow the JSON's `action`; do not retry |
 | `2` | usage or configuration error; nothing was attempted | fix the invocation |
-| `3` | the **read itself** failed — the control surface answered NOTHING | fail closed: write nothing, retry the read. Never clearance, never a stand-down |
+| `3` | the **READ itself** failed — the control surface answered NOTHING | fail closed: write nothing, retry the read. Never clearance, never a stand-down |
+| `4` | internal error — a defect in the script | state is **UNKNOWN**; re-read the issue before doing anything |
+| `5` | a **WRITE** failed | **re-read** to establish what landed, then decide. Do not retry blindly |
 
 Exit `3` is the one to read carefully. Treating a timeout as a stand-down lets a flaky network halt
 every run; treating it as clearance lets a run write deaf, which is the defect the renewal exists to
 close. The script never collapses the two.
+
+`5` exists because `3`'s advice is actively wrong for a write. "Nothing was learned, retry" is right
+when a read failed; a write may have landed in the instant before the failure surfaced, so retrying
+blindly duplicates it. `4` exists because without it an unhandled exception exits `1` with a
+traceback and no JSON — indistinguishable from a deliberate STOP, with no `action` to follow.
 
 **What is deliberately NOT scripted**: `merge`, `publish_version`, `close`, and the interpretation of
 `review_status` / `ci_status`. Those write irreversibly to the remote or require a verdict, and a
@@ -102,7 +109,14 @@ machine-readable trailer alongside the sentence a human reads:
 <!-- issue-flow: claim run-id=claude-code-60fabae1 horizon=2026-07-25T23:00Z -->
 <!-- issue-flow: standdown run-id=claude-code-d7d8a22e -->
 <!-- issue-flow: heartbeat run-id=claude-code-60fabae1 -->
+<!-- issue-flow: reclaim run-id=claude-code-3f1a0b2c from=claude-code-60fabae1 -->
 ```
+
+Two vocabularies read these, and they must agree about the same words. **Release** kinds
+(`standdown`, `release`, `unassign`, `reclaim`) mean a run-id no longer holds the item, so its
+earlier claim stops counting. **Control** kinds (`standdown`, `reclaim`, `adjudication`) mean a
+message instructs a run-id to stop. Note that `reclaim` names the run it took over **from**, not the
+run that wrote it — a marker's subject is not always its author.
 
 They are HTML comments, so they are invisible in rendered markdown and a later run rewording the
 surrounding prose cannot break them. Reading falls back to the prose forms (`Claimed by <run-id>`)
@@ -144,8 +158,9 @@ ones.
 | `ensure_states` | `SCRIPT ensure-states` | idempotent; run it before your first write to an unfamiliar project |
 | `create` | `SCRIPT create --identity <id> --title <t> --body-file <f> --priority <scale:value> --domain <name> --runtime <rt> --run-id <id> [--state ready\|blocked]` | creates every label **before** attaching it, then mirrors the initial board column — the case everyone forgets, because no `transition` ever follows a fresh issue to correct an empty `Status` |
 | `list_state` | `SCRIPT list-state --state <s>` | unassigned only, `--limit 200` (the default cap is 30 and silently truncates the queue), partitioned by `domain:<name>`. It returns the raw labels and **refuses to rank across partitions** — ordering inside one needs the domain's scale contract, and manufacturing a global rank is forbidden |
-| `claim` | `SCRIPT claim --issue <n> --run-id <id> --runtime <rt> --horizon <when>` | assigns, writes the claim comment, then adjudicates from the timeline. On a loss it stands down, drops **only** your `dev:<runtime>` label, and exits `1` — `@me` is the shared account and removing it would strip the winner |
-| `verify_claim` | `SCRIPT verify-claim --issue <n> --run-id <id> --expect-state <s>` | one read, three checks: the issue is OPEN; it carries exactly one `status:*` and it is yours; no control message after your claim comment names your run-id |
+| `claim` | `SCRIPT claim --issue <n> --run-id <id> --runtime <rt> --horizon <when>` | assigns, writes the claim comment, then adjudicates from the timeline. Idempotent: it reuses your own existing claim rather than posting a second one. A claim that blew its declared horizon in silence is treated as dead, not as a competitor. On a loss it stands down, drops **only** your `dev:<runtime>` label, and exits `1` — `@me` is the shared account and removing it would strip the winner |
+| `reclaim` | `SCRIPT reclaim --issue <n> --run-id <id> --runtime <rt> [--force]` | takes over from a holder whose horizon has passed in silence: comments **first** naming who it was taken from, then swaps assignee and `dev:` marker. Refuses a holder that is not stale unless `--force` |
+| `verify_claim` | `SCRIPT verify-claim --issue <n> --run-id <id> --expect-state <s> [--allow-closed-by-pr <pr>]` | one read, three checks: the issue is OPEN; it carries exactly one `status:*` and it is yours; no control message after your claim comment names your run-id. `--allow-closed-by-pr` is for the renewal before `close` only — it accepts a closed issue **solely** when that PR is what closed it |
 | `transition` | `SCRIPT transition --issue <n> --to <s> [--from <s>]` | mirrors the board **first**, swaps the label in **one** call, then reads **both** back and repairs a board that disagrees. Omitting `--from` removes whatever stale state labels it finds |
 | `comment` | `SCRIPT comment --issue <n> --body-file <f> [--run-id <id> --kind <k>]` | file-based body, always |
 | `heartbeat` | `SCRIPT heartbeat --issue <n> --run-id <id> --expect-state <s> --body-file <f>` | renewal first, post second; **refuses to post** when the renewal says stop |
@@ -180,13 +195,46 @@ causes the bug, twice, in two implementations that would then drift, is not a fi
 Where you still compose a `gh` call by hand (`close`, `merge`), write the body to a file and use
 `--body-file`, with no exception for "this one's short."
 
-## Closing keywords bypass the state machine
+## Auto-close, and why it does not end the work
 
-A commit or PR whose message says `closes #34` or `fixes #34` makes GITHUB close the issue the
-moment it reaches the default branch: no transition to `done`, no mirror, labels frozen wherever
-they were. The board then shows an open column for a closed issue, and it was not any run's doing —
-it was the tracker's own automation acting outside the workflow. Seen live: an issue closed by its
-delivery commit sat CLOSED wearing `status:ready` until an audit caught it.
+GitHub can close an issue on merge without the workflow's `close` ever running: no transition to
+`done`, no mirror, labels frozen wherever they were. The board then shows an open column for a
+closed issue, and it was not any run's doing — it was the tracker's own automation acting outside
+the workflow. Seen live: an issue closed by its delivery commit sat CLOSED wearing `status:ready`
+until an audit caught it.
+
+**Two different things cause it, and only one of them is a defect.** They produce the identical
+symptom — a non-empty `closedByPullRequestsReferences` — so the symptom alone must never be read as
+"somebody wrote a keyword":
+
+| Cause | Status | Remedy |
+|---|---|---|
+| A **closing keyword** in the PR body or a commit message | forbidden — the text is yours | remove it, use `Refs #<n>`, re-check |
+| A **branch link** created by `gh issue develop` | **expected under this binding** | none — no edit removes it |
+
+Seen live (2026-07-26, issue #118 / PR #119): the PR body's first line read
+`Refs #118 — a plain reference, deliberately NOT a closing keyword`, no commit message on the branch
+carried a keyword either, and `closingIssuesReferences` still returned `[118]`. GitHub converts the
+Development-sidebar link into a closing reference the moment a PR opens from that branch, and
+empties `linkedBranches` in the same move. A check that blamed the prose sent the run to edit text
+that never contained the offence.
+
+**This binding accepts the branch-link close deliberately.** The native link is the most durable
+join between an issue and its code, and `gh issue develop` is recommended here precisely because it
+creates that link. Treating its consequence as a violation would make the recommended path
+permanently un-shippable, and a gate that fires on every correct delivery is a gate that gets
+ignored — at which point it also stops catching the keyword, which is the avoidable case that
+actually matters.
+
+**So the rule is not "prevent the auto-close". It is: `transition` to `done` after the merge
+REGARDLESS of whether GitHub already closed the issue.** Closing an issue emits `issues.closed`,
+which is not a label event: it moves neither the `status:*` label nor the board column. The
+auto-close is the tracker's bookkeeping, never the workflow's `close`, and the state machine does
+not know it happened. Run the transition afterwards and the end state is correct; skip it because
+"the issue is already closed" and you have reproduced the exact incident above.
+
+`check-closing-keywords` and `publish-review` report the cause, not just the symptom: a keyword is a
+hard stop (exit `1`), a branch link is reported with the follow-up it mandates and does not block.
 
 **Write this, so the wording is not improvised per PR.** Knowing the rule is demonstrably not enough
 — `Fixes #<n>` is the muscle-memory opening of a PR body, and a run reaches for it while composing
@@ -209,10 +257,11 @@ messages can introduce one after the body is already clean. Editing the body doe
 though the value can lag a few seconds, so re-run rather than trusting the first response.
 
 **One consequence to state rather than rediscover.** A board's native *Linked pull requests* column
-is populated BY those keywords, so obeying this rule leaves that column empty by design. Do not
-"fix" it by adding a keyword — that trades a cosmetic gap for the exact automation this section
-forbids. The durable joins are the timeline cross-reference (`#<n>` in the PR body), the branch
-linkage from `gh issue develop`, and the delivering SHA in the close comment.
+is populated by these references, so under `gh issue develop` it fills itself and under a
+hand-created branch it stays empty. Either way, never add a keyword to populate it — that trades a
+cosmetic gap for the one cause this section actually forbids. The durable joins are the timeline
+cross-reference (`#<n>` in the PR body), the branch linkage, and the delivering SHA in the close
+comment.
 
 ## Branch, worktree and the linked issue
 
@@ -456,6 +505,14 @@ the closing note with `gh issue comment <n> --body-file <file>`, then a bare `gh
 `gh issue close` has NO file variant (`-c/--comment` is inline-only, confirmed against
 `gh issue close --help`), so the note goes through the file-based comment path and the close carries
 no body at all.
+
+**Run the transition even when GitHub already closed the issue.** Under `gh issue develop` the merge
+auto-closes it (see *Auto-close, and why it does not end the work*), and the temptation is to skip
+the transition because the issue is already closed. That is precisely the failure: the auto-close
+moved neither the label nor the board, so skipping leaves a CLOSED issue wearing `status:review` and
+a card parked in the wrong column. `transition` is idempotent, so running it against an
+already-closed issue costs one call. The final `gh issue close` is then a no-op and may report the
+issue as already closed — that is success, not an error.
 
 Two calls means a partial-failure case: if the comment lands but the close errors, the issue is left
 open with its closing note already posted — retry only the bare `gh issue close <n>`, never re-post

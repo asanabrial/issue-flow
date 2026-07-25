@@ -44,13 +44,17 @@ distinction `SKILL.md` calls "a failed read is not a failed answer":
   1  STOP — a check answered "stop" (lost race, stand-down, wrong state, closed issue).
      This is a decision from a successful read. Do not retry; follow the JSON's `action`.
   2  usage or configuration error — nothing was attempted
-  3  the read itself failed (network, auth, rate limit). The control surface answered NOTHING.
+  3  the READ itself failed (network, auth, rate limit). The control surface answered NOTHING.
      Fail closed: write nothing, retry the read. Never treat this as clearance or as a stand-down.
+  4  internal error — a defect in this script. State is UNKNOWN; re-read before retrying.
+  5  a WRITE failed. Not the same as 3, and the difference is the point: a write may have landed
+     before it failed, so "retry" is the wrong instruction. RE-READ to establish what happened.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -77,9 +81,33 @@ STATES = ["analysis", "ready", "in-progress", "review", "blocked", "done"]
 # always emits both, so a human reading the timeline still sees a sentence.
 MARKER_RE = re.compile(r"<!--\s*issue-flow:\s*(?P<kind>[a-z-]+)\s+(?P<attrs>[^>]*?)\s*-->")
 
+# The two marker vocabularies, named once.
+#
+# These were originally two inline literal sets that overlapped in only ONE element, `standdown`.
+# The consequence was not cosmetic: a `reclaim` marker satisfied the control-message check (so the
+# displaced run stood down) while never releasing the dead run's claim (so `claim` still reported a
+# loss to a run that no longer existed). Two sets that must agree about the same words cannot be
+# spelled out at two call sites.
+#
+# RELEASE — this run-id no longer holds the item, so its earlier claim stops counting.
+# CONTROL — a message addressed to a run-id that instructs it to stop.
+RELEASE_KINDS = frozenset({"standdown", "release", "unassign", "reclaim"})
+CONTROL_KINDS = frozenset({"standdown", "reclaim", "adjudication"})
+# Attributes that can carry the run-id a marker is ABOUT, rather than the one that wrote it.
+TARGET_ATTRS = ("run-id", "target", "from")
+
 
 class ReadFailure(Exception):
     """A read against the control surface did not answer. Never a stand-down."""
+
+
+class WriteFailure(Exception):
+    """A WRITE failed. Distinct from ReadFailure, because the advice is opposite.
+
+    "The read answered nothing, so write nothing and retry" is correct for a read and actively
+    harmful for a write: the write may have landed before the failure surfaced, so a blind retry
+    can duplicate it. The caller must RE-READ to establish what actually happened before deciding.
+    """
 
 
 class Stop(Exception):
@@ -94,11 +122,18 @@ class Stop(Exception):
 # process plumbing
 # ---------------------------------------------------------------------------
 
-def run(args: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
+def run(args: list[str], cwd: Path | None = None, check: bool = True,
+        writes: bool = False) -> subprocess.CompletedProcess:
     """Run a command with an argument LIST and no shell.
 
     No shell means no PowerShell backtick expansion, no word splitting, no quoting rules — the
     corruption documented in bindings/github.md cannot occur through this path.
+
+    `writes=True` marks a command that MUTATES something. It changes only which exception is
+    raised, and that distinction matters more than it looks: a failed read means "nothing was
+    learned, retry"; a failed write means "something may already have happened, re-read before you
+    decide". Reporting a failed write under the read contract tells the caller to retry blindly,
+    which is how a single command posts two claim comments.
     """
     try:
         proc = subprocess.run(
@@ -112,7 +147,8 @@ def run(args: list[str], cwd: Path | None = None, check: bool = True) -> subproc
     except FileNotFoundError as exc:
         raise ReadFailure(f"{args[0]} not found on PATH: {exc}") from exc
     if check and proc.returncode != 0:
-        raise ReadFailure(f"{' '.join(args[:3])} failed ({proc.returncode}): {proc.stderr.strip()}")
+        detail = f"{' '.join(args[:3])} failed ({proc.returncode}): {proc.stderr.strip()}"
+        raise (WriteFailure if writes else ReadFailure)(detail)
     return proc
 
 
@@ -127,16 +163,28 @@ def gh_json(args: list[str], cwd: Path | None = None):
         raise ReadFailure(f"gh returned unparseable JSON for {' '.join(args[:2])}: {exc}") from exc
 
 
-def with_body_file(body: str):
-    """Write a markdown body to a temp file.
+@contextlib.contextmanager
+def body_file(body: str):
+    """Write a markdown body to a temp file, and always remove it.
 
     Every operation that accepts markdown goes through a file, with no exception for "this one's
     short" — that inconsistency is what let evidence-bearing comments arrive silently damaged.
+
+    A context manager rather than a create/unlink pair: the `gh` call between the two raises on any
+    transient failure, which the design treats as routine, and a plain unlink after it is simply
+    skipped on that path. Leaking a file per failed comment is small, but it is the kind of small
+    that accumulates silently for months.
     """
     fd, path = tempfile.mkstemp(suffix=".md", prefix="issue-flow-", text=True)
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(body)
-    return path
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(body)
+        yield path
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +290,21 @@ STANDDOWN_PROSE = re.compile(
     r"adjudicat\w*|you lost|release the item)\b",
     re.IGNORECASE,
 )
-CLAIM_PROSE = re.compile(r"\bclaimed by\s+(?P<run>[\w.-]+)", re.IGNORECASE)
+# Legacy claim detection, anchored on purpose.
+#
+# An unanchored "claimed by <x>" matches ordinary prose — "this was already claimed by
+# @old-contributor months ago" is a plausible comment on any issue with organic history or a
+# triage bot. That phantom carries a real server timestamp, so it sorts EARLIEST, and `claim`
+# concludes it lost a race that never happened: it posts a stand-down and strips its own
+# `dev:<runtime>` label on the strength of text written by someone else entirely.
+#
+# So the fallback demands the shape of an actual claim comment, not the words: the phrase must
+# OPEN the comment, and the horizon clause must be present. `SKILL.md` prescribes exactly one
+# form — `Claimed by <run-id>, expect to report by <time>` — and every binding writes it, so
+# requiring both costs no real claim and rejects every mention. This mirrors the deliberate
+# narrowness of STANDDOWN_PROSE below, which the original of this pattern lacked.
+CLAIM_PROSE = re.compile(r"^\s*(?:[*_>#\s]*)claimed by\s+(?P<run>[\w.-]+)", re.IGNORECASE)
+CLAIM_HORIZON_PROSE = re.compile(r"expect(?:s|ing)?\s+to\s+report\s+by", re.IGNORECASE)
 
 
 def claim_comments(comments: list[dict]) -> list[tuple[str, str, dict]]:
@@ -256,8 +318,11 @@ def claim_comments(comments: list[dict]) -> list[tuple[str, str, dict]]:
                 run_id = mark["run-id"]
                 break
         if not run_id:
-            match = CLAIM_PROSE.search(body)
-            if match:
+            # Both conditions, never one: the phrase must open the comment AND the horizon clause
+            # must be present. A mention like "already claimed by @someone months ago" satisfies
+            # neither, and must not be able to unseat a real claim.
+            match = CLAIM_PROSE.match(body or "")
+            if match and CLAIM_HORIZON_PROSE.search(body or ""):
                 run_id = match.group("run")
         if run_id:
             claims.append((comment.get("createdAt", ""), run_id, comment))
@@ -266,13 +331,98 @@ def claim_comments(comments: list[dict]) -> list[tuple[str, str, dict]]:
 
 
 def released_run_ids(comments: list[dict]) -> set[str]:
-    """Run-ids that already stood down, so their earlier claim no longer holds the item."""
+    """Run-ids that no longer hold the item, so their earlier claim stops counting.
+
+    A `reclaim` marker names the run it took over FROM, not the run that wrote it, which is why
+    every target attribute is read rather than just `run-id`. Miss that and a reclaimed item still
+    adjudicates in favour of the run that was reclaimed from.
+    """
     released = set()
     for comment in comments:
         for mark in parse_markers(comment.get("body", "")):
-            if mark.get("kind") in ("standdown", "release", "unassign") and mark.get("run-id"):
-                released.add(mark["run-id"])
+            if mark.get("kind") not in RELEASE_KINDS:
+                continue
+            for attr in TARGET_ATTRS:
+                if mark.get(attr):
+                    released.add(mark[attr])
     return released
+
+
+def last_activity_by(comments: list[dict], run_id: str) -> str:
+    """The newest timestamp on which this run said anything. '' when it never did."""
+    stamps = [
+        comment.get("createdAt", "")
+        for comment in comments
+        if any(
+            mark.get(attr) == run_id
+            for mark in parse_markers(comment.get("body", ""))
+            for attr in TARGET_ATTRS
+        )
+        or run_id in (comment.get("body") or "")
+    ]
+    return max(stamps) if stamps else ""
+
+
+def parse_stamp(value: str):
+    """Parse an ISO-8601 UTC stamp into a datetime, or None when it is not one.
+
+    Timestamps here arrive at two precisions — GitHub writes `2026-07-25T21:54:35Z`, a declared
+    horizon is written `2026-07-26T00:54Z` — and comparing those as STRINGS is wrong in exactly
+    the case that matters: `00:54:00Z` sorts BEFORE `00:54Z`, because '0' precedes 'Z'. A run that
+    had just spoken would be read as silent. And a horizon is free text a human may have written
+    in prose, which must compare as "unknown" rather than as some accidental ordering.
+    """
+    import datetime
+
+    if not value:
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    for suffix in ("", ":00"):
+        try:
+            parsed = datetime.datetime.fromisoformat(text if not suffix else text.replace("+00:00", f"{suffix}+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed
+    return None
+
+
+def stale_claims(claims, comments: list[dict], now: str) -> set[str]:
+    """Claims whose declared horizon has passed with no word from the holder since.
+
+    This is the mechanical half of SKILL.md's reclaim rule. Without it a run that died mid-build
+    holds its issue forever: `claim` re-reads the timeline, finds that never-released claim as the
+    earliest live entry, and tells a live run it lost a race to a process that no longer exists —
+    reproducing the exact "abandoned work" incident this script was written against.
+
+    Deliberately conservative. A horizon is a heuristic, not a lease: only a claim that BOTH
+    declared a horizon and has been silent past it counts as stale. A claim with no horizon is
+    left alone here, because judging "a few hours is long enough" belongs to a human or to the
+    explicit `reclaim` command, not to an automatic adjudication.
+    """
+    moment = parse_stamp(now)
+    if moment is None:
+        return set()
+    stale = set()
+    for _created_at, run_id, comment in claims:
+        horizon = None
+        for mark in parse_markers(comment.get("body", "")):
+            if mark.get("kind") == "claim" and mark.get("horizon"):
+                horizon = parse_stamp(mark["horizon"])
+        # An unparseable or absent horizon is "unknown", never "expired".
+        if horizon is None or horizon >= moment:
+            continue
+        spoke_at = parse_stamp(last_activity_by(comments, run_id))
+        if spoke_at is None or spoke_at < horizon:
+            stale.add(run_id)
+    return stale
+
+
+def utc_now_stamp() -> str:
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +505,16 @@ class Board:
         self._meta = None
 
     def _cache_path(self) -> Path:
-        return Path(tempfile.gettempdir()) / f"issue-flow-board-{self.owner}-{self.number}.json"
+        # A private subdirectory, not the shared temp root. On a host with a world-writable /tmp
+        # another local account could pre-plant this file and point the mirror's mutation at
+        # project and field ids of its choosing — bounded by what our own token can already write,
+        # so not privilege escalation, but a confused deputy writing to the wrong board.
+        directory = Path(tempfile.gettempdir()) / f"issue-flow-{os.getuid() if hasattr(os, 'getuid') else os.getlogin()}"
+        try:
+            directory.mkdir(mode=0o700, exist_ok=True)
+        except OSError:
+            directory = Path(tempfile.gettempdir())
+        return directory / f"board-{self.owner}-{self.number}.json"
 
     def _graphql(self, query: str, **variables):
         args = ["api", "graphql", "-f", f"query={query}"]
@@ -441,7 +600,13 @@ class Board:
                 return option
         return None
 
-    def item_id(self, issue: int) -> str | None:
+    def _iter_items(self):
+        """Yield every board item, following pagination.
+
+        `items(first:100)` stops finding issues once the board passes a hundred items, and the
+        three callers below all need the same walk. Writing that loop three times is three places
+        for the cursor handling to drift apart.
+        """
         cursor = None
         while True:
             variables = {"login": self.owner, "number": self.number}
@@ -449,16 +614,20 @@ class Board:
                 variables["cursor"] = cursor
             project, _ = self._query_owner_scoped(BOARD_ITEMS_QUERY, **variables)
             if not project:
-                self.skip_reason = "project not visible while resolving the item"
-                return None
+                self.skip_reason = "project not visible while listing items"
+                return
             items = project["items"]
-            for node in items["nodes"]:
-                content = node.get("content") or {}
-                if content.get("number") == issue:
-                    return node["id"]
+            yield from items["nodes"]
             if not items["pageInfo"]["hasNextPage"]:
-                return None
+                return
             cursor = items["pageInfo"]["endCursor"]
+
+    def item_id(self, issue: int) -> str | None:
+        for node in self._iter_items():
+            content = node.get("content") or {}
+            if content.get("number") == issue:
+                return node["id"]
+        return None
 
     def set_status(self, issue: int, state: str) -> dict:
         """Attempt the mirror. Returns what happened; never raises."""
@@ -488,49 +657,26 @@ class Board:
     def read_status(self, issue: int) -> str | None:
         if not self.enabled:
             return None
-        cursor = None
-        while True:
-            variables = {"login": self.owner, "number": self.number}
-            if cursor:
-                variables["cursor"] = cursor
-            project, _ = self._query_owner_scoped(BOARD_ITEMS_QUERY, **variables)
-            if not project:
-                return None
-            items = project["items"]
-            for node in items["nodes"]:
-                content = node.get("content") or {}
-                if content.get("number") == issue:
-                    value = node.get("fieldValueByName") or {}
-                    return value.get("name")
-            if not items["pageInfo"]["hasNextPage"]:
-                return None
-            cursor = items["pageInfo"]["endCursor"]
+        for node in self._iter_items():
+            content = node.get("content") or {}
+            if content.get("number") == issue:
+                return (node.get("fieldValueByName") or {}).get("name")
+        return None
 
     def all_cards(self) -> list[dict]:
-        cards, cursor = [], None
-        while True:
-            variables = {"login": self.owner, "number": self.number}
-            if cursor:
-                variables["cursor"] = cursor
-            project, _ = self._query_owner_scoped(BOARD_ITEMS_QUERY, **variables)
-            if not project:
-                return cards
-            items = project["items"]
-            for node in items["nodes"]:
-                content = node.get("content") or {}
-                if not content.get("number"):
-                    continue
-                value = node.get("fieldValueByName") or {}
-                cards.append(
-                    {
-                        "issue": content["number"],
-                        "column": value.get("name"),
-                        "labels": [n["name"] for n in content.get("labels", {}).get("nodes", [])],
-                    }
-                )
-            if not items["pageInfo"]["hasNextPage"]:
-                return cards
-            cursor = items["pageInfo"]["endCursor"]
+        cards = []
+        for node in self._iter_items():
+            content = node.get("content") or {}
+            if not content.get("number"):
+                continue
+            cards.append(
+                {
+                    "issue": content["number"],
+                    "column": (node.get("fieldValueByName") or {}).get("name"),
+                    "labels": [n["name"] for n in content.get("labels", {}).get("nodes", [])],
+                }
+            )
+        return cards
 
 
 # ---------------------------------------------------------------------------
@@ -563,24 +709,39 @@ def label_names(data: dict) -> list[str]:
 # verify_claim — the renewal
 # ---------------------------------------------------------------------------
 
-def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path) -> dict:
+def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
+                    allow_closed_by_pr: int | None = None) -> dict:
     """One read, three checks. A failed CHECK is a stop instruction; a failed READ is nothing.
 
     That distinction is the whole point: SKILL.md records a run that lost a claim race by five
     seconds, was told so 33 seconds later, and then worked another ~48 minutes because nothing in
     its heartbeat loop ever read the timeline again.
+
+    `allow_closed_by_pr` exists for exactly one moment: the renewal that runs immediately before
+    `close`, after your own merge. Under `gh issue develop` the merge auto-closes the issue, so a
+    closed issue there is the expected outcome of your own delivery rather than evidence that
+    somebody else took it. Without this, the renewal would hard-stop and the run would skip the
+    `transition --to done` that the auto-close makes mandatory — the rule blocking itself.
+
+    It is deliberately narrow: the issue must have been closed BY THE PR YOU MERGED. A closed issue
+    with any other closer is still a stop, because that is the case the check exists for.
     """
     data = issue_view(issue, "state,labels,comments", cwd=cwd)
 
+    closed_by_own_pr = False
     if data.get("state") != "OPEN":
-        raise Stop(
-            {
-                "ok": False,
-                "reason": "issue-not-open",
-                "detail": f"issue #{issue} is {data.get('state')} — someone delivered or killed it",
-                "action": "stop; change nothing about the state, it is not yours",
-            }
-        )
+        if allow_closed_by_pr is not None:
+            closers = {ref.get("number") for ref in closing_refs(issue, cwd)}
+            closed_by_own_pr = allow_closed_by_pr in closers
+        if not closed_by_own_pr:
+            raise Stop(
+                {
+                    "ok": False,
+                    "reason": "issue-not-open",
+                    "detail": f"issue #{issue} is {data.get('state')} — someone delivered or killed it",
+                    "action": "stop; change nothing about the state, it is not yours",
+                }
+            )
 
     present = status_labels(label_names(data))
     if len(present) != 1 or present[0] != f"status:{expect_state}":
@@ -644,8 +805,8 @@ def cmd_config(args, config, cwd) -> dict:
         "config": config,
         "board": {"enabled": board.enabled, "owner": board.owner, "number": board.number},
         "scripted_operations": [
-            "ensure-states", "create", "list-state", "claim", "verify-claim", "transition",
-            "comment", "heartbeat", "start-branch", "publish-review", "unassign",
+            "ensure-states", "create", "list-state", "claim", "reclaim", "verify-claim",
+            "transition", "comment", "heartbeat", "start-branch", "publish-review", "unassign",
             "check-closing-keywords", "audit-board",
         ],
         "not_scripted": {
@@ -680,16 +841,25 @@ def cmd_create(args, config, cwd) -> dict:
     body = Path(args.body_file).read_text(encoding="utf-8")
     if args.run_id:
         body = body.rstrip() + f"\n\n{marker('analysis', run_id=args.run_id)}\n"
-    body_file = with_body_file(body)
+    with body_file(body) as path:
+        create_args = ["issue", "create", "--title", f"{args.identity}: {args.title}",
+                       "--body-file", path]
+        for label in labels:
+            create_args.extend(["--label", label])
+        proc = run(["gh", *create_args], cwd=cwd, writes=True)
 
-    create_args = ["issue", "create", "--title", f"{args.identity}: {args.title}",
-                   "--body-file", body_file]
-    for label in labels:
-        create_args.extend(["--label", label])
-    proc = run(["gh", *create_args], cwd=cwd)
+    # `gh issue create` prints the issue URL, but its stdout is not a contract. Parse defensively
+    # and say so plainly on failure: an unguarded index here would crash out of the JSON contract
+    # entirely, after the issue was already filed.
+    match = re.search(r"/issues/(\d+)\s*$", proc.stdout.strip())
+    if not match:
+        raise WriteFailure(
+            "the issue may have been created, but its URL could not be parsed from "
+            f"`gh issue create` output: {proc.stdout.strip()[:200]!r} — re-read before retrying, "
+            "a retry would file a duplicate"
+        )
     url = proc.stdout.strip().splitlines()[-1]
-    number = int(url.rstrip("/").rsplit("/", 1)[-1])
-    os.unlink(body_file)
+    number = int(match.group(1))
 
     # The case everyone forgets: a fresh issue reaches the board with an empty Status and no
     # transition ever follows to correct it.
@@ -706,10 +876,11 @@ def cmd_list_state(args, config, cwd) -> dict:
         cwd=cwd,
     ) or []
 
-    # Partition by domain. Ordering INSIDE a partition needs the domain's own scale contract,
-    # which this script does not know and must not invent: SKILL.md forbids manufacturing a
-    # global priority rank across scales. So partitions and their raw labels are returned, and
-    # the agent applies the contract it loaded.
+    # Partition by domain, and order each partition OLDEST FIRST — that is the workflow's
+    # tie-break, and it is the only ordering this script is entitled to apply. Ranking by priority
+    # INSIDE a partition needs the domain's own scale contract, which this script does not know
+    # and must not invent: SKILL.md forbids manufacturing a global rank across scales. So every
+    # label is returned raw alongside the age order, and the agent applies the contract it loaded.
     partitions: dict[str, list] = {}
     for item in data:
         names = [label["name"] for label in item["labels"]]
@@ -737,33 +908,53 @@ def cmd_claim(args, config, cwd) -> dict:
     assigned to you while another run is already building it.
     """
     ensure_label(f"dev:{args.runtime}", "bfd4f2", cwd)
-    run(["gh", "issue", "edit", str(args.issue), "--add-assignee", "@me"], cwd=cwd)
+    run(["gh", "issue", "edit", str(args.issue), "--add-assignee", "@me"], cwd=cwd, writes=True)
 
-    body = (
-        f"Claimed by {args.run_id}, expect to report by {args.horizon}.\n\n"
-        f"{marker('claim', run_id=args.run_id, horizon=args.horizon)}\n"
-    )
-    body_file = with_body_file(body)
-    run(["gh", "issue", "comment", str(args.issue), "--body-file", body_file], cwd=cwd)
-    os.unlink(body_file)
+    # Idempotent on retry. `claim` is four writes and a read; if it dies after the comment lands,
+    # the caller re-runs it — and a second claim comment for the same run muddies the very record
+    # the race is adjudicated from. So look for our own claim first and reuse it. This is also
+    # what makes the retry advice on a failed write safe to follow at all.
+    existing = claim_comments(issue_view(args.issue, "comments", cwd=cwd).get("comments", []))
+    already_mine = [at for at, rid, _ in existing if rid == args.run_id]
+
+    if not already_mine:
+        body = (
+            f"Claimed by {args.run_id}, expect to report by {args.horizon}.\n\n"
+            f"{marker('claim', run_id=args.run_id, horizon=args.horizon)}\n"
+        )
+        with body_file(body) as path:
+            run(["gh", "issue", "comment", str(args.issue), "--body-file", path],
+                cwd=cwd, writes=True)
 
     data = issue_view(args.issue, "comments", cwd=cwd)
-    claims = claim_comments(data.get("comments", []))
-    released = released_run_ids(data.get("comments", []))
-    live = [(at, rid) for at, rid, _ in claims if rid not in released]
+    comments = data.get("comments", [])
+    claims = claim_comments(comments)
+    released = released_run_ids(comments)
+    # A claim that blew its own declared horizon in silence is not a competitor, it is a corpse.
+    # Without this the earliest claim wins forever and a dead run holds its issue permanently.
+    expired = stale_claims(claims, comments, utc_now_stamp())
+    dead = released | (expired - {args.run_id})
+    live = [(at, rid) for at, rid, _ in claims if rid not in dead]
 
     if not live:
-        raise ReadFailure("the claim comment was written but is not visible on the timeline yet")
+        # The write succeeded but the timeline has not caught up. Say so as a WRITE failure: the
+        # comment exists, so "retry the read" is the right action and "retry the whole command"
+        # is not. The idempotence guard above makes even a full retry safe, but the caller should
+        # still be told which of the two happened.
+        raise WriteFailure(
+            "the claim comment was written but is not visible on the timeline yet — re-read; "
+            "re-running `claim` will reuse the existing comment rather than post a second one"
+        )
 
     winner_at, winner = live[0]
     if winner != args.run_id:
         # Losing is cheap and takes seconds; two runs building the same issue is not.
-        standdown = with_body_file(
+        with body_file(
             f"{args.run_id} standing down: {winner} claimed at {winner_at}, earlier than this run. "
             f"Nothing was created.\n\n{marker('standdown', run_id=args.run_id)}\n"
-        )
-        run(["gh", "issue", "comment", str(args.issue), "--body-file", standdown], cwd=cwd)
-        os.unlink(standdown)
+        ) as path:
+            run(["gh", "issue", "comment", str(args.issue), "--body-file", path],
+                cwd=cwd, writes=True)
         # Only the per-runtime label comes off. `@me` is the shared account and removing it would
         # strip the winner, who is holding the item right now.
         run(["gh", "issue", "edit", str(args.issue), "--remove-label", f"dev:{args.runtime}"],
@@ -778,11 +969,14 @@ def cmd_claim(args, config, cwd) -> dict:
             }
         )
 
-    run(["gh", "issue", "edit", str(args.issue), "--add-label", f"dev:{args.runtime}"], cwd=cwd)
+    run(["gh", "issue", "edit", str(args.issue), "--add-label", f"dev:{args.runtime}"],
+        cwd=cwd, writes=True)
     return {
         "ok": True,
         "issue": args.issue,
         "run_id": args.run_id,
+        "reused_existing_claim": bool(already_mine),
+        "superseded_expired_claims": sorted(expired - {args.run_id}),
         "claimed_at": winner_at,
         "horizon": args.horizon,
         "next": "transition to in-progress before any repository write",
@@ -790,7 +984,78 @@ def cmd_claim(args, config, cwd) -> dict:
 
 
 def cmd_verify_claim(args, config, cwd) -> dict:
-    return do_verify_claim(args.issue, args.run_id, args.expect_state, cwd)
+    return do_verify_claim(args.issue, args.run_id, args.expect_state, cwd,
+                           allow_closed_by_pr=args.allow_closed_by_pr)
+
+
+def cmd_reclaim(args, config, cwd) -> dict:
+    """Take over work whose holder never came back.
+
+    The record of the takeover matters more than the takeover, so the comment goes FIRST and names
+    who it was taken from. If the original holder was alive and merely slow, its next renewal reads
+    this and backs off exactly like the loser of a claim race — which is why the marker carries
+    `from`, and why `released_run_ids` treats a reclaim as releasing that run rather than this one.
+
+    The dead run's `dev:<runtime>` marker is removed as ours goes on. It cannot do that itself,
+    which is the whole reason this command exists; skip it and the item claims two runtimes hold it.
+    """
+    data = issue_view(args.issue, "state,labels,comments", cwd=cwd)
+    if data.get("state") != "OPEN":
+        raise Stop({"ok": False, "reason": "issue-not-open",
+                    "action": "nothing to reclaim on a closed issue"})
+
+    comments = data.get("comments", [])
+    claims = claim_comments(comments)
+    released = released_run_ids(comments)
+    holders = [(at, rid) for at, rid, _ in claims if rid not in released]
+    if not holders:
+        raise Stop({"ok": False, "reason": "nothing-to-reclaim",
+                    "action": "no live claim on this issue — use `claim` instead"})
+
+    held_at, holder = holders[0]
+    if holder == args.run_id:
+        raise Stop({"ok": False, "reason": "already-yours",
+                    "action": f"{args.run_id} is already the live claimant"})
+
+    expired = stale_claims(claims, comments, utc_now_stamp())
+    if holder not in expired and not args.force:
+        raise Stop(
+            {
+                "ok": False,
+                "reason": "holder-not-stale",
+                "holder": holder,
+                "claimed_at": held_at,
+                "action": "the holder's declared horizon has not passed, or it has spoken since. "
+                          "Reclaiming early costs someone a duplicated hour — pass --force only "
+                          "with a reason you can defend on the issue",
+            }
+        )
+
+    with body_file(
+        f"Reclaiming from `{holder}`; last activity {last_activity_by(comments, holder) or 'none'}, "
+        f"claimed at {held_at}.\n\n"
+        f"Taken over by `{args.run_id}`. Nothing the previous run left will be discarded — its "
+        f"branch, diagnosis and ruled-out hypotheses stay valid.\n\n"
+        f"{marker('reclaim', run_id=args.run_id, **{'from': holder})}\n"
+    ) as note:
+        run(["gh", "issue", "comment", str(args.issue), "--body-file", note], cwd=cwd, writes=True)
+
+    ensure_label(f"dev:{args.runtime}", "bfd4f2", cwd)
+    edit = ["gh", "issue", "edit", str(args.issue), "--add-assignee", "@me",
+            "--add-label", f"dev:{args.runtime}"]
+    for label in label_names(data):
+        if label.startswith("dev:") and label != f"dev:{args.runtime}":
+            edit.extend(["--remove-label", label])
+    run(edit, cwd=cwd, writes=True)
+
+    return {
+        "ok": True,
+        "issue": args.issue,
+        "reclaimed_from": holder,
+        "run_id": args.run_id,
+        "forced": bool(args.force),
+        "next": "read what the dead run left on the issue — the work may be further along than the label",
+    }
 
 
 def cmd_transition(args, config, cwd) -> dict:
@@ -843,19 +1108,32 @@ def cmd_transition(args, config, cwd) -> dict:
                 f"issue #{args.issue} is not on the board (or not visible) — labels carry the truth"
             )
         elif expected and column != expected["name"]:
-            # Disagree means the mirror did not land. Set it again with the ids already resolved.
-            retry = board.set_status(args.issue, args.to)
-            recheck = board.read_status(args.issue)
-            result["board_repair"] = {"retried": retry, "column_now": recheck}
-            if expected and recheck != expected["name"]:
-                raise Stop(
-                    {
-                        "ok": False,
-                        "reason": "board-readback-failed",
-                        "detail": f"board says {recheck!r}, labels say status:{args.to}",
-                        "action": "the mirror is not landing — investigate before continuing",
-                    }
+            # Before believing the mirror failed, distrust the CACHE. The mutation addresses the
+            # column by stable id, so renaming a column on the board leaves the board correct while
+            # the cached option NAME goes stale — and comparing a live name against a stale one
+            # then reports a failure that never happened, blocking every transition on this issue
+            # for as long as the cache lives. Re-resolve with fresh ids and compare again; only a
+            # mismatch that survives that is real.
+            fresh = Board(cfg(config, "project board"), cwd, use_cache=False)
+            fresh_expected = Board.option_for(fresh.meta(), args.to) if fresh.meta() else None
+            if fresh_expected and column == fresh_expected["name"]:
+                result["board_note"] = (
+                    "the cached column name was stale (the board column was renamed); the mirror "
+                    "itself had landed correctly and the cache is now refreshed"
                 )
+            else:
+                retry = fresh.set_status(args.issue, args.to)
+                recheck = fresh.read_status(args.issue)
+                result["board_repair"] = {"retried": retry, "column_now": recheck}
+                if fresh_expected and recheck != fresh_expected["name"]:
+                    raise Stop(
+                        {
+                            "ok": False,
+                            "reason": "board-readback-failed",
+                            "detail": f"board says {recheck!r}, labels say status:{args.to}",
+                            "action": "the mirror is not landing — investigate before continuing",
+                        }
+                    )
     return result
 
 
@@ -863,9 +1141,8 @@ def cmd_comment(args, config, cwd) -> dict:
     body = Path(args.body_file).read_text(encoding="utf-8")
     if args.run_id and args.kind:
         body = body.rstrip() + f"\n\n{marker(args.kind, run_id=args.run_id)}\n"
-    body_file = with_body_file(body)
-    run(["gh", "issue", "comment", str(args.issue), "--body-file", body_file], cwd=cwd)
-    os.unlink(body_file)
+    with body_file(body) as path:
+        run(["gh", "issue", "comment", str(args.issue), "--body-file", path], cwd=cwd, writes=True)
     return {"ok": True, "issue": args.issue, "kind": args.kind or "note"}
 
 
@@ -875,28 +1152,43 @@ def cmd_heartbeat(args, config, cwd) -> dict:
     verdict = do_verify_claim(args.issue, args.run_id, args.expect_state, cwd)
     body = Path(args.body_file).read_text(encoding="utf-8")
     body = body.rstrip() + f"\n\n{marker('heartbeat', run_id=args.run_id)}\n"
-    body_file = with_body_file(body)
-    run(["gh", "issue", "comment", str(args.issue), "--body-file", body_file], cwd=cwd)
-    os.unlink(body_file)
+    with body_file(body) as path:
+        run(["gh", "issue", "comment", str(args.issue), "--body-file", path], cwd=cwd, writes=True)
     return {"ok": True, "issue": args.issue, "renewed": verdict["checked"], "posted": True}
 
 
 def worktree_path(template: str, repo: str, branch: str, run_id: str, issue: int) -> Path:
     """Resolve the configured worktree template.
 
-    The branch is flattened because a branch name carries `/` and a nested `docs/` directory
-    under the worktree root is a surprise nobody configured. Path uniqueness comes from the
-    run-id: two runs that both want issue 58 must not compute the same directory. Git refuses a
-    branch already checked out elsewhere, but NOTHING refuses a second process writing into a
-    directory that already exists — which is how, on 2026-07-24, a losing run wrote its model,
-    its migration and its tests into the winner's checkout mid-build.
+    Every substituted value is flattened, not just the branch. The branch is the one that carries
+    a `/` in normal use, but the reason — a separator in a substituted value silently restructures
+    the path instead of naming a directory — applies identically to the run-id, and applying it to
+    only one of them is the inconsistency that becomes a traversal later. `..` segments are
+    rejected outright for the same reason.
+
+    Path uniqueness comes from the run-id, and `cmd_start_branch` refuses a path that already
+    exists. Why that is not paranoia — the 2026-07-24 collision — is told once, in
+    `bindings/github.md` under *Branch, worktree and the linked issue*. It is deliberately NOT
+    retold here: an incident narrated in three files goes stale in two of them.
     """
-    flat = branch.replace("/", "-")
+    def flatten(value: str) -> str:
+        cleaned = re.sub(r"[/\\]+", "-", str(value)).strip()
+        if not cleaned or cleaned != cleaned.replace("..", ""):
+            raise Stop(
+                {
+                    "ok": False,
+                    "reason": "unsafe-worktree-component",
+                    "component": str(value),
+                    "action": "a worktree path component may not be empty or contain `..`",
+                }
+            )
+        return cleaned
+
     resolved = (
-        template.replace("<repo>", repo)
-        .replace("<branch>", flat)
-        .replace("<run-id>", run_id)
-        .replace("<issue>", str(issue))
+        template.replace("<repo>", flatten(repo))
+        .replace("<branch>", flatten(branch))
+        .replace("<run-id>", flatten(run_id))
+        .replace("<issue>", flatten(issue))
     )
     return Path(resolved)
 
@@ -943,24 +1235,29 @@ def cmd_start_branch(args, config, cwd) -> dict:
     if not linked:
         # The branch may already exist from a resumed run; fall back to a local branch off the
         # fresh remote base and record it in prose, which is what the binding prescribes.
-        run(["git", "fetch", "origin", args.base], cwd=cwd)
-        run(["git", "branch", "--force", args.branch, f"origin/{args.base}"], cwd=cwd, check=False)
+        #
+        # `--` closes option parsing. Without it a branch name beginning with `-` is read as a
+        # flag: `git branch --force -D origin/main` deletes the branch literally named
+        # `origin/main` instead of creating one called `-D`. Nothing upstream validates the value,
+        # and this call runs with check=False, so the damage would be silent.
+        run(["git", "fetch", "origin", "--", args.base], cwd=cwd)
+        run(["git", "branch", "--force", "--", args.branch, f"origin/{args.base}"],
+            cwd=cwd, check=False, writes=True)
 
     run(["git", "fetch", "origin"], cwd=cwd)
     path.parent.mkdir(parents=True, exist_ok=True)
-    run(["git", "worktree", "add", str(path), args.branch], cwd=cwd)
+    run(["git", "worktree", "add", "--", str(path), args.branch], cwd=cwd, writes=True)
 
     head = run(["git", "rev-parse", "HEAD"], cwd=path).stdout.strip()
     base_sha = run(["git", "rev-parse", f"origin/{args.base}"], cwd=cwd).stdout.strip()
 
-    body = with_body_file(
+    with body_file(
         f"Branch: `{args.branch}` (base `{args.base}` @ `{base_sha}`)\n"
         f"Worktree: `{path}`\n"
         f"Held by `{args.run_id}`.\n\n"
         f"{marker('branch', run_id=args.run_id, branch=args.branch, base=base_sha)}\n"
-    )
-    run(["gh", "issue", "comment", str(args.issue), "--body-file", body], cwd=cwd)
-    os.unlink(body)
+    ) as note:
+        run(["gh", "issue", "comment", str(args.issue), "--body-file", note], cwd=cwd, writes=True)
 
     return {
         "ok": True,
@@ -1094,7 +1391,7 @@ def cmd_publish_review(args, config, cwd) -> dict:
     do_verify_claim(args.issue, args.run_id, args.expect_state, cwd)
 
     worktree = Path(args.worktree) if args.worktree else cwd
-    run(["git", "push", "-u", "origin", args.branch], cwd=worktree)
+    run(["git", "push", "-u", "origin", "--", args.branch], cwd=worktree, writes=True)
 
     existing = gh_json(
         ["pr", "list", "--head", args.branch, "--state", "open",
@@ -1123,10 +1420,9 @@ def cmd_publish_review(args, config, cwd) -> dict:
         # not enough — `Fixes #<n>` is the muscle-memory opening of a PR body.
         if f"#{args.issue}" not in body:
             body = f"Refs #{args.issue} — a plain reference, deliberately NOT a closing keyword.\n\n" + body
-        body_file = with_body_file(body)
-        run(["gh", "pr", "create", "--base", args.base, "--head", args.branch,
-             "--title", args.pr_title, "--body-file", body_file], cwd=cwd)
-        os.unlink(body_file)
+        with body_file(body) as path:
+            run(["gh", "pr", "create", "--base", args.base, "--head", args.branch,
+                 "--title", args.pr_title, "--body-file", path], cwd=cwd, writes=True)
         fresh = gh_json(
             ["pr", "list", "--head", args.branch, "--state", "open",
              "--json", "number,url,headRefOid,baseRefOid"],
@@ -1150,14 +1446,13 @@ def cmd_publish_review(args, config, cwd) -> dict:
             }
         )
 
-    body = with_body_file(
+    with body_file(
         f"Published for review: {pr['url']}\n\n"
         f"- head `{pr['headRefOid']}`\n- base `{pr['baseRefOid']}`\n\n"
         f"Review and CI are bound to these exact SHAs; any push invalidates both.\n\n"
         f"{marker('published', run_id=args.run_id, pr=str(pr['number']), head=pr['headRefOid'])}\n"
-    )
-    run(["gh", "issue", "comment", str(args.issue), "--body-file", body], cwd=cwd)
-    os.unlink(body)
+    ) as note:
+        run(["gh", "issue", "comment", str(args.issue), "--body-file", note], cwd=cwd, writes=True)
 
     result = {
         "ok": True,
@@ -1188,13 +1483,13 @@ def cmd_unassign(args, config, cwd) -> dict:
     edit = ["gh", "issue", "edit", str(args.issue), "--remove-label", f"dev:{args.runtime}"]
     if not args.held_by_other:
         edit.extend(["--remove-assignee", "@me"])
-    run(edit, cwd=cwd)
+    run(edit, cwd=cwd, writes=True)
     if args.run_id:
-        body = with_body_file(
+        with body_file(
             f"`{args.run_id}` releasing this item.\n\n{marker('standdown', run_id=args.run_id)}\n"
-        )
-        run(["gh", "issue", "comment", str(args.issue), "--body-file", body], cwd=cwd)
-        os.unlink(body)
+        ) as note:
+            run(["gh", "issue", "comment", str(args.issue), "--body-file", note],
+                cwd=cwd, writes=True)
     return {
         "ok": True,
         "issue": args.issue,
@@ -1223,9 +1518,23 @@ def cmd_audit_board(args, config, cwd) -> dict:
     # looking like it succeeded. A board that is configured and reachable always has cards, so
     # zero means the read did not answer — treat it as a failed read, not a clean result.
     if not cards:
-        raise ReadFailure(
-            "the board returned zero cards — a configured board is never empty, so this is a "
-            "failed read (wrong owner type, missing `project` scope, or an API hiccup), not a pass"
+        # An empty read and a clean board produce the same `drift: []`, and reporting that as a
+        # pass would reproduce the exact failure this file exists to remove: a step that silently
+        # did nothing while looking like it succeeded.
+        #
+        # But it is not a failed READ either — a brand-new project genuinely has no cards, and
+        # telling the caller to retry forever would be its own wrong answer. The honest verdict is
+        # INCONCLUSIVE: the audit ran and could not conclude anything.
+        raise Stop(
+            {
+                "ok": False,
+                "reason": "board-empty-inconclusive",
+                "detail": "the board returned zero cards",
+                "action": "this is NOT a clean board. Either the project is genuinely empty (fine, "
+                          "nothing to audit) or the query was misdirected — wrong owner type, "
+                          "missing `project` scope, wrong board number. Confirm which before "
+                          "treating the board as verified",
+            }
         )
 
     drift, missing_column = [], []
@@ -1299,6 +1608,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--issue", type=int, required=True)
     p.add_argument("--run-id", required=True)
     p.add_argument("--expect-state", required=True, choices=STATES)
+    p.add_argument("--allow-closed-by-pr", type=int,
+                   help="the renewal before `close`, after your own merge auto-closed the issue: "
+                        "a closed issue passes ONLY when this PR is what closed it")
+
+    p = sub.add_parser("reclaim", help="take over work whose holder never came back")
+    p.add_argument("--issue", type=int, required=True)
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--runtime", required=True)
+    p.add_argument("--force", action="store_true",
+                   help="reclaim a holder whose horizon has NOT passed — needs a defensible reason")
 
     p = sub.add_parser("transition", help="mirror the board, swap the label, read BOTH back")
     p.add_argument("--issue", type=int, required=True)
@@ -1360,6 +1679,7 @@ COMMANDS = {
     "create": cmd_create,
     "list-state": cmd_list_state,
     "claim": cmd_claim,
+    "reclaim": cmd_reclaim,
     "verify-claim": cmd_verify_claim,
     "transition": cmd_transition,
     "comment": cmd_comment,
@@ -1403,6 +1723,29 @@ def main(argv: list[str] | None = None) -> int:
             "action": "fail closed: write nothing, retry the read. Do not treat this as a stop or a pass.",
         }, indent=2))
         return 3
+    except WriteFailure as failure:
+        print(json.dumps({
+            "ok": False,
+            "reason": "write-failed",
+            "detail": str(failure),
+            "action": "the write may have landed before it failed — RE-READ to establish what "
+                      "actually happened, then decide. Do not retry blindly.",
+        }, indent=2))
+        return 5
+    except Exception as exc:  # noqa: BLE001 — deliberate catch-all, see below
+        # Without this, an unexpected exception exits 1 with a traceback and no JSON — which the
+        # contract defines as "a check said STOP, follow the JSON's action". A caller obeying that
+        # contract would find no JSON to follow and could not tell an internal bug from a genuine
+        # stand-down. A distinct code, and an explicit statement that the state is UNKNOWN, is the
+        # only honest answer: the failure may have occurred after a write landed.
+        print(json.dumps({
+            "ok": False,
+            "reason": "internal-error",
+            "detail": f"{type(exc).__name__}: {exc}",
+            "action": "state is UNKNOWN — re-read the issue before retrying; this is a defect in "
+                      "the script, not an answer from the tracker",
+        }, indent=2))
+        return 4
 
     print(json.dumps(result, indent=2))
     return 0
