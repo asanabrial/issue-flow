@@ -166,6 +166,7 @@ ones.
 | `heartbeat` | `SCRIPT heartbeat --issue <n> --run-id <id> --expect-state <s> --body-file <f>` | renewal first, post second; **refuses to post** when the renewal says stop |
 | branch + worktree | `SCRIPT start-branch --issue <n> --branch <b> --base <base> --run-id <id>` | renews the claim before the first write outside the board, creates the branch server-side (already linked in the Development sidebar), adds a **per-run** worktree at the configured path, and records branch/base/worktree/holder on the issue |
 | `publish_review` | `SCRIPT publish-review --issue <n> --branch <b> --base <base> --run-id <id> --pr-title <t> --pr-body-file <f> [--worktree <p>]` | pushes, **reuses** the single open PR or creates one, refuses on more than one, scans for closing keywords, and records the PR URL with its exact head and base SHAs |
+| `changelog-notes` | `SCRIPT changelog-notes --version <x.y.z> --file <changelog> [--out <f>]` | read-only. Extracts the version's entry for its tag and Release, anchored on the version **opening** the heading. Fails closed on a missing or empty entry — a tag is immutable, so notes invented at tag time are permanent |
 | `check closing keywords` | `SCRIPT check-closing-keywords --issue <n>` | run again before merging: the branch's commit messages can introduce one after the body is already clean |
 | `unassign` | `SCRIPT unassign --issue <n> --runtime <rt> [--run-id <id>] [--held-by-other]` | `--held-by-other` is the lost-race/stand-down form: drops only your label and keeps the shared assignee |
 | board audit | `SCRIPT audit-board [--fix]` | compares every card's column against its own `status:*` label. **Zero cards is reported as a failed read, not a clean board** |
@@ -491,10 +492,27 @@ naming convention and previous component tag. Require exactly one convention; if
 require an unambiguous single-product/component classification before using `v<new>` or
 `<component>/v<new>`.
 
+**A tag carries what a human wrote about the version.** Before creating it, extract the version's
+changelog entry:
+
+```bash
+SCRIPT changelog-notes --version <new> --file <component-changelog> --out <notes-file>
+```
+
+It **fails closed** when the version has no entry, or has a heading with nothing under it. That is
+not an obstacle to route around: the entry is part of what "delivered" means, and a tag is immutable,
+so notes improvised at tag time are permanent. Write the entry first.
+
+The extraction anchors on the version OPENING the heading, which matters more than it sounds. Seen
+live: an entry headed `### 2026-07-25 — (sin bump de versión) … (sigue en v6.9.8)` — whose entire
+point is that 6.9.8 did *not* ship in it — was matched for 6.9.8 ahead of the genuine entry by a
+looser pattern. That would have produced a tag whose notes describe a different change and disclaim
+the version they are named after.
+
 For `<tag>`, inspect both local and remote direct plus peeled refs. A valid annotated tag has a tag
 object and a `refs/tags/<tag>^{}` target equal to `<merge-sha>`; a lightweight tag, another target or
 ambiguous state blocks without rewriting anything. If the remote tag is absent, reuse a matching
-annotated local tag or create it with `git tag -a "<tag>" "<merge-sha>" -m "<component> <new>"`, then
+annotated local tag or create it with `git tag -a "<tag>" -F "<notes-file>" "<merge-sha>"`, then
 attempt `git push origin "refs/tags/<tag>"`. After ANY push result — success, rejection or timeout —
 re-read the remote: a conclusive peeled target equal to `<merge-sha>` is idempotent success, another
 target is conflict, and no conclusive read fails closed.
@@ -502,9 +520,13 @@ target is conflict, and no conclusive read fails closed.
 When GitHub Releases are required, first reverify the remote peeled target, then query
 `gh release view "<tag>" --json tagName,isDraft,isPrerelease`. A matching non-draft Release with the
 SemVer-derived prerelease flag is idempotent success; incompatible metadata blocks. Only a confirmed
-not-found result permits `gh release create "<tag>" --verify-tag --generate-notes` (add
-`--prerelease` for a prerelease, and `--notes-start-tag "<previous-component-tag>"` only when that
-remote component tag exists). After ANY create result, re-read the Release JSON and the remote peeled
+not-found result permits `gh release create "<tag>" --verify-tag --notes-file "<notes-file>"` — the
+same notes the tag carries (add `--prerelease` for a prerelease).
+
+**Do not use `--generate-notes`.** It substitutes a list of commit subjects for the entry a human
+wrote, which reads like documentation without being any — and it does so silently, so a component
+whose changelog was never updated still gets a Release that looks complete. The `changelog-notes`
+failure is the signal you want there. After ANY create result, re-read the Release JSON and the remote peeled
 tag; both must match the expected metadata and `<merge-sha>`. Auth, network or API ambiguity fails
 closed. Tag or Release failure leaves the issue in `review` even though the merge already exists.
 

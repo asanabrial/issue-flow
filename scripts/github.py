@@ -509,7 +509,20 @@ class Board:
         # another local account could pre-plant this file and point the mirror's mutation at
         # project and field ids of its choosing — bounded by what our own token can already write,
         # so not privilege escalation, but a confused deputy writing to the wrong board.
-        directory = Path(tempfile.gettempdir()) / f"issue-flow-{os.getuid() if hasattr(os, 'getuid') else os.getlogin()}"
+        #
+        # Nothing in here may raise. `os.getlogin()` does: it fails whenever the process has no
+        # attached interactive logon session — a service account, a scheduled task, an
+        # agent-launched subprocess. Called outside the guard it would escape `_cache_path` →
+        # `meta` → `set_status`, and since `transition` mirrors the board BEFORE the label edit,
+        # a crash here would abort the label move entirely. That is the precise inverse of this
+        # class's contract, so identity resolution falls back rather than throwing.
+        try:
+            identity = str(os.getuid()) if hasattr(os, "getuid") else (
+                os.environ.get("USERNAME") or os.environ.get("USER") or os.getlogin()
+            )
+        except OSError:
+            identity = "shared"
+        directory = Path(tempfile.gettempdir()) / f"issue-flow-{re.sub(r'[^A-Za-z0-9._-]', '_', identity)}"
         try:
             directory.mkdir(mode=0o700, exist_ok=True)
         except OSError:
@@ -651,8 +664,14 @@ class Board:
                 option=option["id"],
             )
             return {"attempted": True, "set_to": option["name"]}
-        except ReadFailure as exc:
-            return {"attempted": True, "skipped": str(exc)}
+        except Exception as exc:  # noqa: BLE001 — the contract is best-effort; see below
+            # Catching broadly is the point, not a lapse. This class promises the mirror "never
+            # blocks a transition", and `transition` mirrors BEFORE it moves the label — so any
+            # exception escaping here kills the authoritative write, which is the exact inversion
+            # of the promise. A board problem must degrade to a reported skip, never to a failed
+            # state change. Every genuine defect this hides still surfaces: the transition's
+            # read-back compares the board against the label immediately afterwards.
+            return {"attempted": True, "skipped": f"{type(exc).__name__}: {exc}"}
 
     def read_status(self, issue: int) -> str | None:
         if not self.enabled:
@@ -814,7 +833,7 @@ def cmd_config(args, config, cwd) -> dict:
         "scripted_operations": [
             "ensure-states", "create", "list-state", "claim", "reclaim", "verify-claim",
             "transition", "comment", "heartbeat", "start-branch", "publish-review", "unassign",
-            "check-closing-keywords", "audit-board",
+            "changelog-notes", "check-closing-keywords", "audit-board",
         ],
         "not_scripted": {
             "merge": "irreversible remote write — the agent runs it after verifying SHAs",
@@ -1084,7 +1103,11 @@ def cmd_transition(args, config, cwd) -> dict:
         for stale in current:
             if stale != f"status:{args.to}":
                 edit.extend(["--remove-label", stale])
-    run(edit, cwd=cwd)
+    # The single most consequential write in the file, and it was the one missing `writes=True`.
+    # `gh issue edit` with both --add-label and --remove-label can apply partially, so reporting a
+    # failure here as a READ failure would tell the caller "nothing happened, retry" about an issue
+    # that may already be carrying two states.
+    run(edit, cwd=cwd, writes=True)
 
     after = status_labels(label_names(issue_view(args.issue, "labels", cwd=cwd)))
     result = {
@@ -1205,11 +1228,17 @@ def normalise_path(path) -> str:
 
     Necessary on Windows, where git reports `H:/REPO/...` and the resolved Path is `H:\\REPO\\...`;
     a raw string comparison silently says "different directory" and turns a resume into a refusal.
+
+    Case is folded ONLY where the filesystem folds it. On POSIX two directories differing only by
+    case are two directories, and lowercasing them into one key would make `registered_worktrees`
+    report the wrong worktree as the owner of a path — which is the single fact the resume-versus-
+    refuse decision rests on.
     """
     try:
-        return str(Path(path).resolve()).replace("\\", "/").rstrip("/").lower()
+        text = str(Path(path).resolve()).replace("\\", "/").rstrip("/")
     except OSError:
-        return str(path).replace("\\", "/").rstrip("/").lower()
+        text = str(path).replace("\\", "/").rstrip("/")
+    return text.lower() if os.name == "nt" else text
 
 
 def registered_worktrees(cwd: Path) -> dict[str, str | None]:
@@ -1535,6 +1564,148 @@ def cmd_publish_review(args, config, cwd) -> dict:
     return result
 
 
+def changelog_section(text: str, version: str) -> tuple[str, str] | None:
+    """Extract one version's entry from a markdown changelog: (heading, body).
+
+    Format-tolerant, because changelog conventions vary and this skill must not impose one: any
+    heading level, `v` optional, `[1.2.3]` bracketed (Keep a Changelog) or bare, an optional
+    `Version`/`Release` word, and anything may FOLLOW on the heading line — a date, a severity, a
+    description.
+
+    **The version must OPEN the heading, not merely appear in it**, and that anchor is the whole
+    correctness of this function. Caught live against a real changelog: an entry headed
+    `### 2026-07-25 — (sin bump de versión) … (comportamiento del motor sin cambios, sigue en
+    v6.9.8)` — an entry whose entire point is that 6.9.8 did NOT ship in it — was matched for
+    version 6.9.8 ahead of the genuine `### v6.9.8 (…) — PATCH: …` heading further down, because a
+    permissive `.*?` let the version be found anywhere on the line. The result would have been an
+    immutable tag carrying notes that describe a different change and explicitly disclaim the
+    version it is named after.
+
+    Version matching is also exact on the whole number: `1.2.3` must not match `1.2.30`, which a
+    naive substring search does.
+
+    The section ends at the next heading of the SAME OR SHALLOWER level, so sub-headings inside an
+    entry stay with it.
+    """
+    wanted = version.lstrip("vV")
+    # The trailing assertion must reject a SemVer pre-release or build suffix, not merely another
+    # digit. `(?![0-9.])` let a query for 6.9.8 match `### v6.9.8-rc1 …`, because `-` is neither a
+    # digit nor a dot — so a draft or release-candidate entry sitting ABOVE the real one would win
+    # and its notes would end up in the immutable tag for the final release. Anything alphanumeric,
+    # `.`, `-` or `+` after the number means this is a DIFFERENT version.
+    pattern = re.compile(
+        r"^(?P<hashes>#{1,6})[ \t]+(?:(?:version|release)[ \t]+)?\[?v?"
+        + re.escape(wanted)
+        + r"\]?(?![0-9A-Za-z.+\-])",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        # Two headings anchored to one version is not something to resolve by picking the first.
+        # Whichever is chosen becomes permanent, and the topmost is not reliably the real one —
+        # a superseded draft above a genuine entry is exactly the shape that goes wrong.
+        raise Stop(
+            {
+                "ok": False,
+                "reason": "ambiguous-changelog-entry",
+                "version": version,
+                "headings": [text[m.start():text.find("\n", m.start())].strip() for m in matches],
+                "action": "more than one heading claims this version — resolve the changelog "
+                          "before tagging; picking one silently would make the wrong choice permanent",
+            }
+        )
+    match = matches[0]
+
+    level = len(match.group("hashes"))
+    start = match.start()
+    # The heading is the whole LINE. Cutting it at the version would drop the date and description
+    # the entry's own author wrote there, which is precisely the context a release note needs.
+    line_end = text.find("\n", start)
+    if line_end == -1:
+        line_end = len(text)
+    heading = text[start:line_end].strip()
+
+    rest = text[line_end:]
+    following = re.search(rf"^#{{1,{level}}}[ \t]+", rest, re.MULTILINE)
+    end = line_end + (following.start() if following else len(rest))
+    body = text[line_end:end].strip()
+    return heading, body
+
+
+def cmd_changelog_notes(args, config, cwd) -> dict:
+    """Read the changelog entry for a version, so a tag carries what a human wrote about it.
+
+    Read-only by design: it neither creates the tag nor the Release, because those are irreversible
+    and stay with the agent. What it removes is the step that gets skipped or improvised — every
+    version this workflow ships is supposed to have a changelog entry, and `--generate-notes` quietly
+    substitutes a list of commit subjects for it, which reads like documentation without being any.
+
+    Fails closed. A version bump with no entry is not a tagging problem to work around: the entry is
+    part of what "delivered" means, and inventing notes at tag time is how a changelog becomes a
+    thing nobody trusts.
+    """
+    # A RELATIVE --file resolves against --repo-dir, never against the process working directory.
+    #
+    # The old order asked `path.exists()` first, which Python answers against os.getcwd(). In a
+    # monorepo every worktree shares the same relative layout, so `docs/engine/CHANGELOG.md` exists
+    # in the ambient directory AND in the worktree being tagged — and the ambient one won. The two
+    # differ exactly when it matters: the branch added or corrected the entry the tag is about.
+    # Reading the wrong branch's changelog into an immutable tag is silent and unfixable.
+    path = Path(args.file)
+    resolved = path if path.is_absolute() else cwd / path
+    if not resolved.exists():
+        raise Stop({"ok": False, "reason": "changelog-not-found", "file": str(resolved),
+                    "action": "a relative --file is resolved against --repo-dir; pass an absolute "
+                              "path, or point --repo-dir at the checkout that holds the changelog"})
+    found = changelog_section(resolved.read_text(encoding="utf-8"), args.version)
+
+    if not found:
+        raise Stop(
+            {
+                "ok": False,
+                "reason": "no-changelog-entry",
+                "version": args.version,
+                "file": str(resolved),
+                "action": "this version has no entry. Write it BEFORE tagging — a tag is immutable "
+                          "and the entry is part of the delivery, not a formality after it",
+            }
+        )
+
+    heading, body = found
+    if not body:
+        raise Stop(
+            {
+                "ok": False,
+                "reason": "empty-changelog-entry",
+                "version": args.version,
+                "heading": heading,
+                "action": "the heading exists but says nothing under it — a tag message of one "
+                          "title line is not release notes",
+            }
+        )
+
+    notes = f"{heading}\n\n{body}" if args.include_heading else body
+    written = None
+    if args.out:
+        written = str(Path(args.out).resolve())
+        Path(args.out).write_text(notes + "\n", encoding="utf-8", newline="\n")
+
+    return {
+        "ok": True,
+        "version": args.version,
+        "file": str(resolved),
+        "heading": heading,
+        "lines": len(body.splitlines()),
+        "notes_file": written,
+        "notes": None if written else notes,
+        "next": "git tag -a <tag> -F <notes-file> <merge-sha>, and `gh release create "
+                "--notes-file <notes-file>` where the component publishes Releases — never "
+                "--generate-notes, which replaces what a human wrote with a list of commit subjects",
+    }
+
+
 def cmd_unassign(args, config, cwd) -> dict:
     """Release work. `dev:<runtime>` means HOLDING, so it comes off the moment you stop.
 
@@ -1722,6 +1893,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--held-by-other", action="store_true",
                    help="lost race or stand-down: keep the shared assignee, drop only your label")
 
+    p = sub.add_parser("changelog-notes",
+                       help="extract a version's changelog entry, to carry into its tag/Release")
+    p.add_argument("--version", required=True, help="e.g. 6.9.8 or v6.9.8")
+    p.add_argument("--file", required=True, help="the component's changelog")
+    p.add_argument("--out", help="write the notes here, for `git tag -F` / `--notes-file`")
+    p.add_argument("--include-heading", action="store_true",
+                   help="keep the version heading at the top of the notes")
+
     p = sub.add_parser("check-closing-keywords",
                        help="will this issue auto-close on merge, and from what cause")
     p.add_argument("--issue", type=int, required=True)
@@ -1748,6 +1927,7 @@ COMMANDS = {
     "start-branch": cmd_start_branch,
     "publish-review": cmd_publish_review,
     "unassign": cmd_unassign,
+    "changelog-notes": cmd_changelog_notes,
     "check-closing-keywords": cmd_check_closing_keywords,
     "audit-board": cmd_audit_board,
 }
