@@ -273,28 +273,13 @@ path and holding run-id on the issue either way. A branch nobody can find from t
 nobody can follow.
 
 The worktree path comes from the `Worktree location` configuration row, with `<repo>`, `<branch>`,
-`<issue>` and `<run-id>` substituted; every component is flattened, so a `docs/113-…` branch does not
-create a stray `docs/` directory under the worktree root.
-
-**What the path must guarantee is that no two live runs share a directory** — not that it contains
-any particular token. Two templates achieve that differently, and the choice is a real trade:
-
-| Template | Collision is prevented by | Cost |
-|---|---|---|
-| `…/<branch>-<run-id>` | construction — no two runs ever compute the same path | one orphan directory per run that dies; they accumulate |
-| `…/<branch>` | git itself — `worktree add` refuses a branch already checked out elsewhere (`fatal: '<branch>' is already used by worktree at …`) | needs the resume check below to be correct |
-
-The second is safe only because the branch carries the issue number, so two runs on one issue compute
-the same BRANCH and git blocks the second checkout. It was NOT safe in the original convention, where
-the path was derived from the issue while the branch varied — that is how, on 2026-07-24, two runs
-derived the same directory and the loser wrote its model, its migration and its tests into the
-winner's checkout mid-build.
-
-**So `start-branch` asks whether the directory is YOURS, not whether it exists.** A registered
-worktree for this exact branch is a resume: it is reused and reported as `resumed_existing_worktree`.
-Anything else — a stranger's checkout, or an orphan left by a dead run — is refused, because writing
-into either is the failure above. Merely refusing every existing path would make resume impossible
-under a run-id-free template while protecting against nothing git had not already caught.
+`<issue>` and `<run-id>` substituted; the branch is flattened, so a `docs/113-…` branch does not
+create a stray `docs/` directory under the worktree root. **The run-id in the path is not decoration.**
+Git refuses a branch already checked out elsewhere, but *nothing refuses a second process writing
+into a directory that already exists* — which is how, on 2026-07-24, two runs derived the same path
+from the same convention and the loser wrote its model, its migration and its tests into the winner's
+checkout mid-build. `start-branch` refuses outright when the path already exists, because at that
+point the only safe answer is to find out who holds it.
 
 **A fresh worktree does not have the files git never tracked.** Everything gitignored — environment
 files, secrets, credentials, local settings — is simply absent, and the failure it produces is
