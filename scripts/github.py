@@ -1200,6 +1200,36 @@ def worktree_path(template: str, repo: str, branch: str, run_id: str, issue: int
     return Path(resolved)
 
 
+def normalise_path(path) -> str:
+    """One spelling for a path, so two spellings of the same directory compare equal.
+
+    Necessary on Windows, where git reports `H:/REPO/...` and the resolved Path is `H:\\REPO\\...`;
+    a raw string comparison silently says "different directory" and turns a resume into a refusal.
+    """
+    try:
+        return str(Path(path).resolve()).replace("\\", "/").rstrip("/").lower()
+    except OSError:
+        return str(path).replace("\\", "/").rstrip("/").lower()
+
+
+def registered_worktrees(cwd: Path) -> dict[str, str | None]:
+    """Every worktree git knows about, as {normalised path: branch or None if detached}.
+
+    A directory git does NOT list is not a worktree — it is an orphan a dead run left behind, and
+    the difference decides whether writing there is a resume or a collision.
+    """
+    proc = run(["git", "worktree", "list", "--porcelain"], cwd=cwd, check=False)
+    trees: dict[str, str | None] = {}
+    current = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("worktree "):
+            current = normalise_path(line[len("worktree "):].strip())
+            trees[current] = None
+        elif line.startswith("branch ") and current:
+            trees[current] = line[len("branch refs/heads/"):].strip()
+    return trees
+
+
 def cmd_start_branch(args, config, cwd) -> dict:
     """Create the branch server-side (already linked to the issue), then an isolated worktree.
 
@@ -1223,15 +1253,37 @@ def cmd_start_branch(args, config, cwd) -> dict:
 
     _, repo_name = repo_identity(cwd)
     path = worktree_path(template, repo_name, args.branch, args.run_id, args.issue)
+
+    # An existing path means one of three different things, and they are not interchangeable.
+    #
+    # This matters because the template is configurable. With `<run-id>` in it a path is unique per
+    # run, so ANY existing path is foreign. Without it — `<repo>/<branch>` — an existing path is
+    # usually your OWN branch's worktree, and refusing it would make every resume impossible while
+    # protecting against nothing: git already refuses a second checkout of a branch that is live
+    # elsewhere ("fatal: '<branch>' is already used by worktree at ..."), which is the collision
+    # that actually costs work.
+    #
+    # So the question is not "does it exist" but "is it MINE": a registered worktree for this exact
+    # branch is a resume; anything else is a stranger's tree or an orphan directory left by a dead
+    # run, and writing into either is the #58 failure.
+    resuming = False
     if path.exists():
-        raise Stop(
-            {
-                "ok": False,
-                "reason": "worktree-path-exists",
-                "path": str(path),
-                "action": "another run may hold it — do not write into it; verify the claim and the holder",
-            }
-        )
+        registered = registered_worktrees(cwd)
+        owner_branch = registered.get(normalise_path(path))
+        if owner_branch == args.branch:
+            resuming = True
+        else:
+            raise Stop(
+                {
+                    "ok": False,
+                    "reason": "worktree-path-occupied",
+                    "path": str(path),
+                    "occupied_by_branch": owner_branch,
+                    "action": "this directory is not a registered worktree for your branch — it is "
+                              "another checkout or an orphan from a dead run. Do NOT write into it; "
+                              "verify the holder, or remove the orphan first",
+                }
+            )
 
     developed = run(
         ["gh", "issue", "develop", str(args.issue), "--name", args.branch, "--base", args.base],
@@ -1252,8 +1304,9 @@ def cmd_start_branch(args, config, cwd) -> dict:
             cwd=cwd, check=False, writes=True)
 
     run(["git", "fetch", "origin"], cwd=cwd)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    run(["git", "worktree", "add", "--", str(path), args.branch], cwd=cwd, writes=True)
+    if not resuming:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        run(["git", "worktree", "add", "--", str(path), args.branch], cwd=cwd, writes=True)
 
     head = run(["git", "rev-parse", "HEAD"], cwd=path).stdout.strip()
     base_sha = run(["git", "rev-parse", f"origin/{args.base}"], cwd=cwd).stdout.strip()
@@ -1272,6 +1325,7 @@ def cmd_start_branch(args, config, cwd) -> dict:
         "branch": args.branch,
         "natively_linked": linked,
         "worktree": str(path),
+        "resumed_existing_worktree": resuming,
         "head": head,
         "base_sha": base_sha,
         "reminder": "gitignored files (.env, credentials, local settings) are NOT in a fresh worktree",
