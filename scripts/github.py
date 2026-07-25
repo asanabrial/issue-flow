@@ -987,7 +987,14 @@ query($owner: String!, $name: String!, $number: Int!) {
 """
 
 
-def closing_keyword_refs(issue: int, cwd: Path) -> list[dict]:
+CLOSING_KEYWORD_RE = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*"
+    r"(?:#|https://github\.com/[\w.-]+/[\w.-]+/issues/)(?P<number>\d+)",
+    re.IGNORECASE,
+)
+
+
+def closing_refs(issue: int, cwd: Path) -> list[dict]:
     owner, name = repo_identity(cwd)
     data = gh_json(
         ["api", "graphql", "-f", f"query={CLOSING_KEYWORDS_QUERY}",
@@ -998,20 +1005,86 @@ def closing_keyword_refs(issue: int, cwd: Path) -> list[dict]:
     return (node.get("closedByPullRequestsReferences") or {}).get("nodes") or []
 
 
+def keyword_sources(issue: int, prs: list[dict], base: str | None, branch: str | None,
+                    cwd: Path) -> list[dict]:
+    """Find where an actual closing keyword is written, if anywhere.
+
+    A non-empty `closedByPullRequestsReferences` proves the issue WILL auto-close, but not WHY, and
+    the remedy differs completely by cause. Text you wrote you can edit; a link GitHub derived from
+    the branch you cannot. Reporting both as "fix the PR body" sends a run to edit prose that never
+    contained the keyword — observed live on issue #118, whose body opened with
+    `Refs #118 — deliberately NOT a closing keyword` while the reference was live anyway.
+    """
+    hits = []
+    for pr in prs:
+        body = gh_json(["pr", "view", str(pr["number"]), "--json", "body"], cwd=cwd) or {}
+        for match in CLOSING_KEYWORD_RE.finditer(body.get("body") or ""):
+            if int(match.group("number")) == issue:
+                hits.append({"where": f"pr#{pr['number']} body", "text": match.group(0)})
+    if base and branch:
+        log = run(["git", "log", f"origin/{base}..{branch}", "--format=%B"], cwd=cwd, check=False)
+        for match in CLOSING_KEYWORD_RE.finditer(log.stdout or ""):
+            if int(match.group("number")) == issue:
+                hits.append({"where": "commit message", "text": match.group(0)})
+    return hits
+
+
+def assess_autoclose(issue: int, cwd: Path, base: str | None = None,
+                     branch: str | None = None) -> dict:
+    """Will this issue auto-close on merge, and if so, from what?
+
+    Two distinct causes, one symptom:
+
+      * a **closing keyword** in the PR body or a commit message — avoidable, and a hard stop,
+        because the text is yours to fix;
+      * a **branch link** created by `gh issue develop` — GitHub converts the Development-sidebar
+        link into a closing reference the moment a PR opens from that branch, and empties
+        `linkedBranches` in the same move. No keyword is involved and no edit removes it.
+
+    The second is not a defect in the run: it is what the recommended linking command does. Making
+    it a hard stop would make the recommended path permanently un-shippable, and a gate that always
+    fires is a gate that gets ignored. So it is reported loudly with the follow-up it mandates —
+    the auto-close is NOT the workflow's `close`, so `transition --to done` must still run after
+    the merge or the label and the board freeze wherever they were.
+    """
+    refs = closing_refs(issue, cwd)
+    if not refs:
+        return {"will_autoclose": False, "cause": None, "linked_prs": []}
+    hits = keyword_sources(issue, refs, base, branch, cwd)
+    return {
+        "will_autoclose": True,
+        "cause": "closing-keyword" if hits else "branch-link",
+        "keyword_sources": hits,
+        "linked_prs": refs,
+    }
+
+
 def cmd_check_closing_keywords(args, config, cwd) -> dict:
-    """A closing keyword makes GitHub close the issue on merge: no transition, no mirror, labels
-    frozen. Reading your own prose is how it slipped through — so check it mechanically."""
-    refs = closing_keyword_refs(args.issue, cwd)
-    if refs:
+    """Auto-close bypasses `transition`: no state move, no mirror, labels frozen wherever they were.
+    Reading your own prose is how a keyword slips through — so check it mechanically."""
+    verdict = assess_autoclose(args.issue, cwd, args.base, args.branch)
+
+    if verdict["cause"] == "closing-keyword":
         raise Stop(
             {
                 "ok": False,
                 "reason": "closing-keyword-live",
-                "linked_prs": refs,
-                "action": "edit the PR body/commits to `Refs #<n>` and re-run; the value can lag a few seconds",
+                **verdict,
+                "action": "remove the keyword — use `Refs #<n>` — then re-run; the value can lag a few seconds",
             }
         )
-    return {"ok": True, "issue": args.issue, "closing_keyword_refs": []}
+
+    result = {"ok": True, "issue": args.issue, **verdict}
+    if verdict["cause"] == "branch-link":
+        result["warning"] = (
+            "this issue WILL auto-close on merge because `gh issue develop` linked the branch, "
+            "not because of any keyword — no edit removes it"
+        )
+        result["mandatory_follow_up"] = (
+            "after merge, run `transition --to done` anyway: GitHub's auto-close is not the "
+            "workflow's close, so without it the label and the board freeze where they are"
+        )
+    return result
 
 
 def cmd_publish_review(args, config, cwd) -> dict:
@@ -1064,16 +1137,16 @@ def cmd_publish_review(args, config, cwd) -> dict:
         pr = fresh[0]
         created = True
 
-    refs = closing_keyword_refs(args.issue, cwd)
-    if refs:
+    verdict = assess_autoclose(args.issue, cwd, args.base, args.branch)
+    if verdict["cause"] == "closing-keyword":
         raise Stop(
             {
                 "ok": False,
                 "reason": "closing-keyword-live",
                 "pr": pr,
-                "linked_prs": refs,
+                **verdict,
                 "action": "the issue WILL auto-close on merge, bypassing transition and the mirror — "
-                          "fix the PR body/commits to `Refs #<n>` and re-run",
+                          "remove the keyword (use `Refs #<n>`) and re-run",
             }
         )
 
@@ -1086,7 +1159,7 @@ def cmd_publish_review(args, config, cwd) -> dict:
     run(["gh", "issue", "comment", str(args.issue), "--body-file", body], cwd=cwd)
     os.unlink(body)
 
-    return {
+    result = {
         "ok": True,
         "issue": args.issue,
         "pr": pr["number"],
@@ -1094,8 +1167,16 @@ def cmd_publish_review(args, config, cwd) -> dict:
         "created": created,
         "head": pr["headRefOid"],
         "base": pr["baseRefOid"],
+        "autoclose": verdict,
         "next": "transition --to review, then bind review and CI to these SHAs",
     }
+    if verdict["cause"] == "branch-link":
+        result["mandatory_follow_up"] = (
+            "GitHub will auto-close this issue on merge because the branch was linked, not because "
+            "of a keyword. Run `transition --to done` after the merge regardless — the auto-close "
+            "is not the workflow's close and moves neither the label nor the board"
+        )
+    return result
 
 
 def cmd_unassign(args, config, cwd) -> dict:
@@ -1261,8 +1342,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--held-by-other", action="store_true",
                    help="lost race or stand-down: keep the shared assignee, drop only your label")
 
-    p = sub.add_parser("check-closing-keywords", help="prove no closing keyword will bypass the state machine")
+    p = sub.add_parser("check-closing-keywords",
+                       help="will this issue auto-close on merge, and from what cause")
     p.add_argument("--issue", type=int, required=True)
+    p.add_argument("--base", help="base ref, so commit messages can be scanned for keywords too")
+    p.add_argument("--branch", help="branch ref, paired with --base")
 
     p = sub.add_parser("audit-board", help="compare every card's column against its own status label")
     p.add_argument("--fix", action="store_true", help="repair the drift this pass finds")
