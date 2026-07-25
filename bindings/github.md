@@ -2,9 +2,58 @@
 
 How this workflow's operations are performed against GitHub, and which of its assumptions GitHub
 satisfies natively rather than by convention. `SKILL.md` describes WHAT happens; this file is the
-only place that says HOW, and the only place a `gh` command appears.
+only place that says HOW.
 
 Read this alongside `SKILL.md` when the operator configuration names `github` as the tracker.
+
+## The mechanical half runs as a script
+
+**Every reversible operation below is executed by `scripts/github.py`, not by an agent composing
+`gh` calls.** That is not an optimisation — it is the fix for a specific, repeated failure:
+
+> *"not a missing permission, not an unclear config, not a tracker limitation. The instruction was
+> present and the run simply never executed it."* — `SKILL.md`, on a run that moved labels correctly
+> through the entire state machine and mirrored the board **zero times in a whole session**.
+
+Prose cannot fix a run that does not execute prose. So the steps that are **mechanical and
+verifiable** — label swaps, the board mirror and its read-back, claim adjudication, the renewal,
+branch and worktree creation, PR reuse, the closing-keyword scan — are code. The steps that need
+**judgement** — what is worth analysing, whether a blocker is discharged, whether a diff passes
+review — are not, and stay in the prose where they belong.
+
+```bash
+python <skill>/scripts/github.py --repo-dir <repo> <operation> [options]
+```
+
+`<skill>` is the directory holding `SKILL.md`. The script reads the SAME operator configuration the
+prose does (the block between the config markers in `SKILL.md`, overridden by `operator.local.md`),
+so it never becomes a third source of truth. `python <skill>/scripts/github.py config` prints what it
+resolved — run it once if you are unsure what the board or worktree row currently says.
+
+**Exit codes carry the distinction `SKILL.md` calls *a failed read is not a failed answer*:**
+
+| Exit | Meaning | What you do |
+|---|---|---|
+| `0` | the operation completed **and its read-back verified** | continue |
+| `1` | **STOP** — a check answered stop (lost race, stand-down, wrong state, closed issue) | follow the JSON's `action`; do not retry |
+| `2` | usage or configuration error; nothing was attempted | fix the invocation |
+| `3` | the **read itself** failed — the control surface answered NOTHING | fail closed: write nothing, retry the read. Never clearance, never a stand-down |
+
+Exit `3` is the one to read carefully. Treating a timeout as a stand-down lets a flaky network halt
+every run; treating it as clearance lets a run write deaf, which is the defect the renewal exists to
+close. The script never collapses the two.
+
+**What is deliberately NOT scripted**: `merge`, `publish_version`, `close`, and the interpretation of
+`review_status` / `ci_status`. Those write irreversibly to the remote or require a verdict, and a
+defect in a script must not be able to merge, tag or close anything. The agent performs them itself,
+by the prose further down, after verifying SHAs.
+
+**Where `gh` cannot be installed** — a locked-down image, a sandbox with no package manager — the
+REST API with a token does everything below at the cost of longer invocations. An analyst reaching
+the API over HTTPS is exactly as capable as one running `gh`, which is the whole reason the analyst
+role was defined as network-only. `gh` itself is a separate install
+(`winget install GitHub.cli`, `brew install gh`, `apt install gh`); the installer deliberately makes
+no network calls, so it checks and tells you rather than fetching it.
 
 ## What GitHub provides
 
@@ -27,7 +76,7 @@ wearing `status:review`, so every query for work awaiting verification would kee
 a board grouped by status would never move the card: closing an issue emits `issues.closed`, which
 is not a label event and fires no mirror.
 
-## The claim hazard — read this before implementing `claim`
+## The claim hazard — why the assignee cannot adjudicate
 
 The obvious reading of GitHub is that assignees are a set, so two agents claiming leaves two
 assignees and the collision is visible. **That is true only when the agents are different accounts,
@@ -36,56 +85,31 @@ leaves exactly one assignee, and the re-read shows a clean issue assigned to you
 is already building it.
 
 So verification here does not read the assignee. It reads the **comment timeline**, which the server
-orders and which no later writer can reorder:
-
-1. **Claiming writes a comment**, carrying the run-id. It is not decoration — it is the only
-   artefact that records *which* run claimed and *when*.
-2. **Then read the comments back.** An earlier claim comment than yours, with a different run-id and
-   no back-off after it, means you lost: release and take the next item.
+orders and which no later writer can reorder. `claim` writes its comment first and then adjudicates
+from that timeline; the earliest live claim wins.
 
 This is the same mechanism the Linear binding needs, arrived at from the opposite direction — there
 because the assignee is overwritten, here because it is shared. The lesson generalises further than
 either: **an identity field cannot adjudicate a race between runs that share that identity.**
 
-## `verify_claim` — the renewal, made concrete
+### Control markers
 
-The workflow requires every heartbeat — and every expensive or irreversible step between heartbeats
-— to re-read the control surface before writing. On GitHub that surface is one call, and everything
-the renewal needs is in it:
+`SKILL.md` warns that "parsing prose for the same answer is fragile — any rewording breaks it", and
+adjudication used to depend on exactly that. So every control comment the script writes carries a
+machine-readable trailer alongside the sentence a human reads:
 
-```bash
-gh issue view <n> --json state,labels,comments
+```
+<!-- issue-flow: claim run-id=claude-code-60fabae1 horizon=2026-07-25T23:00Z -->
+<!-- issue-flow: standdown run-id=claude-code-d7d8a22e -->
+<!-- issue-flow: heartbeat run-id=claude-code-60fabae1 -->
 ```
 
-Then three checks, in any order — a failed check is a **stop instruction, not a retry**:
-
-1. **State.** `state` is `OPEN`. A closed issue means someone delivered or killed it: stop, and do
-   not change anything.
-2. **Workflow state.** Exactly one `status:*` label is present and it is the state you are working
-   under (for a dev mid-build, `status:in-progress`). A missing or different state means the item
-   moved without you: stop, and leave the new state alone — it is not yours.
-3. **Control messages.** No comment created *after your own claim comment* names your run-id in a
-   stand-down, a reclaim or an adjudication. Your claim comment is the watermark: anything addressed
-   to your run-id below it is for you (for a reclaimer, the `Reclaiming from <run-id>` comment plays
-   the watermark role — it is that run's first write to the timeline). Finding one means stop,
-   acknowledge once, release your `dev:<runtime>` marker, and write nothing else. A mention is not a
-   control message: another run's heartbeat that names your run-id in passing ("waiting on
-   `<run-id>`'s measurement phase") instructs you to do nothing, and classifying it as a stand-down
-   would have you abandon work nobody asked you to drop. What stops you is a comment that tells you.
-
-Two distinctions keep this safe to run unattended:
-
-- **A failed read is not a failed check.** If the `gh` call itself errors — network, auth, rate
-  limit — the renewal answered nothing. The semantics (*A failed read is not a failed answer* in
-  `SKILL.md`) apply verbatim: fail closed on the write, retry the read.
-- **Do not remove the assignee when another run still holds the item.** Every agent authenticates
-  as the same account, so the single `@me` assignee is the winner's as much as yours — removing it
-  strips the active holder. On a stand-down or a lost race, your `dev:<runtime>` label is
-  per-runtime and comes off; the shared assignee stays. (Plain `unassign` — handing back work you
-  alone hold — still removes both; see the operations table.)
-
-The semantics — what a stop instruction is, what release means, why no second claim comment — live
-in `SKILL.md` under *A heartbeat is a claim renewal*; this section is only the mechanics.
+They are HTML comments, so they are invisible in rendered markdown and a later run rewording the
+surrounding prose cannot break them. Reading falls back to the prose forms (`Claimed by <run-id>`)
+for comments written before markers existed, and that fallback is deliberately narrow: a control
+message must both **name the run-id AND instruct**. A heartbeat that mentions your run-id in passing
+("waiting on `<run-id>`'s measurement phase") instructs you to do nothing, and classifying it as a
+stand-down would have you abandon work nobody asked you to drop.
 
 **Worked example — a real claim race, 2026-07-22.** The timeline, from the issue's comment trail:
 
@@ -98,25 +122,10 @@ in `SKILL.md` under *A heartbeat is a claim renewal*; this section is only the m
 | 15:24:21 | the winner delivers |
 | 15:28:52 | `claude-code-d7d8a22e` finally stands down, retracting a measurement taken on work it no longer held |
 
-Under write-only heartbeats the stand-down sat unread for 48 minutes. Under read-before-write
-renewal, the loser's next heartbeat — 14:49:22 at the latest — runs the three checks first: check 3
-finds the 14:40:41 adjudication naming its run-id, below its own claim comment. The heartbeat is
-never written; the run acknowledges, releases its markers, and heartbeats 1–3 and the duplicate
-build do not happen. The renewal does not prevent losing the race; it caps the cost of having lost
-it at one renewal interval.
-
-## Prerequisites
-
-**`gh` is the preferred path, not the only one.** It is a separate install — nothing in this skill
-can put it there, and the installer deliberately makes no network calls, so it checks for `gh` and
-tells you, rather than fetching it. Get it from your platform's package manager
-(`winget install GitHub.cli`, `brew install gh`, `apt install gh`).
-
-Where `gh` cannot be installed — a locked-down image, a sandbox with no package manager — **the
-REST API with a token does everything below**, at the cost of longer invocations. Keep that route
-in mind rather than concluding the workflow is unavailable: an analyst reaching the API over HTTPS
-is exactly as capable as one running `gh`, which is the whole reason the analyst role was defined
-as network-only in the first place.
+Under write-only heartbeats the stand-down sat unread for 48 minutes. The script makes that timeline
+impossible: `heartbeat` runs the renewal **before** it posts, and refuses to post when the renewal
+says stop — so the loser's next heartbeat at 14:49:22 exits `1` instead of writing. The renewal does
+not prevent losing the race; it caps the cost of having lost it at one renewal interval.
 
 ## State names
 
@@ -127,56 +136,63 @@ ones.
 
 ## Operations
 
-`<n>` is the issue number throughout.
+`<n>` is the issue number throughout. `SCRIPT` abbreviates
+`python <skill>/scripts/github.py --repo-dir <repo>`.
 
-| Operation | GitHub |
-|---|---|
-| `ensure_states` | `gh label create "status:<s>" --color ededed --force` for each state (see below) |
-| `create` | ensure every label exists (below), then `gh issue create --title "<identity>: <title>" --body-file <file> --label "status:ready" --label "<scale>:<value>" --label "domain:<name>" --label "analyst:<runtime>"`. **If a project board is configured, mirroring the initial column is part of this operation** — see step 4 of *How the mirror runs* |
-| `list_state` | `gh issue list --label "status:<state>" --search "no:assignee" --json number,title,labels,createdAt`; partition results by `domain:<name>` and declared priority scale, sort inside each partition by that scale, and expose each partition head with `createdAt` so the workflow can choose the oldest head without comparing scale values |
-| `claim` | `gh issue edit <n> --add-assignee @me`, write the claim comment, then **read the comment timeline** — an earlier claim than yours means you lost. Re-reading assignees is not enough; see below |
-| `verify_claim` | one read — `gh issue view <n> --json state,labels,comments` — then three checks, any failed check is a stop instruction, not a retry: the issue is OPEN; it carries exactly one `status:*` label and it is the state you are working under; and no comment created after your own claim comment names your run-id in a stand-down, reclaim or adjudication. See *`verify_claim` — the renewal, made concrete* below |
-| `transition` | **If a project board is configured, attempt its `Status` field FIRST** — best-effort, without pre-checking whether the issue is on the board; an issue not on it (or a missing scope) is a quiet no-op, not a precondition (see *Keeping a board in sync*). **Then** move the authoritative label: `gh issue edit <n> --add-label "status:<new>" --remove-label "status:<old>"` — one call, both halves. **Then READ BOTH BACK in one step** (see *The transition read-back* below): exactly one `status:*` label, and — when a board is configured — a `Status` column that matches it. An unverified mirror is the one that never happened |
-| `publish_review` | push the issue branch, then query `gh pr list --head <branch> --state open --json number,url,headRefOid,baseRefOid`. Reuse the single open PR when present; create one only when none exists with `gh pr create --base <base> --head <branch> --title "<title>" --body-file <file>`. More than one open PR is ambiguous: stop. Do not use closing keywords. Record the PR URL on the issue before `transition(review)` |
-| `review_status` | capture `headRefOid` and `baseRefOid` with `gh pr view <pr> --json headRefOid,baseRefOid,latestReviews,reviewDecision,reviewRequests,mergeStateStatus`. The independent verdict artifact MUST contain `Reviewer-Run: <run-id>`, `Reviewed-Head: <full-head-sha>` and `Reviewed-Base: <full-base-sha>`; re-read both SHAs after review and reject the verdict if either differs. The verdict is mandatory even when every runtime authenticates as the PR author and GitHub cannot supply a distinct native approval |
-| `ci_status` | capture `headRefOid` and `baseRefOid`; run `gh pr checks <pr> --watch --fail-fast`, then separately read `gh pr checks <pr> --json name,workflow,state,bucket` (`--watch` and `--json` are separate invocations). Build the expected set as the union of host-required names and every applicable repository-required lane. For the host set, `gh pr checks <pr> --required --json name` returning exactly `no required checks reported on the '<branch>' branch` means the empty set; every other command error fails closed. When repository policy names workflow job ids rather than visible checks, resolve each id through `jobs.<id>.name` in the workflow file at the captured head SHA before comparing; never compare ids directly with `gh pr checks.name`. Each expected visible name must be present exactly once with `bucket=pass`; `skipping`, `cancel`, a missing name or an unexpected duplicate is not green. Re-read both SHAs afterwards; if either changed, discard review and CI |
-| `merge` | require `reviewed head/base == CI head/base == current headRefOid/baseRefOid`, then run `gh pr merge <pr> --merge --match-head-commit <head-sha>`. Never use `--admin` or `--delete-branch`: deletion can fail after a successful API merge in a multi-worktree checkout and make the result look retryable. If a merge queue owns delivery, first prove its configured method preserves merge commits or stop. Poll `gh pr view <pr> --json state,mergedAt,mergeCommit` until merged and take `.mergeCommit.oid` as the delivered SHA; fetch it and verify it has exactly two parents in order: reviewed base, then reviewed head. A mismatch means the base raced or the host used another strategy: leave the issue in `review` and invoke the repository's fix-forward/revert policy. If exact-delivered-SHA CI is required, locate every required workflow with `gh run list --commit <merge-sha> --workflow <workflow> --json databaseId,headSha,status,conclusion`, wait with `gh run watch <id> --exit-status`, then verify `gh run view <id> --json headSha,status,conclusion,jobs`: the head must equal `<merge-sha>`, the run and every applicable required job must be `completed/success`, never `skipped`. Run `verify_claim` again immediately before `close`; clean up the remote branch and worktree only after confirmed delivery |
-| `publish_version` | after every required delivered-SHA gate, call `verify_claim` BEFORE the first publication write, then detect each component whose declared version changed from `<old>` to `<new>`. Enumerate `git ls-remote --tags origin` — never local tags — to derive the component's established naming convention and previous component tag. Require exactly one convention; if history is empty, require an unambiguous single-product/component classification before using `v<new>` or `<component>/v<new>`. For `<tag>`, inspect both local and remote direct plus peeled refs. A valid annotated tag has a tag object and a `refs/tags/<tag>^{}` target equal to `<merge-sha>`; a lightweight tag, another target or ambiguous state blocks without rewriting anything. If the remote tag is absent, reuse a matching annotated local tag or create it with `git tag -a "<tag>" "<merge-sha>" -m "<component> <new>"`, then attempt `git push origin "refs/tags/<tag>"`. After ANY push result — success, rejection or timeout — re-read the remote: a conclusive peeled target equal to `<merge-sha>` is idempotent success, another target is conflict, and no conclusive read fails closed. When GitHub Releases are required, first reverify the remote peeled target, then query `gh release view "<tag>" --json tagName,isDraft,isPrerelease`. A matching non-draft Release with the SemVer-derived prerelease flag is idempotent success; incompatible metadata blocks. Only a confirmed not-found result permits `gh release create "<tag>" --verify-tag --generate-notes` (add `--prerelease` for a prerelease and add `--notes-start-tag "<previous-component-tag>"` only when that remote component tag exists). After ANY create result, re-read the Release JSON and the remote peeled tag; both must match the expected metadata and `<merge-sha>`. Auth, network or API ambiguity fails closed. Tag/Release failure leaves the issue in `review` even though the merge already exists |
-| `comment` | write the body to a temp file, then `gh issue comment <n> --body-file <file>` — **never inline `--body "<text>"`**; see below |
-| `last_activity` | `gh issue view <n> --json updatedAt,comments` |
-| `label` | `gh label create "<key>:<value>" --force` **then** `gh issue edit <n> --add-label "<key>:<value>"` |
-| `unassign` | `gh issue edit <n> --remove-assignee @me --remove-label "dev:<runtime>"` — one call, both halves. **Exception — releasing work another run still holds** (lost race, stand-down): remove only your `dev:<runtime>` label; `@me` is the shared account and removing it strips the active holder |
-| `close` | `transition` to `done` **first**, then post the closing note with `gh issue comment <n> --body-file <file>`, then a bare `gh issue close <n>` — `gh issue close` has NO file variant (`-c/--comment` is inline-only, confirmed against `gh issue close --help`), so the note goes through `comment`'s file-based path and the close carries no body at all. Two calls means a partial-failure case: if the comment lands but the close errors, the issue is left open with its closing note already posted — retry only the bare `gh issue close <n>`, never re-post the note |
+| Operation | Command | What it guarantees beyond the obvious |
+|---|---|---|
+| `ensure_states` | `SCRIPT ensure-states` | idempotent; run it before your first write to an unfamiliar project |
+| `create` | `SCRIPT create --identity <id> --title <t> --body-file <f> --priority <scale:value> --domain <name> --runtime <rt> --run-id <id> [--state ready\|blocked]` | creates every label **before** attaching it, then mirrors the initial board column — the case everyone forgets, because no `transition` ever follows a fresh issue to correct an empty `Status` |
+| `list_state` | `SCRIPT list-state --state <s>` | unassigned only, `--limit 200` (the default cap is 30 and silently truncates the queue), partitioned by `domain:<name>`. It returns the raw labels and **refuses to rank across partitions** — ordering inside one needs the domain's scale contract, and manufacturing a global rank is forbidden |
+| `claim` | `SCRIPT claim --issue <n> --run-id <id> --runtime <rt> --horizon <when>` | assigns, writes the claim comment, then adjudicates from the timeline. On a loss it stands down, drops **only** your `dev:<runtime>` label, and exits `1` — `@me` is the shared account and removing it would strip the winner |
+| `verify_claim` | `SCRIPT verify-claim --issue <n> --run-id <id> --expect-state <s>` | one read, three checks: the issue is OPEN; it carries exactly one `status:*` and it is yours; no control message after your claim comment names your run-id |
+| `transition` | `SCRIPT transition --issue <n> --to <s> [--from <s>]` | mirrors the board **first**, swaps the label in **one** call, then reads **both** back and repairs a board that disagrees. Omitting `--from` removes whatever stale state labels it finds |
+| `comment` | `SCRIPT comment --issue <n> --body-file <f> [--run-id <id> --kind <k>]` | file-based body, always |
+| `heartbeat` | `SCRIPT heartbeat --issue <n> --run-id <id> --expect-state <s> --body-file <f>` | renewal first, post second; **refuses to post** when the renewal says stop |
+| branch + worktree | `SCRIPT start-branch --issue <n> --branch <b> --base <base> --run-id <id>` | renews the claim before the first write outside the board, creates the branch server-side (already linked in the Development sidebar), adds a **per-run** worktree at the configured path, and records branch/base/worktree/holder on the issue |
+| `publish_review` | `SCRIPT publish-review --issue <n> --branch <b> --base <base> --run-id <id> --pr-title <t> --pr-body-file <f> [--worktree <p>]` | pushes, **reuses** the single open PR or creates one, refuses on more than one, scans for closing keywords, and records the PR URL with its exact head and base SHAs |
+| `check closing keywords` | `SCRIPT check-closing-keywords --issue <n>` | run again before merging: the branch's commit messages can introduce one after the body is already clean |
+| `unassign` | `SCRIPT unassign --issue <n> --runtime <rt> [--run-id <id>] [--held-by-other]` | `--held-by-other` is the lost-race/stand-down form: drops only your label and keeps the shared assignee |
+| board audit | `SCRIPT audit-board [--fix]` | compares every card's column against its own `status:*` label. **Zero cards is reported as a failed read, not a clean board** |
+| `review_status` | *(agent, not scripted)* | `gh pr view <pr> --json headRefOid,baseRefOid,latestReviews,reviewDecision,reviewRequests,mergeStateStatus`. The independent verdict artifact MUST contain `Reviewer-Run: <run-id>`, `Reviewed-Head: <full-head-sha>` and `Reviewed-Base: <full-base-sha>`; re-read both SHAs after review and reject the verdict if either differs. The verdict is mandatory even when every runtime authenticates as the PR author and GitHub cannot supply a distinct native approval |
+| `ci_status` | *(agent, not scripted)* | see *CI, merge and delivery* below |
+| `merge` | *(agent, not scripted)* | see *CI, merge and delivery* below |
+| `publish_version` | *(agent, not scripted)* | see *Version tags* below |
+| `last_activity` | `gh issue view <n> --json updatedAt,comments` | what the stale-claim rule reads |
+| `close` | *(agent, not scripted)* | see *Closing* below |
 
-**Inline `--body`/`--comment` corrupts markdown on a PowerShell runtime — write to a file instead.**
-Seen live: three separate comments, from two different runtimes, posted with the backtick stripped
-or eaten entirely — `` `floor_starvation` `` arrived as `\loor_starvation\` (the backtick-plus-`f`
-was consumed as PowerShell's form-feed escape, taking the `f` with it), `` `status:blocked` `` arrived
-as `\status:blocked\`, and every intended line break arrived as the two literal characters `\n`
-instead of a newline. Backtick is PowerShell's escape character; a double-quoted `--body "<text
-with `code spans`\nand newlines>"` gets expanded by the shell BEFORE `gh` ever sees it, and no amount
-of care in the text itself prevents that — the corruption happens one layer below where the text is
-composed. `create` already does this right (`--body-file <file>`); `comment` and `close` did not, and
-that inconsistency is exactly what let evidence-bearing comments — the ones a stale-claim or
-blocked-condition check reads back later — arrive silently damaged. Write the body to a file on every
-operation that accepts markdown, with no exception for "this one's short."
+### Why markdown bodies always go through a file
 
-**Closing keywords bypass the state machine — do not use them.** A commit or PR whose message says
-`closes #34` or `fixes #34` makes GITHUB close the issue the moment it reaches the default branch:
-no transition to `done`, no mirror, labels frozen wherever they were. The board then shows an open
-column for a closed issue, and it was not any run's doing — it was the tracker's own automation
-acting outside the workflow. Reference issues plainly (`#34` links without closing) and close
-through the workflow's `close`, which moves the state first. If a closing keyword slips through
-anyway, run `transition` to `done` afterwards — the auto-close is not the workflow's close, and the
-state machine does not know it happened. Seen live: an issue closed by its delivery commit sat
-CLOSED wearing `status:ready` until an audit caught it.
+Inline `--body`/`--comment` corrupts markdown on a PowerShell runtime. Seen live: three separate
+comments, from two different runtimes, posted with the backtick stripped or eaten entirely —
+`` `floor_starvation` `` arrived as `\loor_starvation\` (the backtick-plus-`f` was consumed as
+PowerShell's form-feed escape, taking the `f` with it), `` `status:blocked` `` arrived as
+`\status:blocked\`, and every intended line break arrived as the two literal characters `\n`.
+Backtick is PowerShell's escape character; a double-quoted `--body "<text with `code spans`\nand
+newlines>"` gets expanded by the shell BEFORE `gh` ever sees it, and no amount of care in the text
+itself prevents that — the corruption happens one layer below where the text is composed.
+
+**The script removes this class rather than warning about it**: every subprocess call passes an
+argument list with no shell, and every markdown body goes through a temp file. That is also why this
+binding is a Python script and not a PowerShell/bash pair — writing the fix in the language that
+causes the bug, twice, in two implementations that would then drift, is not a fix.
+
+Where you still compose a `gh` call by hand (`close`, `merge`), write the body to a file and use
+`--body-file`, with no exception for "this one's short."
+
+## Closing keywords bypass the state machine
+
+A commit or PR whose message says `closes #34` or `fixes #34` makes GITHUB close the issue the
+moment it reaches the default branch: no transition to `done`, no mirror, labels frozen wherever
+they were. The board then shows an open column for a closed issue, and it was not any run's doing —
+it was the tracker's own automation acting outside the workflow. Seen live: an issue closed by its
+delivery commit sat CLOSED wearing `status:ready` until an audit caught it.
 
 **Write this, so the wording is not improvised per PR.** Knowing the rule is demonstrably not enough
 — `Fixes #<n>` is the muscle-memory opening of a PR body, and a run reaches for it while composing
 the caveat that forbids it. Seen live (2026-07-25, PR #97): the first line read, verbatim,
 `Fixes #61 (link only — closing keywords are not used per project workflow; state is moved via the
-tracker)`. The parenthetical states the rule and the sentence breaks it, which is what makes this
-worth a template rather than another warning. The safe form:
+tracker)`. The parenthetical states the rule and the sentence breaks it. The safe form:
 
 ```
 Refs #<n> — a plain reference, deliberately NOT a closing keyword.
@@ -186,127 +202,73 @@ The forbidden set is not just `fixes`: GitHub honours **`close`, `closes`, `clos
 `fixed`, `resolve`, `resolves`, `resolved`**, case-insensitively, in a PR body or any commit message
 on the branch. `Refs`, `Implements`, `Part of` and a bare `#<n>` all link without closing.
 
-**Then verify it mechanically, because reading your own prose is how it slipped through:**
-
-```bash
-gh api graphql -f query='query{repository(owner:"<owner>",name:"<repo>"){
-  issue(number:<n>){ closedByPullRequestsReferences(first:5){ nodes{ number state } } } }}'
-```
-
-A **non-empty** result means a closing keyword is live somewhere in the PR and the issue WILL
-auto-close on merge, bypassing `transition` and the mirror. Fix the body and re-query — editing the
-body does remove the link, though the value can lag a few seconds, so re-read rather than trusting
-the first response. Run this once after publishing the PR and again before merging; the branch's
-commit messages can introduce one after the body is already clean.
+**Then verify it mechanically, because reading your own prose is how it slipped through.**
+`publish-review` runs the check as part of publishing and refuses to finish while a keyword is live;
+`check-closing-keywords` runs it standalone. Run it again before merging — the branch's commit
+messages can introduce one after the body is already clean. Editing the body does remove the link,
+though the value can lag a few seconds, so re-run rather than trusting the first response.
 
 **One consequence to state rather than rediscover.** A board's native *Linked pull requests* column
 is populated BY those keywords, so obeying this rule leaves that column empty by design. Do not
 "fix" it by adding a keyword — that trades a cosmetic gap for the exact automation this section
 forbids. The durable joins are the timeline cross-reference (`#<n>` in the PR body), the branch
-linkage from `gh issue develop`, and the delivering SHA in the close comment. If a project wants that
-column populated, that is a decision about the workflow, not a licence to bypass it per-issue.
+linkage from `gh issue develop`, and the delivering SHA in the close comment.
 
-**A shared GitHub account cannot manufacture independent approval.** The workflow's reviewer is a
-fresh reasoning context, but GitHub sees the authenticated account, not that context. When the same
-account authored the PR, record the reviewer verdict and evidence in the PR or issue with
-`Reviewer-Run: <run-id>`, `Reviewed-Head: <full-head-sha>` and
-`Reviewed-Base: <full-base-sha>`; do not claim a native `APPROVED` review that GitHub refused.
-Re-read both PR SHAs after the verdict — matching prose without that race check is still stale
-evidence. This comment proves the workflow review only; if repository protection requires a native
-approval, it does NOT substitute for one and delivery stays blocked until a distinct identity
-supplies it. In repositories with a genuinely distinct reviewer identity, use the native review
-decision and require it normally, still tied to the reviewed revision.
+## Branch, worktree and the linked issue
 
-**Link the branch to the issue the moment it exists.** GitHub has a native way that also happens to
-fit this workflow's git flow exactly: `gh issue develop <n> --name <branch> --base <base>` creates
-the branch **server-side, from the fresh base, already linked** in the issue's Development sidebar —
-then `git fetch origin <branch>` and build the worktree from it. One command replaces branch
-creation AND recording. Where the branch already exists locally, push it and comment
-`Branch: <name>` instead — prose is the fallback, the sidebar is the record. And the closing comment
-names the delivering commit SHA: branches get deleted after merge, and the SHA is the join that
-survives deletion.
+`gh issue develop <n> --name <branch> --base <base>` creates the branch **server-side, from the fresh
+base, already linked** in the issue's Development sidebar — one command replacing branch creation AND
+recording. `start-branch` uses it, falls back to a local branch off the freshly fetched remote base
+when it fails (a resumed run whose branch already exists), and records branch, base SHA, worktree
+path and holding run-id on the issue either way. A branch nobody can find from the issue is work
+nobody can follow.
 
-**`transition` must add and remove in the same invocation.** Two calls leave a window in which the
-issue carries two states, and any run reading the board during that window sees an ambiguous item.
-**Then re-read the labels**: exactly one `status:*` must remain. Two means the removal failed or
-another run interleaved — fix it on the spot, because a two-state item poisons every query that
-touches either state, and it has happened in live use.
+The worktree path comes from the `Worktree location` configuration row, with `<repo>`, `<branch>`,
+`<issue>` and `<run-id>` substituted; the branch is flattened, so a `docs/113-…` branch does not
+create a stray `docs/` directory under the worktree root. **The run-id in the path is not decoration.**
+Git refuses a branch already checked out elsewhere, but *nothing refuses a second process writing
+into a directory that already exists* — which is how, on 2026-07-24, two runs derived the same path
+from the same convention and the loser wrote its model, its migration and its tests into the winner's
+checkout mid-build. `start-branch` refuses outright when the path already exists, because at that
+point the only safe answer is to find out who holds it.
 
-### The transition read-back
+**A fresh worktree does not have the files git never tracked.** Everything gitignored — environment
+files, secrets, credentials, local settings — is simply absent, and the failure it produces is
+confusing rather than obvious: the tool starts normally and then dies on a variable it has never had
+trouble with, in a tree that looks identical to the one that works. The script says so in its output;
+copying them across is still yours to do.
 
-The label half above has always been verified. **The board half must be verified by the same read**,
-because it is the half with no other feedback loop — and left unverified it is the half that silently
-never runs (see *Seen live* in `SKILL.md`'s board section: an entire session of correct labels and a
-board frozen on `Ready`).
+## `transition` — and why the read-back covers the board
 
-One call answers both, and it needs no ids resolved in advance:
+**Add and remove in the same invocation.** Two calls leave a window in which the issue carries two
+states, and any run reading the board during that window sees an ambiguous item. Then re-read: a
+two-state item poisons every query that touches either state, and it has happened in live use.
 
-```bash
-gh issue view <n> --json labels --jq '[.labels[].name] | map(select(startswith("status:")))'
-```
+The label half has always been verified. **The board half is verified by the same read**, because it
+is the half with no other feedback loop — a wrong label is caught by the very next `list_state`, a
+wrong claim by the next `verify_claim`, but a column nobody looks at simply stays wrong forever, and
+the run that skipped it sees nothing. `transition` reads both, and where they disagree it re-sets the
+column with the ids it already resolved and reads again; a mirror that still will not land exits `1`
+rather than reporting success.
 
-…and, when the configuration names a board, the column for that item:
-
-```bash
-gh api graphql -f query='
-  query($login: String!, $number: Int!, $cursor: String) {
-    user(login: $login) {
-      projectV2(number: $number) {
-        items(first: 100, after: $cursor) {
-          pageInfo { hasNextPage endCursor }
-          nodes {
-            content { ... on Issue { number labels(first: 20) { nodes { name } } } }
-            fieldValueByName(name: "Status") {
-              ... on ProjectV2ItemFieldSingleSelectValue { name }
-            }
-          }
-        }
-      }
-    }
-  }' -f login="<owner>" -F number=<board-number>
-```
-
-Keep every brace on its own line as above. That is not style: a compacted `} } }` tail is one brace
-short of closing `query` itself, and GraphQL reports it as `Expected NAME, actual: (none)` pointing
-at the line AFTER the real mistake — which reads like a field-name problem and sends you looking in
-the wrong place. This exact snippet was first written compacted, and failed that way.
-
-Pulling `labels` in the same query is deliberate: the comparison needs the label and the column
-together, and fetching them separately invites comparing a fresh column against a stale label.
-
-`fieldValueByName` is what makes this cheap: it returns the column by name, so a verification needs
-no field or option ids at all — only the mirror WRITE needs those.
-
-Match the returned `Status` against the state you just set **by option name OR description**, the
-same either/or the mirror write already uses — not by description alone. Real boards do not label
-that last column consistently: one observed board describes `Analysis`…`Blocked` with their exact
-`status:*` labels and then describes `Done` as `closed`, because that column also tracks the
-tracker's own closed flag. A verifier demanding `status:done` there would fail on the one transition
-that matters most and send a run chasing a mirror that had worked. Resolve the option set once per
-run (step 1 of *How the mirror runs*) and compare against that, so the board's own vocabulary
-decides rather than an assumption about it. Three outcomes:
-
-- **Agree** → done.
-- **Disagree** → the mirror did not land. Set it now with step 3 of *How the mirror runs*; you already
-  know the item id from this very read.
-- **Item absent from the board** → the quiet skip *Whether to mirror at all* already allows. Say so
-  once rather than silently, so "not on the board" is never indistinguishable from "never mirrored".
-
-**Audit cheaply when you are already there.** The same paginated query returns every card, so
-comparing each item's `Status` against its own `status:*` label is one pass over data you have
-already fetched. A run that finds its own drift should check for others while it has the response in
-hand — on 2026-07-25 that pass over 83 cards found exactly the two the run itself had left stale,
-which is also how you learn the problem was yours and not systemic.
+Matching a state to a column is by option **name OR description**, not description alone. Real boards
+do not label that last column consistently: one observed board describes `Analysis`…`Blocked` with
+their exact `status:*` labels and then describes `Done` as `closed`, because that column also tracks
+the tracker's own closed flag. A verifier demanding `status:done` there would fail on the one
+transition that matters most and send a run chasing a mirror that had worked.
 
 ## Setup
 
-State labels, once per repository:
+`SCRIPT ensure-states` creates the six state labels. `gh` refuses to attach a label that does not
+exist, and the error arrives at issue creation — the analyst's last step, after all the analysis is
+done. That is why `create` creates every label first and attaches second: the domain names its own
+priority scale and rule book, so no setup script can have created them in advance. Label creation is
+idempotent, so it costs one call and removes the failure mode entirely.
 
-```bash
-for s in analysis ready in-progress review blocked done; do
-  gh label create "status:$s" --color ededed --force
-done
-```
+Attribution labels are created on demand by `claim` and `create`, so the set stays exactly as wide as
+the runtimes actually in use. Labels are what make attribution *queryable*:
+`gh issue list --label "dev:codex"` answers "what is that runtime holding right now" in one call,
+where parsing prose for the same answer breaks on any rewording.
 
 **Adding `done` to a repository that already ran without it** leaves closed issues still wearing the
 state they were in when someone closed them. They keep showing up in `review` queries and, on a
@@ -326,31 +288,15 @@ done
 An issue carrying two state labels is handled by the pass for each of them; an issue already on
 `status:done` is matched by none of them and left alone.
 
-**`gh` refuses to attach a label that does not exist**, and the error arrives at
-`gh issue create` — the analyst's last step, after all the analysis is done. That is why `create` and
-`label` create first and attach second: the domain names its own priority scale and rule book, so no
-setup script can have created them in advance. `gh label create --force` is idempotent, so running it
-every time costs one call and removes the failure mode entirely.
-
-Attribution labels are created on demand — the first run of a given runtime creates its own, so the
-set stays exactly as wide as the runtimes actually in use:
-
-```bash
-gh label create "analyst:<runtime>" --color c5def5 --force
-gh label create "dev:<runtime>"     --color bfd4f2 --force
-```
-
-Labels are what make attribution *queryable*: `gh issue list --label "dev:codex"` answers "what is
-that runtime holding right now" in one call, where parsing prose for the same answer breaks on any
-rewording.
-
 ## Credentials
 
 `gh auth status` may report a token stored in a system keyring that a sandboxed runtime cannot read;
 there, use `GH_TOKEN` instead. **Verify with `gh issue list` before relying on the workflow** — an
 analyst that cannot file its issue has done the work and lost it.
 
-`gh issue` needs no `project` scope. The board mirroring below does.
+`gh issue` needs no `project` scope. The board mirroring below does — prove it once with
+`gh project list --owner <owner>`, or just run `SCRIPT config` and then any `transition`, which
+reports a missing scope as a skip rather than failing.
 
 ---
 
@@ -361,48 +307,34 @@ two: project items are references, so title, state, labels and assignees are alw
 custom field lives on the project item and no label touches it. Left alone, a board shows whatever
 someone set by hand the day they set it.
 
+**Whether to mirror at all is read from the configuration, not guessed.** The `Project board` row
+names `owner/number` or `none`. `none` means no board anywhere and every board step becomes a no-op.
+
+**The mirror is part of `transition` and it runs FIRST**, before the label edit, best-effort and
+without pre-checking board membership — an issue not on the board is a quiet skip, not a
+precondition. The fragile, easily-skipped half runs before anything can short-circuit it; the
+reliable one-call label edit follows. This trades one failure for a rarer one: the label stays the
+store queries read, so a run that dies between the board write and the label edit leaves the board
+ahead of a still-stale label — far less likely than the board drift that board-last invited, which is
+the incident this order exists to prevent.
+
+### Drift a previous run left behind
+
 **The mirror only fires on a `transition` you make — it does not repair drift from before you got
-there.** *(Since the read-back became mandatory, drift from your OWN transitions is caught within the
-same operation. What remains uncovered is drift a PREVIOUS run left behind, which is what this
-section is about — and note that the read-back's own paginated query already returns every card, so
-auditing the rest costs a comparison over a response you are holding, not another call.)* Seen live:
-five items sitting on `Ready` in the board days after their labels had moved to
-`in-progress` or `done`, because whatever run transitioned them either predates this section being
-written or hit the missing-scope fallback — and nothing since then ever looked back. There is no
-daemon reconciling the two, by design (see *Why a mirror is needed at all*), which means staleness is
-permanent unless a run that happens to be reading an item's labels for some other reason also checks
-its board column. So: whenever you read an issue's labels and its board item is in view for any
-reason — not only during your own `transition` — compare the two, and if they disagree, correct the
-`Status` field with step 3 of *How the mirror runs* on the spot. It costs one extra mutation call
-using ids you likely already resolved this run, and it is the only thing standing between "the mirror
-sometimes fails" and "the board silently drifts forever."
+there.** Drift from your OWN transitions is now caught inside the operation by its read-back. What
+remains uncovered is what an earlier run left, and there is no daemon reconciling the two by design
+(see *Why a mirror is needed at all*), which means staleness is permanent unless somebody looks.
 
-**Whether to mirror at all is read from the operator configuration, not guessed.** The `Project
-board` row names `owner/number` or `none`. `none` means no board anywhere: skip this section
-entirely. A named board means **an operation that sets a state — `create` as much as `transition` — is not
-finished until the mirror was attempted** —
-attempted, not necessarily succeeded: an issue not yet on the board, or a missing column, is skipped
-quietly, because the label already carries the truth. `create` is the case everyone forgets: a fresh
-issue reaches the board through auto-add with its Status empty, and no transition ever follows to
-correct it — the analyst that filed it sets the initial column, or the item sits in no column at all. What is not acceptable is not trying: every
-skipped attempt is how the board was found lying five states behind the labels.
+Seen live: five items sitting on `Ready` days after their labels had moved to `in-progress` or
+`done`, because whatever run transitioned them either predates this section or hit the missing-scope
+fallback — and nothing since then ever looked back.
 
-Resolve the project, field and option ids **once per run** and reuse them for every transition in
-that run — they are stable within a session, and per-transition discovery is the overhead that
-tempts a run to skip the mirror.
-
-**The mirror is part of `transition`, done by the same run that moves the label — and it runs first.**
-No server-side machinery: on a `transition` for an issue that has a project item, this workflow sets
-the board `Status` field BEFORE it moves the `status:*` label, best-effort and without pre-checking
-board membership — an issue not on the board is the quiet skip below, not a precondition. The fragile,
-easily-skipped half runs before anything can short-circuit it; the reliable one-call label edit
-follows. This trades one failure for a rarer one: the label stays the store queries read, so a run
-that dies between the board write and the label edit leaves the board ahead of a still-stale label —
-far less likely than the board drift that board-last invited, which is the incident this order exists
-to prevent. That costs the agent's token the `project` scope — `gh issue` alone never needs it — so
-prove it once with `gh project list --owner <owner>` before relying on the mirror, and where the scope
-is missing, skip the board attempt and do the label edit alone, exactly as step 1 of *How the mirror
-runs* below prescribes.
+`SCRIPT audit-board` is that look: one paginated pass comparing every card's column against its own
+`status:*` label, `--fix` to repair what it finds. On 2026-07-25 that pass over 83 cards found
+exactly the two the run itself had left stale, which is also how you learn the problem was yours and
+not systemic. **A zero-card result is reported as a failed read, not a clean board** — a configured
+board is never empty, and reporting an empty read as a pass would reproduce the exact failure this
+whole file exists to remove.
 
 ### Why a mirror is needed at all
 
@@ -420,82 +352,19 @@ for you; a human has to click it once.
 
 So a board needs the built-in `Status` field, reshaped to mirror your states with
 `updateProjectV2Field` — one option per state, each option's description naming the label it mirrors.
-Then the board reads like the workflow, and only the syncing is left.
+That reshaping is the one board step no script performs, because it is the one a human clicks.
 
-### How the mirror runs
+### Quiet failure modes the script already handles
 
-1. **Resolve the project, its `Status` field and its options — once per run, then reuse for every
-   transition in that run.**
+Worth knowing, because they are invisible when they happen and you will meet them on another board:
 
-   ```bash
-   gh api graphql -f query='
-     query($login: String!, $number: Int!) {
-       user(login: $login) {
-         projectV2(number: $number) {
-           id
-           fields(first: 20) {
-             nodes {
-               ... on ProjectV2SingleSelectField { id name options { id name description } }
-             }
-           }
-         }
-       }
-     }' -f login="<owner>" -F number=<board-number>
-   ```
-
-   Keep the returned project id, the `Status` field id, and the option id for each state (matched by
-   the option's name or its description, per *Why a mirror is needed at all* above). **If this call
-   errors on a missing scope, stop the board attempt here and go straight to the label edit** — the
-   label is the authoritative store and carries the truth; nothing on the board is worth attempting
-   without the `project` scope, and the label edit still runs after this section either way.
-
-2. **Resolve the project item id for the issue being transitioned**, paginating if the board has grown
-   past a page:
-
-   ```bash
-   gh api graphql -f query='
-     query($login: String!, $number: Int!, $cursor: String) {
-       user(login: $login) {
-         projectV2(number: $number) {
-           items(first: 100, after: $cursor) {
-             pageInfo { hasNextPage endCursor }
-             nodes { id content { ... on Issue { number } } }
-           }
-         }
-       }
-     }' -f login="<owner>" -F number=<board-number>
-   ```
-
-   Follow `pageInfo` until the issue's `number` shows up or the pages run out — each follow-up page is
-   the same call plus `-f cursor="<endCursor from the previous page>"` (the first call simply omits it,
-   leaving `$cursor` null). An issue not found is the quiet skip *Whether to mirror at all* already
-   allows (not yet added to the board, or added but not yet indexed).
-
-3. **Set the field** with the ids resolved above, to the option matching the new label:
-
-   ```bash
-   gh api graphql -f query='
-     mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
-       updateProjectV2ItemFieldValue(input: {
-         projectId: $project, itemId: $item, fieldId: $field
-         value: { singleSelectOptionId: $option }
-       }) { projectV2Item { id } }
-     }' -f project="<PROJECT_ID>" -f item="<ITEM_ID>" -f field="<FIELD_ID>" -f option="<OPTION_ID>"
-   ```
-
-   For a `transition`, this whole board attempt (steps 1–3) precedes the `status:*` label edit — the
-   authoritative label move from the operations table runs immediately after, whether the board write
-   succeeded, was skipped for a missing item, or fell back on a missing scope.
-
-4. **`create` runs step 3 too, immediately after filing**, setting the initial column to whatever
-   option mirrors `status:ready` — this is the case *Whether to mirror at all* names as the one
-   everyone forgets, because no `transition` ever follows a fresh issue to correct an empty `Status`.
-
-Two quiet failure modes worth knowing, on top of the scope check in step 1: for an
-**organisation-owned** project, `user(login:)` must become `organization(login:)` in both queries
-above — the query returns null rather than erroring, so the mirror silently never fires; and
-`items(first:100)` in step 2 stops finding issues once the board passes a hundred items — the
-pagination above is what keeps that from going quiet too.
+- For an **organisation-owned** project, `user(login:)` returns null rather than erroring, so a
+  mirror written against it silently never fires. The script tries `user` then `organization`.
+- `items(first:100)` stops finding issues once the board passes a hundred items. Every board query
+  in the script paginates.
+- Board field and option ids are resolved **once and cached for a day**. Per-transition discovery is
+  the overhead that tempts a run to skip the mirror, so the cache exists to remove the temptation,
+  not to save API calls. `--no-cache` re-resolves.
 
 **If your agents cannot hold the `project` scope**, the same mirroring can run server-side in a
 repository Action on `issues.labeled`/`unlabeled` — it needs a PAT stored as a secret, because the
@@ -504,9 +373,7 @@ things to debug when the board lags.
 
 **Whatever you do, the labels stay authoritative.** They are what agents read and write; the board
 is a view. Invert that and every agent needs the `project` scope and the workflow's transport has to
-be rewritten — a board that is state costs a redesign, a board that is a view costs nothing. If the
-Action ever breaks, the board goes stale while the work stays correct, which is the right failure
-direction.
+be rewritten — a board that is state costs a redesign, a board that is a view costs nothing.
 
 **GitHub now renders agent activity of its own**, and it is a third view, not a second state. When a
 coding agent is assigned to an issue, its session shows under the assignee with its own live status —
@@ -514,3 +381,96 @@ queued, working, waiting for review, completed. That reports what a runtime said
 what the state machine says, and the two legitimately disagree: a session can read as *completed*
 while its issue is correctly still `status:in-progress`, because the run ended and the work did not.
 Same rule as the board — read it, do not trust it, and never move a label to make it agree.
+
+---
+
+## CI, merge and delivery — the agent's half
+
+These are not scripted. Each one either writes irreversibly to the remote or turns evidence into a
+verdict, and both are decisions a script must not make on an agent's behalf.
+
+**`ci_status`.** Capture `headRefOid` and `baseRefOid`; run `gh pr checks <pr> --watch --fail-fast`,
+then separately read `gh pr checks <pr> --json name,workflow,state,bucket` (`--watch` and `--json` are
+separate invocations). Build the expected set as the union of host-required names and every
+applicable repository-required lane. For the host set, `gh pr checks <pr> --required --json name`
+returning exactly `no required checks reported on the '<branch>' branch` means the empty set; every
+other command error fails closed. When repository policy names workflow job ids rather than visible
+checks, resolve each id through `jobs.<id>.name` in the workflow file at the captured head SHA before
+comparing; never compare ids directly with `gh pr checks.name`. Each expected visible name must be
+present exactly once with `bucket=pass`; `skipping`, `cancel`, a missing name or an unexpected
+duplicate is not green. Re-read both SHAs afterwards; if either changed, discard review and CI.
+
+**`merge`.** Require `reviewed head/base == CI head/base == current headRefOid/baseRefOid`, then run
+`gh pr merge <pr> --merge --match-head-commit <head-sha>`. Never use `--admin` or `--delete-branch`:
+deletion can fail after a successful API merge in a multi-worktree checkout and make the result look
+retryable. If a merge queue owns delivery, first prove its configured method preserves merge commits
+or stop. Poll `gh pr view <pr> --json state,mergedAt,mergeCommit` until merged and take
+`.mergeCommit.oid` as the delivered SHA; fetch it and verify it has exactly two parents in order:
+reviewed base, then reviewed head. A mismatch means the base raced or the host used another strategy:
+leave the issue in `review` and invoke the repository's fix-forward/revert policy. If
+exact-delivered-SHA CI is required, locate every required workflow with
+`gh run list --commit <merge-sha> --workflow <workflow> --json databaseId,headSha,status,conclusion`,
+wait with `gh run watch <id> --exit-status`, then verify
+`gh run view <id> --json headSha,status,conclusion,jobs`: the head must equal `<merge-sha>`, the run
+and every applicable required job must be `completed/success`, never `skipped`.
+
+**Run `SCRIPT verify-claim` again immediately before merging, before publishing tags, and before
+closing.** Merge, version publication and close are separate irreversible boundaries, and a long
+quiet phase between them cannot be allowed to bypass the renewal.
+
+### Version tags
+
+**`publish_version`.** After every required delivered-SHA gate, renew the claim BEFORE the first
+publication write, then detect each component whose declared version changed from `<old>` to `<new>`.
+Enumerate `git ls-remote --tags origin` — never local tags — to derive the component's established
+naming convention and previous component tag. Require exactly one convention; if history is empty,
+require an unambiguous single-product/component classification before using `v<new>` or
+`<component>/v<new>`.
+
+For `<tag>`, inspect both local and remote direct plus peeled refs. A valid annotated tag has a tag
+object and a `refs/tags/<tag>^{}` target equal to `<merge-sha>`; a lightweight tag, another target or
+ambiguous state blocks without rewriting anything. If the remote tag is absent, reuse a matching
+annotated local tag or create it with `git tag -a "<tag>" "<merge-sha>" -m "<component> <new>"`, then
+attempt `git push origin "refs/tags/<tag>"`. After ANY push result — success, rejection or timeout —
+re-read the remote: a conclusive peeled target equal to `<merge-sha>` is idempotent success, another
+target is conflict, and no conclusive read fails closed.
+
+When GitHub Releases are required, first reverify the remote peeled target, then query
+`gh release view "<tag>" --json tagName,isDraft,isPrerelease`. A matching non-draft Release with the
+SemVer-derived prerelease flag is idempotent success; incompatible metadata blocks. Only a confirmed
+not-found result permits `gh release create "<tag>" --verify-tag --generate-notes` (add
+`--prerelease` for a prerelease, and `--notes-start-tag "<previous-component-tag>"` only when that
+remote component tag exists). After ANY create result, re-read the Release JSON and the remote peeled
+tag; both must match the expected metadata and `<merge-sha>`. Auth, network or API ambiguity fails
+closed. Tag or Release failure leaves the issue in `review` even though the merge already exists.
+
+A Git tag and a GitHub Release are different artifacts: the tag is mandatory; the Release is created
+only when the repository already publishes them for that component. Never move, overwrite or
+force-push an existing version tag — a tag that already points elsewhere is a delivery blocker, not
+permission to rewrite release history.
+
+### Closing
+
+`close` moves the state to `done` **first** — `SCRIPT transition --issue <n> --to done` — then posts
+the closing note with `gh issue comment <n> --body-file <file>`, then a bare `gh issue close <n>`.
+`gh issue close` has NO file variant (`-c/--comment` is inline-only, confirmed against
+`gh issue close --help`), so the note goes through the file-based comment path and the close carries
+no body at all.
+
+Two calls means a partial-failure case: if the comment lands but the close errors, the issue is left
+open with its closing note already posted — retry only the bare `gh issue close <n>`, never re-post
+the note.
+
+Carry your run identity in the closing comment and state what was actually verified: review verdict,
+CI run or checks, measured numbers, tests run, PR, **the delivering commit SHA**, and every version
+tag or Release published. Never write just "done"; the state already says that, and the comment
+exists to show what earned it.
+
+**A shared GitHub account cannot manufacture independent approval.** The workflow's reviewer is a
+fresh reasoning context, but GitHub sees the authenticated account, not that context. When the same
+account authored the PR, record the reviewer verdict and evidence in the PR or issue with
+`Reviewer-Run: <run-id>`, `Reviewed-Head: <full-head-sha>` and `Reviewed-Base: <full-base-sha>`; do
+not claim a native `APPROVED` review that GitHub refused. Re-read both PR SHAs after the verdict —
+matching prose without that race check is still stale evidence. This comment proves the workflow
+review only; if repository protection requires a native approval, it does NOT substitute for one and
+delivery stays blocked until a distinct identity supplies it.
