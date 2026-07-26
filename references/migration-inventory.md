@@ -11,14 +11,14 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 
 | ID | Current source | Final owner/path | Intentional-consolidation rationale | Owner copied | Old source retired |
 |---|---|---|---|---|---|
-| S01 | What this skill is, and what it is NOT (`SKILL.md:11-67`) | `SKILL.md` | Condense activation, bounded scope, and optional domain behavior into the runtime contract. | yes | no |
-| S02 | Review is this role (`SKILL.md:68-85`) | `references/runtime-notes.md` | Keep the independent-context rule actionable in `SKILL.md`; consolidate runtime acquisition details here. | yes | no |
-| S03 | Composition contract (`SKILL.md:86-105`) | `references/domain-composition.md` | Own the transport/business-rule boundary once. | yes | no |
-| S04 | What the domain hands over (`SKILL.md:106-147`) | `references/domain-composition.md` | Consolidate finding fields and priority-scale semantics with the boundary they implement. | yes | no |
-| S05 | Tracker binding operations (`SKILL.md:148-192`) | `SKILL.md` | Retain the abstract operation contract; tracker commands remain in each binding. | yes | no |
-| S06 | Attribution (`SKILL.md:193-255`) | `references/safety.md` | Preserve run/runtime cardinality, label lifecycle, and shared-account rationale together. | yes | no |
+| S01 | What this skill is, and what it is NOT (`SKILL.md:11-67`) | `SKILL.md` | Condense activation, bounded scope, and optional domain behavior into the runtime contract. | yes | yes |
+| S02 | Review is this role (`SKILL.md:68-85`) | `references/runtime-notes.md` | Keep the independent-context rule actionable in `SKILL.md`; consolidate runtime acquisition details here. | yes | yes |
+| S03 | Composition contract (`SKILL.md:86-105`) | `references/domain-composition.md` | Own the transport/business-rule boundary once. | yes | yes |
+| S04 | What the domain hands over (`SKILL.md:106-147`) | `references/domain-composition.md` | Consolidate finding fields and priority-scale semantics with the boundary they implement. | yes | yes |
+| S05 | Tracker binding operations (`SKILL.md:148-192`) | `SKILL.md` | Retain the abstract operation contract; tracker commands remain in each binding. | yes | yes |
+| S06 | Attribution (`SKILL.md:193-255`) | `references/domain-composition.md` | Preserve run/runtime cardinality, label lifecycle, and shared-account rationale together. | yes | yes |
 | S07 | Domain routing (`SKILL.md:256-291`) | `references/domain-composition.md` | Keep label, metadata arrow, and side-selection rules under one owner. | yes | no |
-| S08 | Why the split exists (`SKILL.md:292-305`) | `references/domain-composition.md` | Preserve role-boundary rationale without loading it on every invocation. | yes | no |
+| S08 | Why the split exists (`SKILL.md:292-305`) | `references/domain-composition.md` | Preserve role-boundary rationale without loading it on every invocation. | yes | yes |
 | S09 | Role: ANALYST (`SKILL.md:308-322`) | `SKILL.md` | The read-only boundary and one-finding limit remain direct runtime rules. | yes | no |
 | S10 | Drain analysis and blocked (`SKILL.md:323-365`) | `SKILL.md` | Queue order and analyst tool boundary remain executable steps. | yes | no |
 | S11 | Autonomous discovery (`SKILL.md:366-384`) | `references/domain-composition.md` | Consolidate the built-in fallback domain contract and deduplication bar. | yes | no |
@@ -27,9 +27,9 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | S14 | Repository default flow (`SKILL.md:603-742`) | `references/repository-delivery.md` | Consolidate branching, worktree, integration, review, and cleanup rationale. | yes | no |
 | S15 | Abandoned work (`SKILL.md:743-840`) | `references/safety.md` | Keep horizon, heartbeat, reclaim, and retention failure modes together. | yes | no |
 | S16 | Work that cannot finish (`SKILL.md:841-921`) | `references/safety.md` | Consolidate handoff-state rationale while retaining the decision gate in `SKILL.md`. | yes | no |
-| S17 | State machine (`SKILL.md:922-972`) | `SKILL.md` | State meanings, exclusivity, blockers, and explicit done remain runtime decisions. | yes | no |
+| S17 | State machine (`SKILL.md:922-972`) | `SKILL.md` | State meanings, exclusivity, blockers, and explicit done remain runtime decisions. | yes | yes |
 | S18 | Optional board view (`SKILL.md:973-1006`) | `references/safety.md` | Preserve authoritative-label and verified-projection rationale once; bindings own mechanics. | yes | no |
-| S19 | In-session agent team (`SKILL.md:1007-1036`) | `references/runtime-notes.md` | Isolate runtime-specific team lifetime and hook behavior. | yes | no |
+| S19 | In-session agent team (`SKILL.md:1007-1036`) | `references/runtime-notes.md` | Isolate runtime-specific team lifetime and hook behavior. | yes | yes |
 | S20 | Honest limits (`SKILL.md:1037-1065`) | `references/safety.md` | Keep heuristic, credential, resource, and judgement limits visible as one safety boundary. | yes | no |
 | S21 | Operator configuration (`SKILL.md:1069-1090`) | `SKILL.md` | Preserve script-readable markers and portable defaults; local overrides remain uncommitted. | no | no |
 
