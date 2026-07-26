@@ -1019,8 +1019,20 @@ def cmd_claim(args, config, cwd) -> dict:
     # the caller re-runs it — and a second claim comment for the same run muddies the very record
     # the race is adjudicated from. So look for our own claim first and reuse it. This is also
     # what makes the retry advice on a failed write safe to follow at all.
-    existing = claim_comments(issue_view(args.issue, "comments", cwd=cwd).get("comments", []))
-    already_mine = [at for at, rid, _ in existing if rid == args.run_id]
+    #
+    # Reuse only a claim that is still LIVE. A claim I made and then RELEASED is a historical
+    # record, not a holding, so reusing it posts nothing and leaves the run with no live claim at
+    # all — after which adjudication finds none and reports a write that never propagated.
+    # Seen live (2026-07-26, issue #70): a run claimed, released under a blocker, then tried to
+    # resume; the guard kept handing back the released claim and `claim` failed with a diagnosis
+    # naming the wrong cause, twice, until the timeline was read by hand.
+    existing_comments = issue_view(args.issue, "comments", cwd=cwd).get("comments", [])
+    existing = claim_comments(existing_comments)
+    prior_releases = released_at(existing_comments)
+    already_mine = [
+        at for at, rid, _ in existing
+        if rid == args.run_id and claim_is_live(at, rid, prior_releases)
+    ]
 
     if not already_mine:
         body = (
