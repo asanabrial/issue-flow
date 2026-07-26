@@ -11,17 +11,17 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 
 | ID | Current source | Final owner/path | Intentional-consolidation rationale | Owner copied | Old source retired |
 |---|---|---|---|---|---|
-| S01 | What this skill is, and what it is NOT (`SKILL.md:11-67`) | `SKILL.md` | Condense activation, bounded scope, and optional domain behavior into the runtime contract. | no | no |
-| S02 | Review is this role (`SKILL.md:68-85`) | `references/runtime-notes.md` | Keep the independent-context rule actionable in `SKILL.md`; consolidate runtime acquisition details here. | no | no |
-| S03 | Composition contract (`SKILL.md:86-105`) | `references/domain-composition.md` | Own the transport/business-rule boundary once. | no | no |
-| S04 | What the domain hands over (`SKILL.md:106-147`) | `references/domain-composition.md` | Consolidate finding fields and priority-scale semantics with the boundary they implement. | no | no |
+| S01 | What this skill is, and what it is NOT (`SKILL.md:11-67`) | `SKILL.md` | Condense activation, bounded scope, and optional domain behavior into the runtime contract. | yes | no |
+| S02 | Review is this role (`SKILL.md:68-85`) | `references/runtime-notes.md` | Keep the independent-context rule actionable in `SKILL.md`; consolidate runtime acquisition details here. | yes | no |
+| S03 | Composition contract (`SKILL.md:86-105`) | `references/domain-composition.md` | Own the transport/business-rule boundary once. | yes | no |
+| S04 | What the domain hands over (`SKILL.md:106-147`) | `references/domain-composition.md` | Consolidate finding fields and priority-scale semantics with the boundary they implement. | yes | no |
 | S05 | Tracker binding operations (`SKILL.md:148-192`) | `SKILL.md` | Retain the abstract operation contract; tracker commands remain in each binding. | no | no |
-| S06 | Attribution (`SKILL.md:193-255`) | `references/safety.md` | Preserve run/runtime cardinality, label lifecycle, and shared-account rationale together. | no | no |
-| S07 | Domain routing (`SKILL.md:256-291`) | `references/domain-composition.md` | Keep label, metadata arrow, and side-selection rules under one owner. | no | no |
-| S08 | Why the split exists (`SKILL.md:292-305`) | `references/domain-composition.md` | Preserve role-boundary rationale without loading it on every invocation. | no | no |
+| S06 | Attribution (`SKILL.md:193-255`) | `references/safety.md` | Preserve run/runtime cardinality, label lifecycle, and shared-account rationale together. | yes | no |
+| S07 | Domain routing (`SKILL.md:256-291`) | `references/domain-composition.md` | Keep label, metadata arrow, and side-selection rules under one owner. | yes | no |
+| S08 | Why the split exists (`SKILL.md:292-305`) | `references/domain-composition.md` | Preserve role-boundary rationale without loading it on every invocation. | yes | no |
 | S09 | Role: ANALYST (`SKILL.md:308-322`) | `SKILL.md` | The read-only boundary and one-finding limit remain direct runtime rules. | no | no |
 | S10 | Drain analysis and blocked (`SKILL.md:323-365`) | `SKILL.md` | Queue order and analyst tool boundary remain executable steps. | no | no |
-| S11 | Autonomous discovery (`SKILL.md:366-384`) | `references/domain-composition.md` | Consolidate the built-in fallback domain contract and deduplication bar. | no | no |
+| S11 | Autonomous discovery (`SKILL.md:366-384`) | `references/domain-composition.md` | Consolidate the built-in fallback domain contract and deduplication bar. | yes | no |
 | S12 | What the analyst produces (`SKILL.md:385-436`) | `SKILL.md` | Keep create/blocked instructions at runtime; the body schema moves to the asset. | no | no |
 | S13 | Role: DEV (`SKILL.md:440-602`) | `SKILL.md` | Preserve resume, claim, build, review, and delivery as the dev execution path. | no | no |
 | S14 | Repository default flow (`SKILL.md:603-742`) | `references/repository-delivery.md` | Consolidate branching, worktree, integration, review, and cleanup rationale. | no | no |
@@ -29,8 +29,8 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | S16 | Work that cannot finish (`SKILL.md:841-921`) | `references/safety.md` | Consolidate handoff-state rationale while retaining the decision gate in `SKILL.md`. | no | no |
 | S17 | State machine (`SKILL.md:922-972`) | `SKILL.md` | State meanings, exclusivity, blockers, and explicit done remain runtime decisions. | no | no |
 | S18 | Optional board view (`SKILL.md:973-1006`) | `references/safety.md` | Preserve authoritative-label and verified-projection rationale once; bindings own mechanics. | no | no |
-| S19 | In-session agent team (`SKILL.md:1007-1036`) | `references/runtime-notes.md` | Isolate runtime-specific team lifetime and hook behavior. | no | no |
-| S20 | Honest limits (`SKILL.md:1037-1065`) | `references/safety.md` | Keep heuristic, credential, resource, and judgement limits visible as one safety boundary. | no | no |
+| S19 | In-session agent team (`SKILL.md:1007-1036`) | `references/runtime-notes.md` | Isolate runtime-specific team lifetime and hook behavior. | yes | no |
+| S20 | Honest limits (`SKILL.md:1037-1065`) | `references/safety.md` | Keep heuristic, credential, resource, and judgement limits visible as one safety boundary. | yes | no |
 | S21 | Operator configuration (`SKILL.md:1069-1090`) | `SKILL.md` | Preserve script-readable markers and portable defaults; local overrides remain uncommitted. | no | no |
 
 ## Analyst issue template
@@ -78,12 +78,12 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | K01 | Bounded target is scope; local rules still apply. | `SKILL.md` | Activation must remain direct. | no | no |
 | K02 | Analyst conditions are optional; no-condition runs discover autonomously. | `SKILL.md` | Preserve valid standalone invocation. | no | no |
 | K03 | Review uses a context that did not write the change. | `SKILL.md` | Keep independence non-negotiable. | no | no |
-| K04 | Transport and business rules remain separate owners. | `references/domain-composition.md` | Prevent domain/tracker coupling. | no | no |
-| K05 | Analyst findings carry identity, title, priority, body, metadata, and domain. | `references/domain-composition.md` | Preserve complete handoff data. | no | no |
-| K06 | Priority scales are declared, ordered only internally, and never globally compared. | `references/domain-composition.md` | Preserve deterministic mixed-domain selection. | no | no |
-| K07 | Mechanical reversible operations use the selected binding executable. | `SKILL.md` | Prevent remembered-but-unexecuted steps. | no | no |
-| K08 | Bindings declare unsupported capabilities and fail closed. | `SKILL.md` | Make transport gaps visible. | no | no |
-| K09 | One stable run-id is reused for every write. | `references/safety.md` | Preserve traceable ownership. | no | no |
+| K04 | Transport and business rules remain separate owners. | `references/domain-composition.md` | Prevent domain/tracker coupling. | yes | no |
+| K05 | Analyst findings carry identity, title, priority, body, metadata, and domain. | `references/domain-composition.md` | Preserve complete handoff data. | yes | no |
+| K06 | Priority scales are declared, ordered only internally, and never globally compared. | `references/domain-composition.md` | Preserve deterministic mixed-domain selection. | yes | no |
+| K07 | Mechanical reversible operations use the selected binding executable. | `SKILL.md` | Prevent remembered-but-unexecuted steps. | yes | no |
+| K08 | Bindings declare unsupported capabilities and fail closed. | `SKILL.md` | Make transport gaps visible. | yes | no |
+| K09 | One stable run-id is reused for every write. | `references/safety.md` | Preserve traceable ownership. | yes | no |
 | K10 | Runtime is a bounded label; run-id remains text. | `references/safety.md` | Prevent unbounded label growth. | no | no |
 | K11 | Dev markers track live holding and are removed on release, not delivery. | `references/safety.md` | Preserve query correctness. | no | no |
 | K12 | Domain label plus metadata arrow route each role to the correct rule book. | `references/domain-composition.md` | Prevent silent routing inference. | no | no |
@@ -110,7 +110,7 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | K33 | Integrate current base and merge rather than rebase by default. | `references/repository-delivery.md` | Preserve SHA-bound evidence. | no | no |
 | K34 | Horizons, read-before-write heartbeats, and reclaim retain prior work. | `references/safety.md` | Consolidate abandoned-work recovery. | no | no |
 | K35 | Analysis, blocked, and review handoffs remain distinct and documented on the issue. | `references/safety.md` | Prevent recoverable work burial. | no | no |
-| K36 | Acceptance criteria precede implementation; partial fixes never ship as complete. | `references/safety.md` | Preserve the done bar. | no | no |
-| K37 | Exactly one workflow state exists; done is explicit before tracker closure. | `SKILL.md` | Keep state integrity direct. | no | no |
-| K38 | Labels are authoritative; configured board projections are mirrored and read back. | `SKILL.md` | Preserve verified state projection. | no | no |
+| K36 | Acceptance criteria precede implementation; partial fixes never ship as complete. | `references/safety.md` | Preserve the done bar. | yes | no |
+| K37 | Exactly one workflow state exists; done is explicit before tracker closure. | `SKILL.md` | Keep state integrity direct. | yes | no |
+| K38 | Labels are authoritative; configured board projections are mirrored and read back. | `SKILL.md` | Preserve verified state projection. | yes | no |
 | K39 | Session teams and resource signals never replace durable tracker state. | `references/runtime-notes.md` | Consolidate runtime lifetime and machine-limit caveats. | no | no |
