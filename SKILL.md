@@ -1,6 +1,7 @@
 ---
 name: issue-flow
 description: "Trigger: issue-flow analyst [conditions], issue-flow dev, analyst, developer, claim issue, move task states. Analysts file at most one evidenced issue; without conditions, audit the repository critically."
+license: GPL-2.0
 metadata:
   author: asanabrial
   version: "1.10.0"
@@ -8,250 +9,33 @@ metadata:
 
 # Issue Flow — Analyst / Dev over a shared issue tracker
 
-## What this skill is, and what it is NOT
+## Activation Contract
 
-It defines the **workflow**: two roles, one state machine, one shared board. It is deliberately
-**domain-agnostic** — it does not know what your project considers worth analysing or what "done"
-means.
+Use for `issue-flow analyst [conditions]`, `issue-flow dev [domain-rules] [issue-number]`, analyst or developer work, claims, and workflow-state transitions.
+Analyst conditions and dev domains are optional: a bounded target is the scope; otherwise the analyst audits the repository and the dev implements the selected issue.
+Read repository instructions first and load only the tracker binding selected by operator configuration before tracker work.
+Load [domain composition](references/domain-composition.md) for handoff, priority, or routing rules; [runtime notes](references/runtime-notes.md) for invocation, delegation, or team mechanics; and [safety incidents](references/safety-incidents.md) for race, reclaim, handoff, or failure rationale.
 
-**The ROLE belongs to this skill. The domain is a RULE BOOK, not a role.** A domain skill does not
-"act as the analyst"; it states what analysis means for its subject, and this skill performs the
-role by those rules. The same domain can be read by either role, and a project supplies one rule
-book per side rather than one skill per role.
+## Hard Rules
 
-```
-/issue-flow analyst [domain-rules | instructions]    ← conditions OPTIONAL
-/issue-flow dev     [domain-rules] [issue-number]    ← domain OPTIONAL
-```
+- Issue Flow owns roles, states, claims, and transitions; routed domains own value, priority, evidence, and done criteria. Neither side invents the other's policy.
+- An analyst, including an adversarial reviewer, is repository-read-only, creates no branch/worktree/commit/PR, and files at most one evidenced issue. Review MUST use a context that did not write the change.
+- Mint one `<runtime>-<session-prefix>` run-id and reuse it for every write. Keep bounded runtime attribution in `analyst:<runtime>`/`dev:<runtime>` labels and unbounded run-id attribution in text; analyst labels persist, while dev labels are removed on release but retained on delivery.
+- Resume this run's held issue before consulting queues. Use the selected binding's timeline-adjudicated claim; the earliest live claim wins. Run `verify_claim` before the first repository write, every heartbeat, and every expensive or irreversible boundary; an unreadable control surface permits no write.
+- Keep exactly one of `analysis`, `ready`, `in-progress`, `review`, `blocked`, or `done`. The binding's workflow state is authoritative; every configured projection is updated and read back, and `done` is explicit before tracker closure.
+- The selected binding MUST map `ensure_states`, `create`, `list_state`, `claim`, `verify_claim`, `transition`, `comment`, `last_activity`, `label`, `unassign`, `publish_version`, and `close`. Run executable reversible operations instead of reconstructing them; bindings MUST declare unsupported capabilities and fail closed.
+- Issue acceptance criteria, routed domain rules, and repository rules define done. Never invent missing gates or reinterpret the issue silently.
 
-**Runtime sigil.** Claude Code invokes skills with `/`; **Codex uses `$` and rejects `/` outright**
-(there, `/` resolves built-in commands only, so `/issue-flow` returns "Unrecognized command"). Same
-skill, same arguments, different prefix:
+## Decision Gates
 
-```
-$issue-flow analyst [$<domain-rules> | instructions]
-$issue-flow dev
-```
-
-
-**The two roles use conditions asymmetrically.** The analyst accepts optional conditions to focus
-its judgement; without them it audits the repository under the autonomous discovery contract below.
-The dev's input is one already-specified issue, so the issue itself bounds the work. **The
-specification IS the scope.**
-
-- **Analyst conditions are optional.** Always obey applicable repository instructions and domain
-  rules; they constrain how analysis is performed and never replace its scope. Use explicit
-  conditions or a bounded target such as a diff, PR or issue as the scope. If none was supplied,
-  enter the autonomous repository-discovery mode below. Never stop merely because the caller
-  supplied no domain.
-- **A bounded target is already a scope.** Analyse that target without inventing wider scope.
-- **With no conditions, audit the repository itself.** First discover and obey applicable local
-  rules. Then inspect current code, tests, configuration, documentation, history and tracker context
-  for defensible bugs, security or reliability risks, performance and maintainability problems,
-  missing tests, architectural debt, and concrete product or developer-experience improvements.
-  Treat security as a first-class search axis: inspect authentication and authorization boundaries,
-  input validation and injection paths, secret and sensitive-data exposure, insecure defaults,
-  dependency and supply-chain risk, cryptographic misuse, privilege escalation and abuse cases.
-  Be constructively dissatisfied: challenge assumptions, trace consequences, compare intent with
-  behaviour, and look for evidence that the current solution can be better. Do not manufacture a
-  backlog; file only a finding supported by reproducible evidence and meaningful impact.
-- **`/issue-flow dev` alone is a complete, valid invocation.** Take the highest-priority ready
-  issue and build exactly what it specifies, following the target repo's own conventions (its agent
-  instructions, or the default flow below where those are silent). Most work needs nothing more.
-
-Add domain rules to the dev only when the project has extra requirements for what counts as a
-*real* change — a measurement discipline, mandatory benchmarks, ship gates, a versioning policy the
-issue cannot restate every time. Then the issue says WHAT, and the domain says what makes it TRUE.
-If you were given no domain, do not invent those requirements either: build what the issue asks and
-say what you verified.
-
-### Review is this role, not a separate capability
-
-Worth stating because it is easy to miss: **an adversarial review of a change is an analyst run over
-a bounded target.** Read-only, produces findings rather than commits, safe to run several of in
-parallel, and it must not be the context that wrote the code — which is the entire definition of this
-role, arrived at from a different direction.
-
-So a project that requires review before delivery is not asking for a capability this workflow
-lacks. It is asking for a **second analyst context** pointed at the diff. What it must NOT be is the
-same run reviewing itself: a context that just argued its way to a design will find that design
-convincing, which is precisely what the gate exists to catch.
-
-**How that second context is obtained is the runtime's business, not this skill's.** A sub-agent, a
-teammate on a team, or simply another session started against the same issue all satisfy it equally.
-Where a runtime forbids spawning helpers without the operator asking, the separate session is always
-available and costs nothing but wall-clock — so "I cannot delegate" is never a reason to skip the
-review, only a reason to run it differently.
-
-## Composition contract — who owns what
-
-This split is the whole design, so it is worth stating precisely:
-
-| This skill owns — the TRANSPORT | The domain owns — the BUSINESS RULES |
+| Situation | Action |
 |---|---|
-| the tracker, its states, claiming and transitions | what is worth doing, and why |
-| the issue skeleton every finding fills | how findings are prioritised |
-| how a dev takes and releases work | what "done" and "correct" mean |
-| where work is stored and how it moves | what evidence a finding must carry |
-| keeping parallel devs from corrupting each other | what makes a change worth shipping |
-
-**The domain must never name a transport.** A domain skill says "a finding carries a priority, an
-identity and this evidence"; it does not know those become a label, a workflow state, an issue
-title or a body section. That is what lets the same domain run over a different tracker later, and what lets
-this skill serve projects that share no vocabulary.
-
-Symmetrically, **this skill must never name a domain**. It has no opinion on what your project
-considers worth doing.
-
-### What the domain hands over
-
-**For the ANALYST role**, each finding it produces must supply:
-
-- `identity` — a stable key the domain controls, so two analysts naming the same thing collide
-  deterministically. Reused as the issue title prefix.
-- `title` — one line, what would change.
-- `priority` — a value on the domain's own scale, plus the reason for it. Mirrored as a label
-  `<scale>:<value>`; the domain names the scale.
-- `body` — the sections below, filled in domain terms.
-- `metadata` — whatever the domain needs to judge freshness or provenance later. Rendered verbatim
-  into the issue; this skill never interprets it.
-- `domain` — the name of the rule book this analysis ran under, and of its implementation
-  counterpart if the project has one. Recorded so the dev does not have to guess (see below).
-
-**The domain names these markers; it does not create them.** Some trackers refuse to attach a label
-that does not already exist, and the domain's priority scale and rule-book name are by definition not
-in any setup script — so `create` and `label` must bring their own labels into existence first. A
-binding that skips this fails on the analyst's very first filing, which is the worst possible moment
-to discover it.
-
-If a domain omits any of these for the ANALYST, say which one is missing and stop. Filling the gap
-by inventing a convention is how two agents end up with two incompatible boards.
-
-**A priority value is not a scale contract.** A scale contract MUST name the scale, enumerate every
-allowed value, define their strict ordering, and state what each value means. Before filing, verify
-that the finding's value belongs to that contract and carries a case-specific rationale. If any part
-is absent or ambiguous, STOP: do not infer `priority`, `severity`, `tier`, or any other vocabulary
-from familiar-looking values.
-
-**Priority is ordered only inside one declared scale.** Never compare values from different scales:
-`tier:2` is neither above nor below `priority:high`. For a mixed-domain `list_state`, partition the
-queue by `domain:<name>` and priority scale, order each partition by its own contract, and use oldest
-first only to choose among partition heads unless the caller selected a domain. This preserves a
-deterministic queue without pretending unrelated business scales share meaning. A binding may expose
-the partitions differently, but it must not manufacture a global priority rank.
-
-**For the DEV role the domain is optional**, and supplies only what an issue cannot carry per-issue:
-tie-breaking when priorities are equal, and what must be TRUE before work is called done — a
-measurement discipline, required benchmarks, ship gates. With no domain, the issue's own acceptance
-criteria are the definition of done, and the repo's conventions govern how you build.
-
-## Tracker binding — the operations this workflow needs
-
-Everything below is written in **operations**, not commands. Which tracker performs them, and how,
-lives in one file per tracker under `bindings/`, selected by the operator configuration at the end of
-this file. Load that one file and ignore the rest; no command for any tracker appears outside it.
-
-**A binding may implement an operation as an executable rather than as prose, and where it does, run
-it instead of composing the calls yourself.** This is not a convenience: the failures this workflow
-keeps recording are not wrong decisions but *steps that were never executed* — a board mirrored zero
-times in a whole session, five issues claimed and never relabeled, a heartbeat loop that never
-re-read the timeline. Every one of those instructions was present and correct. A run that skips a
-step it was asked to remember produces no error and no signal, which is precisely what an executable
-removes: the read-back either ran or the command did not exit cleanly. It is the same move as
-declaring the analyst with a read-only tool allowlist instead of asking it nicely, applied to the
-half of the workflow that is mechanical.
-
-**Which half that is, is the whole design.** An operation belongs in an executable when it is
-mechanical and verifiable — a state written to two surfaces and read back, a race adjudicated by
-timestamp, a path derived from configuration. It stays in prose when it needs judgement: what is
-worth analysing, whether a blocker is discharged, whether a diff passes review. A binding that
-scripts a judgement has not automated it, it has hidden it. A binding SHOULD also declare which
-operations it deliberately leaves unscripted and why — an irreversible remote write is a reasonable
-thing to keep in an agent's hands, and an undeclared gap reads as an oversight.
-
-| Operation | What it must do |
-|---|---|
-| `ensure_states` | make the state vocabulary exist, once per project |
-| `create` | file a new item in `ready` (or `blocked`) carrying the analyst's body **and every marker the finding supplies** — priority, domain and attribution, not just the state |
-| `list_state` | list unclaimed items in a given state; order within a declared domain/scale, and expose mixed-domain partitions without globally comparing their values |
-| `claim` | take the item server-side, then **verify you actually hold it** by the means the binding names |
-| `verify_claim` | re-read the authoritative control surface for an item you hold and answer two questions: am I still its holder, and has anything been said to this run-id since my claim? — what every heartbeat and every irreversible step checks **before** it writes |
-| `transition` | move to exactly one state, dropping the previous one in the same call — **and, where the configuration names a board, move its column in the same operation, then read BOTH back**. A transition is not one write; it is every projection of the state, verified |
-| `comment` | append a note the server timestamps |
-| `last_activity` | when the item was last touched — what the stale-claim rule reads |
-| `label` | attach a `<key>:<value>` marker queryable without opening the item, **creating the label first where the tracker requires one to exist** |
-| `unassign` | release the item without changing its state, **and drop your runtime's attribution marker** — it records who is holding the work, not who once touched it |
-| `publish_version` | for every delivered version bump, publish and remotely verify an immutable annotated component tag on the delivered revision; declare the capability unavailable and fail closed when the repository host cannot do it |
-| `close` | mark it delivered |
-
-**A binding must also declare what its tracker does NOT provide.** An absent capability that goes
-undeclared is how a rule silently stops applying: a tracker with no server-side `last_activity` has
-no stale-claim rule at all, and leaving that unsaid means abandoned work sits forever while this
-document cheerfully claims it cannot. Name the gap in the binding, so a missing rule is visible
-instead of merely untrue.
-
-## Attribution — which agent did what
-
-Every run mints ONE identity at start and reuses it for everything it writes:
-
-```
-<runtime>-<session-prefix>      e.g. codex-b91c, claude-code-60fabae1, kimi-3b1d
-```
-
-**Per RUN, not per runtime.** Two sessions of the same runtime working the same hour must be
-distinguishable, or "claude-code did it" tells you nothing about which of the three did.
-
-**Derive the suffix from the runtime's own session id when it exposes one** — the first characters
-are enough. A random suffix identifies a run but leads nowhere; a derived one **joins the issue to
-the local record of that run**, so a stuck claim or a wrong close can be traced back to the
-transcript that produced it. Claude Code exposes its session id in the paths it hands the session and
-keys its own team and task directories on the same prefix (`~/.claude/tasks/session-<8 chars>/`), so
-matching that convention costs nothing and buys the join. Where a runtime exposes nothing usable,
-fall back to a short random suffix and carry on — an untraceable identity still beats a shared one.
-
-**Why this cannot be left to the tracker.** Agents typically authenticate as the SAME account, so
-the author and assignee fields show one human for everything. Attribution that is not written
-explicitly does not exist.
-
-Record it at **two levels, split by cardinality** — this is the part that matters:
-
-| What | Distinct values | Where | Why there |
-|---|---|---|---|
-| **runtime** — `codex`, `claude-code`, `kimi` | a handful, stable | **label**: `analyst:<runtime>`, `dev:<runtime>` | queryable and visible without opening the card |
-| **run-id** — `codex-b91c` | one per run, unbounded | **text** in the body and comments | a label per run would leave hundreds of dead labels in a week |
-
-Labels are what make attribution *usable*: one `label` query answers "what is that runtime holding
-right now" without opening a single item. Parsing prose for the same answer is fragile — any
-rewording breaks it. Reserve labels for the bounded set and text for the unbounded one; mixing that up is how
-a label list rots.
-
-Concretely:
-
-- **Analyst** — add `analyst:<runtime>`, and close the issue body with
-  `— Analysed by <run-id> on <date>`.
-- **Dev** — add `dev:<runtime>` when claiming, and carry the run-id in the claim and close comments:
-  `Claimed by <run-id>, expect to report by <time>` … `Verified by <run-id>: <what was actually
-  checked>`.
-
-Use the same run-id in the branch or PR name where the repo's conventions allow it, so the code and
-the issue can be joined later without guessing.
-
-**`dev:<runtime>` means holding, so it comes off the moment you stop.** Every path that releases work
-— losing a claim race, hitting a blocker, being reclaimed, sending an issue back to `analysis`,
-returning a partial diagnosis — removes it along with the assignee. Leave it on and the one query the
-label exists for, *what is that runtime holding right now*, answers with work that runtime let go of
-days ago; and an issue that changes hands twice ends up wearing two of them, so the answer is not
-merely stale but ambiguous. **Delivery is not release**: on `close` the marker stays, because the
-runtime did hold the work through to the end and closed items fall outside the "what is open and
-held" question the label answers. The analyst's marker is different again — it records who analysed,
-which stays true forever, so it is never removed and a second analyst simply adds its own.
-
-**One caveat, stated rather than hidden.** On a board grouped by labels, every label family becomes
-its own set of columns, so these two will appear alongside the state and priority families. That is
-a property of the grouping choice, not of attribution: any project already carrying a priority label
-has the same effect today. If the board gets noisy, the fix is to group by the state field and keep
-labels for querying — do not drop the attribution, which is the only record that survives a board
-being reconfigured or replaced.
+| Analyst has conditions or a bounded diff/PR/issue | Analyse only that scope under applicable repository and domain rules. |
+| Analyst has no conditions or domain | Use the autonomous `general` contract in [domain composition](references/domain-composition.md); file only the strongest deduplicated finding or nothing. |
+| A domain route is recorded | Analyst loads the left rule book; dev loads the right. State explicitly when implementation routing is absent. |
+| Runtime mechanics or independent-context acquisition vary | Follow [runtime notes](references/runtime-notes.md); runtime limits change the mechanism, never the invariant. |
+| Claim, reclaim, or handoff safety needs rationale | Follow the active binding and [safety incidents](references/safety-incidents.md), without copying incident narrative here. |
+| State must be chosen | Invalid specification -> `analysis`; implementable and unassigned -> `ready`; claimed build -> `in-progress`; built/published -> `review`; unbuilt external wait -> `blocked` with condition and discharger; merged and verified -> `done`. |
 
 ## Routing — the issue names its own domain
 
@@ -288,20 +72,6 @@ routing**: it is a query key, and nothing guarantees the name matches any loadab
 
 A project with a single domain can leave this implicit; a repo where several independent subsystems all file into one
 board cannot, and that is the case worth designing for.
-
-## Why the split exists
-
-Two different constraints, deliberately separated:
-
-- **Analysis is cheap, parallel and safe.** Several analysts can run at once. Nothing they do can
-  break a build, because they write no code.
-- **Implementation is expensive, serial and risky.** It needs a branch, a worktree, tests and a
-  review.
-
-Separating them lets you fan out the cheap half without paying for the risky half. It also lets a
-runtime that **cannot write to the filesystem** still contribute: an analyst's only output is a
-tracker item, which is network, not disk. A sandboxed agent that cannot create a worktree can still
-be a first-class analyst.
 
 ---
 
@@ -508,7 +278,7 @@ Picks up analysed work and implements it.
    publish the new head and repeat review plus CI. A delivery-only resume must not pretend the code
    is being built again.
 3. **For a `ready` item, `transition` to `in-progress`** (dropping `ready` in the same call), **and attach
-   `dev:<runtime>` in the same step** (see *Why this cannot be left to the tracker* above). Seen
+   `dev:<runtime>` in the same step** (see the attribution rule in **Hard Rules**). Seen
    live: an issue correctly assigned, claimed and transitioned, with the `dev:<runtime>` label added
    only later at close — which means for the entire build, the one query the label exists to answer
    ("what is that runtime holding right now") could not find it. The claim comment was already
@@ -919,62 +689,11 @@ never reconstructed after it to match what you happened to build.
 
 ---
 
-## State machine
-
-| State | Meaning | Who moves it |
-|---|---|---|
-| `analysis` | being analysed, or returned by a dev as wrong | analyst |
-| `ready` | specified, unassigned, implementable | analyst |
-| `in-progress` | claimed and being built | dev |
-| `review` | built and published; awaiting or undergoing independent review, CI and delivery | dev |
-| `blocked` | needs something external and nothing is built yet; the blocker and its discharger are named in the issue | either |
-| `done` | merged and verified | dev |
-
-**Exactly one state at a time.** Two states is an ambiguous board, and a board nobody trusts gets
-ignored. Whether the tracker enforces that or merely permits it is in its binding — where it is
-only permitted, `transition` carries the whole burden.
-
-**`blocked` is the one state nobody owns, so it must name its own exit.** An unassigned item in
-`in-progress` gets reclaimed by the stale-claim rule; an item in `ready` gets picked up by priority.
-A blocked item has neither: no holder to chase and no queue that will surface it. That is why filing
-it demands the missing thing be named precisely — the name IS the exit condition, and any run that
-notices it satisfied moves the item back to `ready` and says why. A blocker recorded as "waiting on
-infra" names nothing, so nothing can ever discharge it.
-
-**Name the discharger too, not only the condition.** Three things get filed as `blocked` and they rot
-at completely different rates:
-
-| Blocked on | Who discharges it | How it rots |
-|---|---|---|
-| a **decision** — a person must choose | only that person | worst: nobody is watching, and an unasked human is indistinguishable from an abandoned issue |
-| a **date or accumulating data** | any run, mechanically | mildly: the date passes and nobody checks |
-| an **external system** | any run, by rechecking | mildly: the outage ends quietly |
-
-The last two a run can resolve on its own, which is why naming the condition is enough for them. The
-first cannot: **if a person must decide, the item is not waiting on the project, it is waiting on
-someone who has not been told.** Say so in the issue, in those words, and make it findable by them —
-that is the difference between a blocker and a dead end. An item blocked on a decision that has sat
-untouched for days is not blocked any more; it is abandoned, and any run that sees one should say so
-rather than walk past it.
-
-**`done` is a state, not the absence of one.** Some trackers also have a closed or archived notion of
-their own; where they do, the two move **together and in that order** — the state first, then the
-tracker's own bookkeeping. Leaving `done` implicit and relying only on "the item is closed" breaks
-two things at once: a board grouped by state never learns the work finished, because closing an item
-is not a state change and fires no state event; and a query for items in `review` keeps returning
-work that shipped last week.
-
-Creating that vocabulary is `ensure_states` — see the active binding. **Both roles run it before
-their first write to a project they have not used before**, and it is idempotent, so running it when
-the states already exist costs one call and changes nothing. Skipping it is not a slow degradation:
-on a tracker that refuses unknown labels, the very first `create` fails, and it fails at the end of
-the analyst's work rather than at the start.
-
 ## Optional: a board view over this workflow
 
 Most trackers can render these items as a Kanban board. Whether that board is a **view** or the
-state itself is the only question that matters, and the answer is always the same here: the state
-machine above is authoritative and the board is a picture of it. Invert that and every agent needs
+state itself is the only question that matters, and the answer is always the same here: the workflow
+state defined by **Hard Rules** and **Decision Gates** is authoritative. Invert that and every agent needs
 whatever extra permission the board API demands, and this workflow's transport has to be rewritten.
 
 What that costs on a given tracker — which parts are API-reachable, which need a human to click
@@ -1001,38 +720,8 @@ run simply never executed it, which is the failure mode a read-back catches and 
 
 **And a read-back only catches it if the read-back itself runs**, which is the same problem one
 level up. Where the binding implements `transition` as an executable, the mirror and both reads are
-inside it and cannot be dropped separately from the label edit — see *A binding may implement an
-operation as an executable* above. That is the durable fix; this section is why it was needed.
-
-## Optional: running this alongside an in-session agent team
-
-Claude Code's agent teams give a lead session a shared task list of its own, which teammates claim
-through file locking. That resembles this workflow and is not it: **the two coordinate at different
-lifetimes, and confusing them loses work.**
-
-| | agent-team task list | this workflow |
-|---|---|---|
-| Lifetime | one session; a team cannot be shared across sessions | as long as the repository |
-| Coordination | file lock, local to the machine | assign server-side, then re-read |
-| Survives the run ending | no | yes |
-| Reachable by another runtime | no | yes |
-
-Use each for what it is: **the team parallelises inside a run; the issue is what survives it.** A lead
-can fan several analysts out as teammates over one domain and have them argue — parallel
-investigation is the strongest documented case for teams — but when the session ends, everything held
-only in the task list, the mailbox or a teammate's context is gone. What was written to the issue
-remains. This is not a new rule, it is the existing one (*everything you learn goes ON THE ISSUE*)
-meeting a new way to lose things.
-
-Two consequences worth acting on:
-
-- **Never treat the shared task list as the state.** It is a view of one session's slice of the
-  board, carrying exactly the authority a Kanban column does: none.
-- **A teammate that finishes without writing to the issue has produced nothing**, however good its
-  reasoning was. Where the runtime offers hooks on task completion or on a teammate going idle —
-  `TaskCompleted` and `TeammateIdle` in Claude Code, both able to refuse with exit code 2 — that rule
-  can be enforced rather than hoped for. That is the mechanical version of the paragraph above, and
-  the same move as declaring the analyst with a read-only tool allowlist instead of asking it nicely.
+inside it and cannot be dropped separately from the label edit, as required by **Hard Rules**. That
+is the durable fix; this section is why it was needed.
 
 ## Honest limits
 

@@ -3,7 +3,7 @@
 Use this fallback when a repository does not define a stricter isolation or integration policy. The
 repository's instructions always win; this reference supplies a floor, not a competing convention.
 The runtime contract still owns role and state decisions, and the
-[abstract binding contract](../SKILL.md#tracker-binding--the-operations-this-workflow-needs) selects
+[abstract binding contract](../SKILL.md#hard-rules) selects
 the operation implementation and exact tracker commands.
 
 ## Delivery invariants
