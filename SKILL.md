@@ -441,8 +441,26 @@ blocker is useful. A silent gap is not.
 
 Picks up analysed work and implements it.
 
-1. **Select — but drain `review` first.** `list_state(review)` for unassigned items before you look
-   at `ready`. Those are changes that are **already built and published**, parked somewhere in
+0. **First, resume what you are already holding.** Before any queue, check whether THIS run-id
+   already holds an item and, if it does, continue that one. Selection queues list only
+   *unclaimed* work, so an item you are mid-way through is invisible to them — and a run that
+   re-enters selection therefore starts a SECOND issue while its first is still open, with nothing
+   anywhere recording that it did.
+
+   This is not an edge case, it is what re-entry looks like. A scheduled or looped invocation
+   (`/issue-flow dev` on a timer), a resumed session, and a runtime that re-reads its instructions
+   mid-task all arrive back at step 1 with work already in hand. Seen live (2026-07-26): a
+   five-minute loop re-entered selection on every tick while the same issue sat claimed and
+   building, and only a manual check each time stopped it opening more. **One task is one agent
+   applies to the agent as well as to the task**: two issues held by one run share its attention
+   and its machine, and neither heartbeat says so.
+
+   Resuming means picking up where the item's own state says you are, not restarting: an item you
+   hold in `review` resumes at step 6, one in `in-progress` at step 4. Only when you hold nothing
+   does selection begin.
+
+1. **Then select — but drain `review` first.** `list_state(review)` for unassigned items before you
+   look at `ready`. Those are changes that are **already built and published**, parked somewhere in
    review, CI or delivery, and every one of them is closer to shipping than anything you could start
    today. **Finishing beats starting**: an unclaimed `review` item outranks the whole `ready` queue
    regardless of priority, because its cost is already sunk and its branch rots while it waits.

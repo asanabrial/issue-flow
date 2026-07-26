@@ -96,6 +96,64 @@ CONTROL_KINDS = frozenset({"standdown", "reclaim", "adjudication"})
 # Attributes that can carry the run-id a marker is ABOUT, rather than the one that wrote it.
 TARGET_ATTRS = ("run-id", "target", "from")
 
+# Attributes that ADDRESS an instruction at a run, per kind. The split exists because `run-id`
+# does not mean the same thing on every marker: on the kinds this file writes it names the AUTHOR,
+# and on a kind nobody here writes it can only name the addressee. See is_control_for.
+INSTRUCTION_ATTRS_BY_KIND = {
+    # Written only as a SELF-release (claim on a lost race, unassign), so `run-id` is the author.
+    "standdown": ("target",),
+    # Written with run-id=<author> and from=<displaced holder>; `from` is the addressee.
+    "reclaim": ("target", "from"),
+    # Never written by this file — it arrives from a human or another runtime, where `run-id` can
+    # only be the run being adjudicated against. Keep it addressable every way.
+    "adjudication": ("run-id", "target", "from"),
+}
+
+# Which attributes name a run that RELEASED the item, per kind — the mirror of the map above, and
+# it differs from it because releasing and being-told-to-stop are not the same relation.
+#
+# `reclaim` is the one that has to be spelled out: it carries `run-id=<author>` and
+# `from=<displaced>`, and only the displaced run released anything. Reading every attribute — as
+# this did until 2026-07-26 — made the reclaiming run release ITSELF in the act of taking the
+# item over, so its own subsequent claim was filtered out as dead. Same shape as the self-standdown
+# defect, arriving through a different door.
+RELEASE_ATTRS_BY_KIND = {
+    "standdown": ("run-id", "target"),
+    "release": ("run-id", "target"),
+    "unassign": ("run-id", "target"),
+    "reclaim": ("from",),
+}
+
+
+def is_control_for(mark: dict, run_id: str) -> bool:
+    """Does this marker INSTRUCT `run_id` to stop?
+
+    Split out of the `verify_claim` scan because it is a judgement about vocabulary that was being
+    made inline, and getting it wrong strands a run in one of two ways — deaf to a real stand-down,
+    or unable to resume work it legitimately put down.
+
+    **A self-release is not an instruction.** Every `standdown` this file writes carries the
+    AUTHOR's own run-id (`claim` on a lost race, `unassign` on a deliberate release), so under the
+    old rule — any control kind naming me, by any attribute — a run that released an item and later
+    re-claimed it read its OWN release as an order to stop.
+
+    Seen live (2026-07-26, issue #70): a run released an item under a delivery blocker, then found
+    that half of the blocker was work it could actually do, and could not resume because of the
+    marker it had written itself. That closes the release→resume cycle the dev role's step 1
+    actively pushes runs towards, since an unclaimed `review` item outranks the whole `ready`
+    queue — including one this very run just put back.
+
+    So which attribute addresses an instruction depends on the kind, and the reason is mechanical:
+    a marker this file writes carries its author in `run-id`, so `run-id` cannot also mean
+    "addressee" there. `reclaim` names the displaced run in `from`; a stand-down aimed at someone
+    else names them in `target`; and `adjudication`, which this file never writes, stays
+    addressable by `run-id` because there is no author to confuse it with.
+    """
+    attrs = INSTRUCTION_ATTRS_BY_KIND.get(mark.get("kind"))
+    if not attrs:
+        return False
+    return any(mark.get(attr) == run_id for attr in attrs)
+
 
 class ReadFailure(Exception):
     """A read against the control surface did not answer. Never a stand-down."""
@@ -330,22 +388,45 @@ def claim_comments(comments: list[dict]) -> list[tuple[str, str, dict]]:
     return claims
 
 
-def released_run_ids(comments: list[dict]) -> set[str]:
-    """Run-ids that no longer hold the item, so their earlier claim stops counting.
+def released_at(comments: list[dict]) -> dict[str, str]:
+    """When each run-id last released the item — {run-id: newest release timestamp}.
 
     A `reclaim` marker names the run it took over FROM, not the run that wrote it, which is why
     every target attribute is read rather than just `run-id`. Miss that and a reclaimed item still
     adjudicates in favour of the run that was reclaimed from.
+
+    **A release cancels the claims BEFORE it, not the run-id forever.** This returned a bare set
+    until 2026-07-26, which made a release permanent: once a run had released an item, every later
+    claim it made was filtered out as dead. Seen live on issue #70 — a run released an item under a
+    delivery blocker, re-claimed it when half the blocker turned out to be its own work, and the
+    fresh claim was discarded. The caller then found NO live claim and reported it as a
+    write-that-had-not-propagated, so the diagnosis named the wrong failure entirely and the
+    operator was told a comment existed that did not.
+
+    Timestamps are ISO-8601 UTC from the server, so string comparison is chronological.
     """
-    released = set()
+    released: dict[str, str] = {}
     for comment in comments:
+        stamp = comment.get("createdAt", "")
         for mark in parse_markers(comment.get("body", "")):
-            if mark.get("kind") not in RELEASE_KINDS:
+            attrs = RELEASE_ATTRS_BY_KIND.get(mark.get("kind"))
+            if not attrs:
                 continue
-            for attr in TARGET_ATTRS:
-                if mark.get(attr):
-                    released.add(mark[attr])
+            for attr in attrs:
+                target = mark.get(attr)
+                if target and stamp > released.get(target, ""):
+                    released[target] = stamp
     return released
+
+
+def claim_is_live(claimed_at: str, run_id: str, released: dict[str, str]) -> bool:
+    """Does this claim still stand, given every release seen on the timeline?
+
+    A claim is dead only when the SAME run released the item AFTER making it. A claim made after
+    that release is a deliberate re-claim and counts normally — see `released_at` for the incident
+    that made the distinction necessary.
+    """
+    return claimed_at > released.get(run_id, "")
 
 
 def last_activity_by(comments: list[dict], run_id: str) -> str:
@@ -783,9 +864,7 @@ def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
         body = comment.get("body", "")
         marks = parse_markers(body)
         controlled = any(
-            mark.get("kind") in ("standdown", "reclaim", "adjudication")
-            and (mark.get("run-id") == run_id or mark.get("target") == run_id
-                 or mark.get("from") == run_id)
+            is_control_for(mark, run_id)
             for mark in marks
         )
         if not controlled and not marks:
@@ -940,8 +1019,20 @@ def cmd_claim(args, config, cwd) -> dict:
     # the caller re-runs it — and a second claim comment for the same run muddies the very record
     # the race is adjudicated from. So look for our own claim first and reuse it. This is also
     # what makes the retry advice on a failed write safe to follow at all.
-    existing = claim_comments(issue_view(args.issue, "comments", cwd=cwd).get("comments", []))
-    already_mine = [at for at, rid, _ in existing if rid == args.run_id]
+    #
+    # Reuse only a claim that is still LIVE. A claim I made and then RELEASED is a historical
+    # record, not a holding, so reusing it posts nothing and leaves the run with no live claim at
+    # all — after which adjudication finds none and reports a write that never propagated.
+    # Seen live (2026-07-26, issue #70): a run claimed, released under a blocker, then tried to
+    # resume; the guard kept handing back the released claim and `claim` failed with a diagnosis
+    # naming the wrong cause, twice, until the timeline was read by hand.
+    existing_comments = issue_view(args.issue, "comments", cwd=cwd).get("comments", [])
+    existing = claim_comments(existing_comments)
+    prior_releases = released_at(existing_comments)
+    already_mine = [
+        at for at, rid, _ in existing
+        if rid == args.run_id and claim_is_live(at, rid, prior_releases)
+    ]
 
     if not already_mine:
         body = (
@@ -955,12 +1046,17 @@ def cmd_claim(args, config, cwd) -> dict:
     data = issue_view(args.issue, "comments", cwd=cwd)
     comments = data.get("comments", [])
     claims = claim_comments(comments)
-    released = released_run_ids(comments)
+    released = released_at(comments)
     # A claim that blew its own declared horizon in silence is not a competitor, it is a corpse.
     # Without this the earliest claim wins forever and a dead run holds its issue permanently.
     expired = stale_claims(claims, comments, utc_now_stamp())
-    dead = released | (expired - {args.run_id})
-    live = [(at, rid) for at, rid, _ in claims if rid not in dead]
+    dead = expired - {args.run_id}
+    # A release only kills the claims that PRECEDE it, so a re-claim after a deliberate release
+    # counts (released_at). Expiry stays run-id-wide: a horizon nobody renewed is about the run.
+    live = [
+        (at, rid) for at, rid, _ in claims
+        if rid not in dead and claim_is_live(at, rid, released)
+    ]
 
     if not live:
         # The write succeeded but the timeline has not caught up. Say so as a WRITE failure: the
@@ -1020,7 +1116,7 @@ def cmd_reclaim(args, config, cwd) -> dict:
     The record of the takeover matters more than the takeover, so the comment goes FIRST and names
     who it was taken from. If the original holder was alive and merely slow, its next renewal reads
     this and backs off exactly like the loser of a claim race — which is why the marker carries
-    `from`, and why `released_run_ids` treats a reclaim as releasing that run rather than this one.
+    `from`, and why `released_at` treats a reclaim as releasing that run and NOT its author.
 
     The dead run's `dev:<runtime>` marker is removed as ours goes on. It cannot do that itself,
     which is the whole reason this command exists; skip it and the item claims two runtimes hold it.
@@ -1032,8 +1128,8 @@ def cmd_reclaim(args, config, cwd) -> dict:
 
     comments = data.get("comments", [])
     claims = claim_comments(comments)
-    released = released_run_ids(comments)
-    holders = [(at, rid) for at, rid, _ in claims if rid not in released]
+    released = released_at(comments)
+    holders = [(at, rid) for at, rid, _ in claims if claim_is_live(at, rid, released)]
     if not holders:
         raise Stop({"ok": False, "reason": "nothing-to-reclaim",
                     "action": "no live claim on this issue — use `claim` instead"})
@@ -1241,6 +1337,38 @@ def normalise_path(path) -> str:
     return text.lower() if os.name == "nt" else text
 
 
+def branch_start_point(*, exists_local: bool, exists_remote: bool, branch: str, base: str) -> str | None:
+    """Where a fallback `git branch` should start — or None when it must NOT run at all.
+
+    This decides whether existing work survives a resume, so it is a pure function fed booleans
+    rather than a line inside the git sequence: the defect it exists to prevent shipped precisely
+    because the sequence had no test, and a command sequence cannot be exercised by this file's
+    harness.
+
+    **Never move an existing ref.** The original was `git branch --force <branch> origin/<base>`,
+    and `--force` on a branch that already exists REWINDS it to the base, discarding every commit
+    on it. The `--force` was there to make the resume case work — which is exactly the case where
+    the branch has work to lose, so it destroyed what it was meant to accommodate.
+
+    Seen live (2026-07-26, issue #70): a run removed a dead run's orphan worktree, called
+    start-branch on the SAME branch to resume it, and the local ref moved from the pushed head to
+    `main`. Two commits — a RED contract and its GREEN implementation — left the local ref, and
+    the reported `head` came back as the base SHA. Only the untouched remote made it recoverable,
+    and only because someone checked; a run that trusted the reported head would have rebuilt the
+    work on top of `main` and never known it had.
+
+    Precedence is ordered by how much work each source can lose:
+
+    1. a LOCAL branch is authoritative and is left alone — it may hold commits never pushed;
+    2. otherwise a REMOTE branch of the same name is the published work, so branch from THAT, not
+       from the base — starting a resumed branch at the base silently restarts it from zero;
+    3. only when neither exists is this genuinely a new branch off the base.
+    """
+    if exists_local:
+        return None
+    return f"origin/{branch}" if exists_remote else f"origin/{base}"
+
+
 def registered_worktrees(cwd: Path) -> dict[str, str | None]:
     """Every worktree git knows about, as {normalised path: branch or None if detached}.
 
@@ -1329,8 +1457,22 @@ def cmd_start_branch(args, config, cwd) -> dict:
         # `origin/main` instead of creating one called `-D`. Nothing upstream validates the value,
         # and this call runs with check=False, so the damage would be silent.
         run(["git", "fetch", "origin", "--", args.base], cwd=cwd)
-        run(["git", "branch", "--force", "--", args.branch, f"origin/{args.base}"],
-            cwd=cwd, check=False, writes=True)
+
+        exists_local = run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{args.branch}"],
+            cwd=cwd, check=False,
+        ).returncode == 0
+        exists_remote = run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{args.branch}"],
+            cwd=cwd, check=False,
+        ).returncode == 0
+        start_point = branch_start_point(
+            exists_local=exists_local, exists_remote=exists_remote,
+            branch=args.branch, base=args.base,
+        )
+        if start_point is not None:
+            run(["git", "branch", "--", args.branch, start_point],
+                cwd=cwd, check=False, writes=True)
 
     run(["git", "fetch", "origin"], cwd=cwd)
     if not resuming:

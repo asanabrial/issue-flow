@@ -61,7 +61,7 @@ check("a marker claim parses",
 
 
 # --------------------------------------------------------------------------------------
-# Release vocabulary. The defect: `released_run_ids` and the control-message check shared only
+# Release vocabulary. The defect: `released_at` and the control-message check shared only
 # ONE marker kind, and nothing emitted `reclaim` — so a reclaimed issue still adjudicated in
 # favour of the run it had been taken from, forever.
 # --------------------------------------------------------------------------------------
@@ -72,7 +72,16 @@ RECLAIMED = [
 ]
 
 check("reclaim releases the run it took over FROM, not its author",
-      "dead-run" in m.released_run_ids(RECLAIMED), True)
+      "dead-run" in m.released_at(RECLAIMED), True)
+
+# The author of the reclaim is NOT released by writing it — that was the original defect's twin.
+check("reclaim does not release its own author",
+      "live-run" in m.released_at(RECLAIMED), False)
+
+# The dead run's claim PRECEDES the reclaim, so it is dead; the assertion is now about ordering
+# rather than about membership, because a release is no longer permanent (see released_at).
+check("the claim the reclaim displaced is dead",
+      m.claim_is_live("2026-01-01T00:00:00Z", "dead-run", m.released_at(RECLAIMED)), False)
 
 check("standdown counts as both release and control",
       "standdown" in m.RELEASE_KINDS and "standdown" in m.CONTROL_KINDS, True)
@@ -271,6 +280,112 @@ except m.Stop as stop:
 # Case folding must follow the filesystem, or two distinct POSIX worktrees collapse to one key.
 check("path case is folded only where the filesystem folds it",
       m.normalise_path("/tmp/A") == m.normalise_path("/tmp/a"), os.name == "nt")
+
+# --------------------------------------------------------------------------------------
+# branch_start_point — the resume must not rewind the branch
+#
+# The fallback used to run `git branch --force <branch> origin/<base>`, which REWINDS an existing
+# branch to the base and drops every commit on it. Seen live on issue #70 (2026-07-26): resuming a
+# branch moved its local ref from the pushed head to `main`, losing a RED/GREEN commit pair from
+# the ref and reporting the base SHA back as the branch head. Only the remote made it recoverable.
+# --------------------------------------------------------------------------------------
+
+# The one that cost work: an existing local branch is NEVER a start point, it is left untouched.
+check("an existing local branch is left alone, never re-pointed",
+      m.branch_start_point(exists_local=True, exists_remote=False, branch="fix/7", base="main"),
+      None)
+check("a local branch wins even when a remote of the same name exists",
+      m.branch_start_point(exists_local=True, exists_remote=True, branch="fix/7", base="main"),
+      None)
+
+# A resumed branch that exists only on the remote must start from the PUBLISHED work. Starting it
+# at the base would silently restart the branch from zero — the same lost work by another route.
+check("a remote-only branch resumes from the published head, not the base",
+      m.branch_start_point(exists_local=False, exists_remote=True, branch="fix/7", base="main"),
+      "origin/fix/7")
+
+# Only a genuinely new branch starts at the base.
+check("a branch that exists nowhere is created off the fresh base",
+      m.branch_start_point(exists_local=False, exists_remote=False, branch="fix/7", base="main"),
+      "origin/main")
+
+# --------------------------------------------------------------------------------------
+# is_control_for — a self-release must not order its own author to stop
+#
+# Every `standdown` this binding writes carries the AUTHOR's run-id. Under the old rule ("any
+# control kind naming me, by any attribute"), a run that released an item and later re-claimed it
+# read its OWN release as a stand-down. Seen live on issue #70 (2026-07-26): the release→resume
+# cycle that step 1 pushes runs towards was closed by the marker the run wrote itself.
+# --------------------------------------------------------------------------------------
+
+ME, OTHER = "claude-code-edd63b3f", "codex-b91c"
+
+# The one that stranded a run: my own release names me in run-id, and it is NOT an order.
+check("my own standdown does not instruct me to stop",
+      m.is_control_for({"kind": "standdown", "run-id": ME}, ME), False)
+# But a stand-down ADDRESSED at me still stops me — the signal must not go deaf.
+check("a standdown addressed at me still stops me",
+      m.is_control_for({"kind": "standdown", "run-id": OTHER, "target": ME}, ME), True)
+# Someone else's release is none of my business either way.
+check("another run's standdown is not about me",
+      m.is_control_for({"kind": "standdown", "run-id": OTHER}, ME), False)
+
+# reclaim names its AUTHOR in run-id and the DISPLACED run in from — only the latter is addressed.
+check("a reclaim I wrote does not stop me",
+      m.is_control_for({"kind": "reclaim", "run-id": ME, "from": OTHER}, ME), False)
+check("a reclaim taken FROM me stops me",
+      m.is_control_for({"kind": "reclaim", "run-id": OTHER, "from": ME}, ME), True)
+
+# adjudication is never written by this file, so run-id can only be the addressee — keep it live.
+check("an adjudication naming me by run-id still stops me",
+      m.is_control_for({"kind": "adjudication", "run-id": ME}, ME), True)
+
+# A non-control kind never stops anyone, whoever it names.
+check("a heartbeat naming me is not an instruction",
+      m.is_control_for({"kind": "heartbeat", "run-id": ME}, ME), False)
+check("a claim naming me is not an instruction",
+      m.is_control_for({"kind": "claim", "run-id": ME}, ME), False)
+
+# --------------------------------------------------------------------------------------
+# released_at / claim_is_live — a release cancels earlier claims, not the run-id forever
+#
+# This was a bare set until 2026-07-26, so a release was permanent: every later claim by that run
+# was filtered out as dead. On issue #70 the caller then found NO live claim and reported it as a
+# write that had not propagated — naming the wrong failure and telling the operator a comment
+# existed that did not.
+# --------------------------------------------------------------------------------------
+
+RELEASED = {ME: "2026-07-26T11:29:56Z"}
+
+# The one that stranded the run: a claim made AFTER my release is a deliberate re-claim.
+check("a claim after my own release is live",
+      m.claim_is_live("2026-07-26T11:34:00Z", ME, RELEASED), True)
+# And the claim the release was about is still dead, which is the whole point of releasing.
+check("a claim before my release is dead",
+      m.claim_is_live("2026-07-26T10:31:57Z", ME, RELEASED), False)
+# A run that never released is unaffected.
+check("a run that never released is live",
+      m.claim_is_live("2026-07-26T09:00:00Z", OTHER, RELEASED), True)
+
+# The map must take the NEWEST release per run — an older one must not resurrect a dead claim.
+TIMELINE = [
+    {"createdAt": "2026-07-26T09:00:00Z",
+     "body": f"<!-- issue-flow: standdown run-id={ME} -->"},
+    {"createdAt": "2026-07-26T11:29:56Z",
+     "body": f"<!-- issue-flow: standdown run-id={ME} -->"},
+    # A reclaim names the DISPLACED run in `from`, so it releases OTHER, not its author.
+    {"createdAt": "2026-07-26T12:00:00Z",
+     "body": f"<!-- issue-flow: reclaim run-id={ME} from={OTHER} -->"},
+]
+check("the newest release per run-id wins",
+      m.released_at(TIMELINE).get(ME), "2026-07-26T11:29:56Z")
+check("a reclaim releases the run it displaced",
+      m.released_at(TIMELINE).get(OTHER), "2026-07-26T12:00:00Z")
+# The 12:00 reclaim carries run-id=ME, and it must NOT push ME's release forward: writing a
+# reclaim is taking the item, not putting it down. Without this the reclaiming run releases itself
+# in the act of taking over, and its own next claim is discarded as dead.
+check("writing a reclaim does not release its author",
+      m.released_at(TIMELINE).get(ME) < "2026-07-26T12:00:00Z", True)
 
 print()
 print(f"{len(FAILURES)} failure(s)" + (f": {FAILURES}" if FAILURES else ""))
