@@ -125,6 +125,9 @@ message must both **name the run-id AND instruct**. A heartbeat that mentions yo
 ("waiting on `<run-id>`'s measurement phase") instructs you to do nothing, and classifying it as a
 stand-down would have you abandon work nobody asked you to drop.
 
+Only `viewerDidAuthor=true` comments are control input. Reclaims must match the stale prior holder
+unless marked `forced=true`; horizonless acquisitions expire four hours after trusted activity.
+
 **Worked example — a real claim race, 2026-07-22.** The timeline, from the issue's comment trail:
 
 | Time (UTC) | Event |
@@ -158,17 +161,17 @@ ones.
 | `ensure_states` | `SCRIPT ensure-states` | idempotent; run it before your first write to an unfamiliar project |
 | `create` | `SCRIPT create --identity <id> --title <t> --body-file <f> --priority <scale:value> --domain <name> --runtime <rt> --run-id <id> [--state ready\|blocked]` | creates every label **before** attaching it, then mirrors the initial board column — the case everyone forgets, because no `transition` ever follows a fresh issue to correct an empty `Status` |
 | `list_state` | `SCRIPT list-state --state <s>` | unassigned only, `--limit 200` (the default cap is 30 and silently truncates the queue), partitioned by `domain:<name>`. It returns the raw labels and **refuses to rank across partitions** — ordering inside one needs the domain's scale contract, and manufacturing a global rank is forbidden |
-| `claim` | `SCRIPT claim --issue <n> --run-id <id> --runtime <rt> --horizon <when>` | assigns, writes the claim comment, then adjudicates from the timeline. Idempotent: it reuses your own existing claim rather than posting a second one. A claim that blew its declared horizon in silence is treated as dead, not as a competitor. On a loss it stands down, drops **only** your `dev:<runtime>` label, and exits `1` — `@me` is the shared account and removing it would strip the winner |
-| `reclaim` | `SCRIPT reclaim --issue <n> --run-id <id> --runtime <rt> [--force]` | takes over from a holder whose horizon has passed in silence: comments **first** naming who it was taken from, then swaps assignee and `dev:` marker. Refuses a holder that is not stale unless `--force` |
-| `verify_claim` | `SCRIPT verify-claim --issue <n> --run-id <id> --expect-state <s> [--allow-closed-by-pr <pr>]` | one read, three checks: the issue is OPEN; it carries exactly one `status:*` and it is yours; no control message after your claim comment names your run-id. `--allow-closed-by-pr` is for the renewal before `close` only — it accepts a closed issue **solely** when that PR is what closed it |
+| `claim` | `SCRIPT claim --issue <n> --run-id <id> --runtime <rt> --horizon <when>` | appends ownership before projecting assignee/label state, then accepts only the reducer's live winner. An expired self-claim gets a fresh event; same-runtime loss cleanup preserves the winner's shared label |
+| `reclaim` | `SCRIPT reclaim --issue <n> --run-id <id> --runtime <rt> [--horizon <when>] [--force]` | one trusted, validated event releases the named holder and establishes the new holder with a horizon before recoverable projections; forced takeovers are marked explicitly |
+| `verify_claim` | `SCRIPT verify-claim --issue <n> --run-id <id> --expect-state <s> [--allow-closed-by-pr <pr>]` | proves the requested run is the reducer's current live winner, uses that ownership event as its control-message watermark, and applies the open/state checks. `--allow-closed-by-pr` remains limited to the renewal before `close` |
 | `transition` | `SCRIPT transition --issue <n> --to <s> [--from <s>]` | mirrors the board **first**, swaps the label in **one** call, then reads **both** back and repairs a board that disagrees. Omitting `--from` removes whatever stale state labels it finds |
 | `comment` | `SCRIPT comment --issue <n> --body-file <f> [--run-id <id> --kind <k>]` | file-based body, always |
 | `heartbeat` | `SCRIPT heartbeat --issue <n> --run-id <id> --expect-state <s> --body-file <f>` | renewal first, post second; **refuses to post** when the renewal says stop |
-| branch + worktree | `SCRIPT start-branch --issue <n> --branch <b> --base <base> --run-id <id>` | renews the claim before the first write outside the board, creates the branch server-side (already linked in the Development sidebar), adds a **per-run** worktree at the configured path, and records branch/base/worktree/holder on the issue |
+| branch + worktree | `SCRIPT start-branch --issue <n> --branch <b> --base <base> --run-id <id>` | renews first, fetches before fallback discovery, resumes local or remote-only branch heads without moving them, and creates from the fetched base only when the branch is absent everywhere |
 | `publish_review` | `SCRIPT publish-review --issue <n> --branch <b> --base <base> --run-id <id> --pr-title <t> --pr-body-file <f> [--worktree <p>]` | pushes, **reuses** the single open PR or creates one, refuses on more than one, scans for closing keywords, and records the PR URL with its exact head and base SHAs |
 | `changelog-notes` | `SCRIPT changelog-notes --version <x.y.z> --file <changelog> [--out <f>]` | read-only. Extracts the version's entry for its tag and Release, anchored on the version **opening** the heading. Fails closed on a missing or empty entry — a tag is immutable, so notes invented at tag time are permanent |
 | `check closing keywords` | `SCRIPT check-closing-keywords --issue <n>` | run again before merging: the branch's commit messages can introduce one after the body is already clean |
-| `unassign` | `SCRIPT unassign --issue <n> --runtime <rt> [--run-id <id>] [--held-by-other]` | `--held-by-other` is the lost-race/stand-down form: drops only your label and keeps the shared assignee |
+| `unassign` | `SCRIPT unassign --issue <n> --runtime <rt> --run-id <id> [--held-by-other]` | requires the releasing run, polls until its marker is visible, then removes only unneeded projections; ambiguous readback fails as a write and retry converges without another marker |
 | board audit | `SCRIPT audit-board [--fix]` | compares every card's column against its own `status:*` label. **Zero cards is reported as a failed read, not a clean board** |
 | `review_status` | *(agent, not scripted)* | `gh pr view <pr> --json headRefOid,baseRefOid,latestReviews,reviewDecision,reviewRequests,mergeStateStatus`. The independent verdict artifact MUST contain `Reviewer-Run: <run-id>`, `Reviewed-Head: <full-head-sha>` and `Reviewed-Base: <full-base-sha>`; re-read both SHAs after review and reject the verdict if either differs. The verdict is mandatory even when every runtime authenticates as the PR author and GitHub cannot supply a distinct native approval |
 | `ci_status` | *(agent, not scripted)* | see *CI, merge and delivery* below |
@@ -268,8 +271,8 @@ comment.
 
 `gh issue develop <n> --name <branch> --base <base>` creates the branch **server-side, from the fresh
 base, already linked** in the issue's Development sidebar — one command replacing branch creation AND
-recording. `start-branch` uses it, falls back to a local branch off the freshly fetched remote base
-when it fails (a resumed run whose branch already exists), and records branch, base SHA, worktree
+recording. `start-branch` uses it, then fetches and resumes an existing local or remote-only branch
+when it fails; only a branch absent everywhere starts from the fetched base. It records branch, base SHA, worktree
 path and holding run-id on the issue either way. A branch nobody can find from the issue is work
 nobody can follow.
 

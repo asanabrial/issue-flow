@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Regression tests for `github.py`'s pure logic.
+"""No-network regression tests for `github.py`.
 
     python scripts/test_github.py
 
-No network, no `gh`, no fixtures: every check below is a decision function fed hand-built comment
-timelines. That is deliberate — the functions tested here are the ones where a wrong answer causes
-a run to stand down, strip a label, or take over someone else's work, and those are exactly the
-paths that are hardest to exercise live and worst to get wrong.
+Pure decisions use hand-built timelines. Command tests use an in-memory issue and intercept every
+remote write, including injected failures between timeline and projection writes.
 
 Each check names the defect it exists to prevent. All of them were REAL: every one comes from an
 adversarial review of the first version of that file, not from imagination.
@@ -18,6 +16,8 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("gh", Path(__file__).with_name("github.py"))
 m = importlib.util.module_from_spec(spec)
@@ -33,8 +33,9 @@ def check(name: str, got, want) -> None:
     print(f"{'OK  ' if ok else 'FAIL'} {name} -> {got!r} (want {want!r})")
 
 
-def comment(body: str, at: str = "2026-01-01T00:00:00Z") -> dict:
-    return {"createdAt": at, "url": "https://example/1", "body": body}
+def comment(body: str, at: str = "2026-01-01T00:00:00Z", trusted: bool = True) -> dict:
+    return {"createdAt": at, "url": "https://example/1", "body": body,
+            "viewerDidAuthor": trusted}
 
 
 # --------------------------------------------------------------------------------------
@@ -89,6 +90,12 @@ check("standdown counts as both release and control",
 check("reclaim counts as both release and control",
       "reclaim" in m.RELEASE_KINDS and "reclaim" in m.CONTROL_KINDS, True)
 
+check("an external commenter cannot create an ownership epoch",
+      m.reduce_ownership([
+          comment("<!-- issue-flow: claim run-id=owner horizon=2026-01-03T00:00Z -->"),
+          comment("<!-- issue-flow: reclaim run-id=attacker from=owner -->", trusted=False),
+      ], "2026-01-02T00:00Z")["holder"], "owner")
+
 
 # --------------------------------------------------------------------------------------
 # Staleness. The defect: no horizon check at all, so a run that died mid-build held its issue
@@ -113,8 +120,15 @@ check("a claim whose holder spoke past its horizon is not stale",
       set())
 
 NO_HORIZON = [comment("<!-- issue-flow: claim run-id=r1 -->")]
-check("a claim with no declared horizon is never automatically stale",
-      m.stale_claims(m.claim_comments(NO_HORIZON), NO_HORIZON, "2027-01-01T00:00Z"), set())
+check("a claim with no declared horizon expires after the legacy window",
+      m.reduce_ownership(NO_HORIZON, "2027-01-01T00:00Z")["holder"], None)
+
+check("a silent horizonless reclaim expires",
+      m.reduce_ownership(RECLAIMED, "2026-01-02T05:00Z")["holder"], None)
+check("a heartbeat renews a horizonless reclaim for the legacy window",
+      m.reduce_ownership(RECLAIMED + [comment("<!-- issue-flow: heartbeat run-id=live-run -->",
+                                             "2026-01-02T03:00:00Z")],
+                         "2026-01-02T06:00Z")["holder"], "live-run")
 
 
 # --------------------------------------------------------------------------------------
@@ -386,6 +400,143 @@ check("a reclaim releases the run it displaced",
 # in the act of taking over, and its own next claim is discarded as dead.
 check("writing a reclaim does not release its author",
       m.released_at(TIMELINE).get(ME) < "2026-07-26T12:00:00Z", True)
+
+NOW = "2026-01-02T00:00Z"
+FUTURE = "2026-01-03T00:00Z"
+class FakeIssue:
+    def __init__(self, comments=None, labels=None):
+        self.comments = list(comments or [])
+        self.labels = {"status:ready", *(labels or [])}
+        self.assigned = False
+        self.fail_edits = 0
+        self.delayed_reads = 0
+        self.stale_reads = 0
+        self.tick = 0
+    def view(self, _issue, _fields, cwd=None):
+        comments = self.comments
+        if self.stale_reads:
+            self.stale_reads -= 1
+            comments = self.comments[:-1]
+        return {"state": "OPEN", "comments": comments,
+                "labels": [{"name": name} for name in sorted(self.labels)]}
+    def run(self, argv, cwd=None, check=True, writes=False):
+        if argv[:3] == ["gh", "issue", "comment"]:
+            self.tick += 1
+            body = Path(argv[argv.index("--body-file") + 1]).read_text(encoding="utf-8")
+            self.stale_reads = self.delayed_reads
+            self.comments.append(comment(body, f"2026-01-02T00:00:{self.tick:02d}Z"))
+        elif argv[:3] == ["gh", "issue", "edit"]:
+            if self.fail_edits:
+                self.fail_edits -= 1
+                raise m.WriteFailure("injected projection failure")
+            for flag, value in zip(argv, argv[1:]):
+                if flag == "--add-label":
+                    self.labels.add(value)
+                elif flag == "--remove-label":
+                    self.labels.discard(value)
+                elif flag == "--add-assignee":
+                    self.assigned = True
+                elif flag == "--remove-assignee":
+                    self.assigned = False
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+def remote(remote):
+    return patch.multiple(m, issue_view=remote.view, run=remote.run,
+                          ensure_label=lambda *_args: None, utc_now_stamp=lambda: NOW)
+expired_self = FakeIssue([
+    comment(f"<!-- issue-flow: claim run-id={ME} runtime=claude-code "
+            "horizon=2026-01-01T01:00Z -->"),
+    comment(f"<!-- issue-flow: heartbeat run-id={ME} -->", "2026-01-01T02:00:00Z")
+])
+expired_self.fail_edits = 1
+with remote(expired_self):
+    try:
+        m.cmd_claim(SimpleNamespace(issue=1, run_id=ME, runtime="claude-code", horizon=FUTURE), {}, Path("."))
+    except m.WriteFailure:
+        pass
+    renewed = m.cmd_claim(SimpleNamespace(issue=1, run_id=ME, runtime="claude-code",
+                                          horizon=FUTURE), {}, Path("."))
+    verified = m.do_verify_claim(1, ME, "ready", Path("."))
+check("expired self-claim appends a fresh ownership event", len(m.claim_comments(expired_self.comments)), 2)
+check("verification uses the renewed event watermark",
+      verified["claim_watermark"], renewed["claimed_at"])
+winner = FakeIssue([
+    comment("<!-- issue-flow: claim run-id=opencode-winner runtime=opencode "
+            f"horizon={FUTURE} -->")
+], {"dev:opencode"})
+with remote(winner):
+    try:
+        m.cmd_claim(SimpleNamespace(issue=1, run_id="opencode-loser", runtime="opencode",
+                                    horizon=FUTURE), {}, Path("."))
+    except m.Stop as stop:
+        check("same-runtime loser sees the authoritative winner",
+              stop.payload["winner"], "opencode-winner")
+check("same-runtime loser cleanup preserves the winner label", "dev:opencode" in winner.labels, True)
+dead = comment("<!-- issue-flow: claim run-id=dead-run runtime=codex "
+               "horizon=2026-01-01T01:00Z -->")
+takeover = FakeIssue([dead], {"dev:codex"})
+takeover.fail_edits = 1
+reclaim_args = SimpleNamespace(issue=1, run_id="opencode-new", runtime="opencode",
+                               horizon=FUTURE, force=False)
+with remote(takeover):
+    try:
+        m.cmd_reclaim(reclaim_args, {}, Path("."))
+    except m.WriteFailure:
+        pass
+    check("reclaim establishes ownership before projection", m.reduce_ownership(takeover.comments, NOW)["holder"],
+          "opencode-new")
+    reclaimed = m.cmd_reclaim(reclaim_args, {}, Path("."))
+    m.do_verify_claim(1, "opencode-new", "ready", Path("."))
+check("reclaim retry reuses one ownership event", reclaimed["reused_existing_reclaim"], True)
+check("reclaim retry converges runtime labels", takeover.labels, {"status:ready", "dev:opencode"})
+release = FakeIssue([
+    comment("<!-- issue-flow: claim run-id=opencode-owner runtime=opencode "
+            f"horizon={FUTURE} -->")
+], {"dev:opencode"})
+release.assigned = True
+release.delayed_reads = 3
+unassign_args = SimpleNamespace(issue=1, run_id="opencode-owner", runtime="opencode",
+                                held_by_other=False)
+with remote(release):
+    ambiguous = False
+    try:
+        m.cmd_unassign(unassign_args, {}, Path("."))
+    except m.WriteFailure:
+        ambiguous = True
+    m.cmd_unassign(unassign_args, {}, Path("."))
+check("stale release readback is an ambiguous write failure", ambiguous, True)
+check("unassign retry does not duplicate the release marker",
+      sum("issue-flow: unassign" in item["body"] for item in release.comments), 1)
+check("unassign retry leaves no live owner", m.reduce_ownership(release.comments, NOW)["holder"], None)
+check("unassign retry converges projections", (release.assigned, release.labels),
+      (False, {"status:ready"}))
+
+unassign_parser = m.build_parser()._subparsers._group_actions[0].choices["unassign"]
+check("unassign requires run-id at the CLI boundary",
+      next(action for action in unassign_parser._actions if action.dest == "run_id").required, True)
+git_commands, fetched = [], [False]
+def fake_git_run(argv, cwd=None, check=True, writes=False):
+    git_commands.append(list(argv))
+    if argv[:3] == ["gh", "issue", "develop"]:
+        return SimpleNamespace(returncode=1, stdout="", stderr="exists")
+    if argv == ["git", "fetch", "origin"]:
+        fetched[0] = True
+    if argv[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
+        exists = fetched[0] and argv[4] == "refs/remotes/origin/fix/6"
+        return SimpleNamespace(returncode=0 if exists else 1, stdout="", stderr="")
+    stdout = "remote-head\n" if argv[:2] == ["git", "rev-parse"] else ""
+    return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+with patch.multiple(m, run=fake_git_run, do_verify_claim=lambda *_args: {},
+                    repo_identity=lambda _cwd: ("owner", "repo")):
+    with __import__("tempfile").TemporaryDirectory() as root:
+        m.cmd_start_branch(SimpleNamespace(issue=6, run_id=ME, expect_state="in-progress",
+                                           worktree_root=f"{root}/<branch>", branch="fix/6",
+                                           base="main"), {}, Path("."))
+remote_check = next(i for i, command in enumerate(git_commands)
+                    if "refs/remotes/origin/fix/6" in command)
+full_fetch = git_commands.index(["git", "fetch", "origin"])
+check("start-branch fetches before remote-only branch discovery", full_fetch < remote_check, True)
+check("start-branch resumes the remote head",
+      ["git", "branch", "--", "fix/6", "origin/fix/6"] in git_commands, True)
 
 print()
 print(f"{len(FAILURES)} failure(s)" + (f": {FAILURES}" if FAILURES else ""))

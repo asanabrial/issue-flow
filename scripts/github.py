@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
 import json
 import os
 import re
@@ -388,6 +389,32 @@ def claim_comments(comments: list[dict]) -> list[tuple[str, str, dict]]:
     return claims
 
 
+def ownership_events(comments: list[dict]) -> list[dict]:
+    """Parse acquisition events once so every ownership command reads the same timeline."""
+    claims = {id(comment): run_id for _at, run_id, comment in claim_comments(comments)}
+    events = []
+    for position, comment in enumerate(comments):
+        if comment.get("viewerDidAuthor") is not True:
+            continue
+        event = next((mark for mark in parse_markers(comment.get("body", ""))
+                      if mark.get("kind") in {"claim", "reclaim"} and mark.get("run-id")), None)
+        if not event and id(comment) in claims:
+            event = {"kind": "claim", "run-id": claims[id(comment)]}
+        if event:
+            events.append({
+                "created_at": comment.get("createdAt", ""),
+                "position": position,
+                "run_id": event["run-id"],
+                "runtime": event.get("runtime"),
+                "horizon": event.get("horizon"),
+                "kind": event["kind"],
+                "from": event.get("from"),
+                "forced": event.get("forced") == "true",
+                "comment": comment,
+            })
+    return sorted(events, key=lambda item: (item["created_at"], item["position"]))
+
+
 def released_at(comments: list[dict]) -> dict[str, str]:
     """When each run-id last released the item — {run-id: newest release timestamp}.
 
@@ -498,6 +525,58 @@ def stale_claims(claims, comments: list[dict], now: str) -> set[str]:
         if spoke_at is None or spoke_at < horizon:
             stale.add(run_id)
     return stale
+
+
+def reduce_ownership(comments: list[dict], now: str) -> dict:
+    """Return the current live winner and the exact event that established ownership.
+
+    A reclaim starts a new ownership epoch: losing contenders from before the takeover cannot
+    resurrect when the reclaimed run releases. Within an epoch, each run's newest acquisition is
+    its proof, while the earliest live run still wins a normal claim race.
+    """
+    events = [event for event in ownership_events(comments)
+              if event["kind"] != "reclaim" or valid_reclaim(event, comments)]
+    takeovers = [index for index, event in enumerate(events) if event["kind"] == "reclaim"]
+    candidates = events[takeovers[-1]:] if takeovers else events
+    valid_reclaims = {event["position"] for event in events if event["kind"] == "reclaim"}
+    release_positions = {
+        mark[attr]: position for position, comment in enumerate(comments)
+        if comment.get("viewerDidAuthor") is True
+        for mark in parse_markers(comment.get("body", ""))
+        if mark.get("kind") != "reclaim" or position in valid_reclaims
+        for attr in RELEASE_ATTRS_BY_KIND.get(mark.get("kind"), ()) if mark.get(attr)}
+    latest_by_run = {}
+    for event in candidates:
+        if event["position"] > release_positions.get(event["run_id"], -1):
+            latest_by_run[event["run_id"]] = event
+
+    moment = parse_stamp(now)
+    trusted = [comment for comment in comments if comment.get("viewerDidAuthor") is True]
+    live, stale = [], []
+    for event in sorted(latest_by_run.values(), key=lambda item: (item["created_at"], item["position"])):
+        horizon = parse_stamp(event["horizon"])
+        spoke_at = parse_stamp(last_activity_by(trusted, event["run_id"])) or parse_stamp(event["created_at"])
+        deadline = horizon or (spoke_at + datetime.timedelta(hours=4) if spoke_at else None)
+        expired_silent = bool(moment and deadline and deadline < moment
+                              and (not horizon or spoke_at is None or spoke_at < horizon))
+        (stale if expired_silent else live).append(event)
+
+    winner = live[0] if live else None
+    return {"holder": winner["run_id"] if winner else None, "event": winner, "live": live, "stale": stale}
+
+
+def holder_uses_runtime(event: dict | None, runtime: str) -> bool:
+    """Markers now carry runtime; the run-id prefix preserves compatibility with old markers."""
+    return bool(event and (
+        event.get("runtime") == runtime or event["run_id"].startswith(f"{runtime}-")
+    ))
+
+
+def valid_reclaim(event: dict, comments: list[dict]) -> bool:
+    prior = reduce_ownership(comments[:event["position"]], event["created_at"])
+    target = prior["event"] or (prior["stale"][0] if prior["stale"] else None)
+    return bool(target and target["run_id"] == event["from"]
+                and (prior["holder"] is None or event["forced"]))
 
 
 def utc_now_stamp() -> str:
@@ -811,7 +890,7 @@ def label_names(data: dict) -> list[str]:
 
 def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
                     allow_closed_by_pr: int | None = None) -> dict:
-    """One read, three checks. A failed CHECK is a stop instruction; a failed READ is nothing.
+    """One ownership read, four checks. A failed CHECK is a stop; a failed READ is nothing.
 
     That distinction is the whole point: SKILL.md records a run that lost a claim race by five
     seconds, was told so 33 seconds later, and then worked another ~48 minutes because nothing in
@@ -855,11 +934,23 @@ def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
         )
 
     comments = data.get("comments", [])
-    mine = [c for at, rid, c in claim_comments(comments) if rid == run_id]
-    watermark = mine[0].get("createdAt", "") if mine else ""
+    ownership = reduce_ownership(comments, utc_now_stamp())
+    if ownership["holder"] != run_id:
+        holder = ownership["holder"]
+        raise Stop(
+            {
+                "ok": False,
+                "reason": "not-current-live-holder",
+                "detail": f"current live holder is {holder or 'none'}, not {run_id}",
+                "action": "stop; release only your own projection and write nothing else",
+            }
+        )
+    watermark = ownership["event"]["created_at"]
 
     for comment in comments:
         if comment.get("createdAt", "") <= watermark:
+            continue
+        if comment.get("viewerDidAuthor") is not True:
             continue
         body = comment.get("body", "")
         marks = parse_markers(body)
@@ -893,6 +984,7 @@ def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
         "checked": [
             f"closed-by-own-pr-{allow_closed_by_pr}" if closed_by_own_pr else "issue-open",
             "single-expected-state",
+            "current-live-holder",
             "no-control-message",
         ],
     }
@@ -1006,59 +1098,30 @@ def cmd_list_state(args, config, cwd) -> dict:
 
 
 def cmd_claim(args, config, cwd) -> dict:
-    """Assign, comment, then adjudicate by the comment timeline.
+    """Append ownership, adjudicate it, then converge assignee and runtime-label projections.
 
     Re-reading the assignee cannot adjudicate this: agents authenticate as ONE shared account, so
     `--add-assignee @me` twice leaves exactly one assignee and the re-read shows a clean issue
     assigned to you while another run is already building it.
     """
     ensure_label(f"dev:{args.runtime}", "bfd4f2", cwd)
-    run(["gh", "issue", "edit", str(args.issue), "--add-assignee", "@me"], cwd=cwd, writes=True)
-
-    # Idempotent on retry. `claim` is four writes and a read; if it dies after the comment lands,
-    # the caller re-runs it — and a second claim comment for the same run muddies the very record
-    # the race is adjudicated from. So look for our own claim first and reuse it. This is also
-    # what makes the retry advice on a failed write safe to follow at all.
-    #
-    # Reuse only a claim that is still LIVE. A claim I made and then RELEASED is a historical
-    # record, not a holding, so reusing it posts nothing and leaves the run with no live claim at
-    # all — after which adjudication finds none and reports a write that never propagated.
-    # Seen live (2026-07-26, issue #70): a run claimed, released under a blocker, then tried to
-    # resume; the guard kept handing back the released claim and `claim` failed with a diagnosis
-    # naming the wrong cause, twice, until the timeline was read by hand.
     existing_comments = issue_view(args.issue, "comments", cwd=cwd).get("comments", [])
-    existing = claim_comments(existing_comments)
-    prior_releases = released_at(existing_comments)
-    already_mine = [
-        at for at, rid, _ in existing
-        if rid == args.run_id and claim_is_live(at, rid, prior_releases)
-    ]
+    before = reduce_ownership(existing_comments, utc_now_stamp())
+    already_mine = next((event for event in before["live"] if event["run_id"] == args.run_id and (not parse_stamp(event["horizon"]) or parse_stamp(event["horizon"]) >= parse_stamp(utc_now_stamp()))), None)
 
     if not already_mine:
         body = (
             f"Claimed by {args.run_id}, expect to report by {args.horizon}.\n\n"
-            f"{marker('claim', run_id=args.run_id, horizon=args.horizon)}\n"
+            f"{marker('claim', run_id=args.run_id, runtime=args.runtime, horizon=args.horizon)}\n"
         )
         with body_file(body) as path:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", path],
                 cwd=cwd, writes=True)
 
-    data = issue_view(args.issue, "comments", cwd=cwd)
-    comments = data.get("comments", [])
-    claims = claim_comments(comments)
-    released = released_at(comments)
-    # A claim that blew its own declared horizon in silence is not a competitor, it is a corpse.
-    # Without this the earliest claim wins forever and a dead run holds its issue permanently.
-    expired = stale_claims(claims, comments, utc_now_stamp())
-    dead = expired - {args.run_id}
-    # A release only kills the claims that PRECEDE it, so a re-claim after a deliberate release
-    # counts (released_at). Expiry stays run-id-wide: a horizon nobody renewed is about the run.
-    live = [
-        (at, rid) for at, rid, _ in claims
-        if rid not in dead and claim_is_live(at, rid, released)
-    ]
-
-    if not live:
+    ownership = reduce_ownership(
+        issue_view(args.issue, "comments", cwd=cwd).get("comments", []), utc_now_stamp()
+    )
+    if not ownership["event"]:
         # The write succeeded but the timeline has not caught up. Say so as a WRITE failure: the
         # comment exists, so "retry the read" is the right action and "retry the whole command"
         # is not. The idempotence guard above makes even a full retry safe, but the caller should
@@ -1068,7 +1131,8 @@ def cmd_claim(args, config, cwd) -> dict:
             "re-running `claim` will reuse the existing comment rather than post a second one"
         )
 
-    winner_at, winner = live[0]
+    winner = ownership["holder"]
+    winner_at = ownership["event"]["created_at"]
     if winner != args.run_id:
         # Losing is cheap and takes seconds; two runs building the same issue is not.
         with body_file(
@@ -1077,30 +1141,32 @@ def cmd_claim(args, config, cwd) -> dict:
         ) as path:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", path],
                 cwd=cwd, writes=True)
-        # Only the per-runtime label comes off. `@me` is the shared account and removing it would
-        # strip the winner, who is holding the item right now.
-        run(["gh", "issue", "edit", str(args.issue), "--remove-label", f"dev:{args.runtime}"],
-            cwd=cwd, check=False)
+        # The runtime label is shared by all its runs, so a same-runtime winner still needs it.
+        if not holder_uses_runtime(ownership["event"], args.runtime):
+            run(["gh", "issue", "edit", str(args.issue), "--remove-label", f"dev:{args.runtime}"],
+                cwd=cwd, check=False, writes=True)
         raise Stop(
             {
                 "ok": False,
                 "reason": "lost-claim-race",
                 "winner": winner,
                 "winner_claimed_at": winner_at,
-                "action": "stood down and released your dev label; take the next item",
+                "action": "stood down; preserved any projection still required by the winner",
             }
         )
 
-    run(["gh", "issue", "edit", str(args.issue), "--add-label", f"dev:{args.runtime}"],
-        cwd=cwd, writes=True)
+    run(["gh", "issue", "edit", str(args.issue), "--add-assignee", "@me",
+         "--add-label", f"dev:{args.runtime}"], cwd=cwd, writes=True)
     return {
         "ok": True,
         "issue": args.issue,
         "run_id": args.run_id,
         "reused_existing_claim": bool(already_mine),
-        "superseded_expired_claims": sorted(expired - {args.run_id}),
+        "superseded_expired_claims": sorted({
+            event["run_id"] for event in before["stale"] if event["run_id"] != args.run_id
+        }),
         "claimed_at": winner_at,
-        "horizon": args.horizon,
+        "horizon": ownership["event"]["horizon"] or args.horizon,
         "next": "transition to in-progress before any repository write",
     }
 
@@ -1111,36 +1177,33 @@ def cmd_verify_claim(args, config, cwd) -> dict:
 
 
 def cmd_reclaim(args, config, cwd) -> dict:
-    """Take over work whose holder never came back.
-
-    The record of the takeover matters more than the takeover, so the comment goes FIRST and names
-    who it was taken from. If the original holder was alive and merely slow, its next renewal reads
-    this and backs off exactly like the loser of a claim race — which is why the marker carries
-    `from`, and why `released_at` treats a reclaim as releasing that run and NOT its author.
-
-    The dead run's `dev:<runtime>` marker is removed as ours goes on. It cannot do that itself,
-    which is the whole reason this command exists; skip it and the item claims two runtimes hold it.
-    """
+    """Atomically in timeline terms displace a holder and establish the new live owner."""
     data = issue_view(args.issue, "state,labels,comments", cwd=cwd)
     if data.get("state") != "OPEN":
         raise Stop({"ok": False, "reason": "issue-not-open",
                     "action": "nothing to reclaim on a closed issue"})
 
     comments = data.get("comments", [])
-    claims = claim_comments(comments)
-    released = released_at(comments)
-    holders = [(at, rid) for at, rid, _ in claims if claim_is_live(at, rid, released)]
-    if not holders:
+    before = reduce_ownership(comments, utc_now_stamp())
+    current = before["event"]
+    reused = bool(current and current["run_id"] == args.run_id and current["kind"] == "reclaim")
+    if reused:
+        holder = current["from"]
+        held_at = current["created_at"]
+    elif current:
+        held_at, holder = current["created_at"], current["run_id"]
+    elif before["stale"]:
+        held_at, holder = before["stale"][0]["created_at"], before["stale"][0]["run_id"]
+    else:
         raise Stop({"ok": False, "reason": "nothing-to-reclaim",
                     "action": "no live claim on this issue — use `claim` instead"})
 
-    held_at, holder = holders[0]
-    if holder == args.run_id:
+    if not reused and holder == args.run_id:
         raise Stop({"ok": False, "reason": "already-yours",
                     "action": f"{args.run_id} is already the live claimant"})
 
-    expired = stale_claims(claims, comments, utc_now_stamp())
-    if holder not in expired and not args.force:
+    stale_holders = {event["run_id"] for event in before["stale"]}
+    if not reused and holder not in stale_holders and not args.force:
         raise Stop(
             {
                 "ok": False,
@@ -1153,14 +1216,24 @@ def cmd_reclaim(args, config, cwd) -> dict:
             }
         )
 
-    with body_file(
-        f"Reclaiming from `{holder}`; last activity {last_activity_by(comments, holder) or 'none'}, "
-        f"claimed at {held_at}.\n\n"
-        f"Taken over by `{args.run_id}`. Nothing the previous run left will be discarded — its "
-        f"branch, diagnosis and ruled-out hypotheses stay valid.\n\n"
-        f"{marker('reclaim', run_id=args.run_id, **{'from': holder})}\n"
-    ) as note:
-        run(["gh", "issue", "comment", str(args.issue), "--body-file", note], cwd=cwd, writes=True)
+    if not reused:
+        horizon = args.horizon or (
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=4)
+        ).strftime("%Y-%m-%dT%H:%MZ")
+        with body_file(
+            f"Reclaiming from `{holder}`; last activity {last_activity_by(comments, holder) or 'none'}, "
+            f"claimed at {held_at}.\n\nTaken over by `{args.run_id}`; expect to report by {horizon}. "
+            f"Nothing the previous run left will be discarded.\n\n"
+            f"{marker('reclaim', run_id=args.run_id, runtime=args.runtime, horizon=horizon, forced='true' if args.force else None, **{'from': holder})}\n"
+        ) as note:
+            run(["gh", "issue", "comment", str(args.issue), "--body-file", note],
+                cwd=cwd, writes=True)
+
+        current = reduce_ownership(
+            issue_view(args.issue, "comments", cwd=cwd).get("comments", []), utc_now_stamp()
+        )["event"]
+        if not current or current["run_id"] != args.run_id:
+            raise WriteFailure("reclaim comment landed but did not establish the requested live holder")
 
     ensure_label(f"dev:{args.runtime}", "bfd4f2", cwd)
     edit = ["gh", "issue", "edit", str(args.issue), "--add-assignee", "@me",
@@ -1176,6 +1249,7 @@ def cmd_reclaim(args, config, cwd) -> dict:
         "reclaimed_from": holder,
         "run_id": args.run_id,
         "forced": bool(args.force),
+        "reused_existing_reclaim": reused,
         "next": "read what the dead run left on the issue — the work may be further along than the label",
     }
 
@@ -1449,14 +1523,14 @@ def cmd_start_branch(args, config, cwd) -> dict:
     )
     linked = developed.returncode == 0
     if not linked:
-        # The branch may already exist from a resumed run; fall back to a local branch off the
-        # fresh remote base and record it in prose, which is what the binding prescribes.
+        # Discover every remote branch before deciding this one is absent. Fetching only the base
+        # leaves a remote-only resumed branch invisible and restarts it from the base.
         #
         # `--` closes option parsing. Without it a branch name beginning with `-` is read as a
         # flag: `git branch --force -D origin/main` deletes the branch literally named
         # `origin/main` instead of creating one called `-D`. Nothing upstream validates the value,
         # and this call runs with check=False, so the damage would be silent.
-        run(["git", "fetch", "origin", "--", args.base], cwd=cwd)
+        run(["git", "fetch", "origin"], cwd=cwd)
 
         exists_local = run(
             ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{args.branch}"],
@@ -1472,9 +1546,10 @@ def cmd_start_branch(args, config, cwd) -> dict:
         )
         if start_point is not None:
             run(["git", "branch", "--", args.branch, start_point],
-                cwd=cwd, check=False, writes=True)
+                cwd=cwd, writes=True)
 
-    run(["git", "fetch", "origin"], cwd=cwd)
+    if linked:
+        run(["git", "fetch", "origin"], cwd=cwd)
     if not resuming:
         path.parent.mkdir(parents=True, exist_ok=True)
         run(["git", "worktree", "add", "--", str(path), args.branch], cwd=cwd, writes=True)
@@ -1849,25 +1924,43 @@ def cmd_changelog_notes(args, config, cwd) -> dict:
 
 
 def cmd_unassign(args, config, cwd) -> dict:
-    """Release work. `dev:<runtime>` means HOLDING, so it comes off the moment you stop.
-
-    The `--held-by-other` form is the exception: on a lost race or a stand-down, `@me` is the
-    shared account and removing it would strip the run that is actually holding the item.
-    """
-    edit = ["gh", "issue", "edit", str(args.issue), "--remove-label", f"dev:{args.runtime}"]
-    if not args.held_by_other:
-        edit.extend(["--remove-assignee", "@me"])
-    run(edit, cwd=cwd, writes=True)
-    if args.run_id:
+    """Release in the timeline first, then remove only projections no live holder needs."""
+    data = issue_view(args.issue, "labels,comments", cwd=cwd)
+    ownership = reduce_ownership(data.get("comments", []), utc_now_stamp())
+    events = ownership["live"] + ownership["stale"]
+    mine = next((event for event in events if event["run_id"] == args.run_id), None)
+    after = None
+    if mine:
         with body_file(
-            f"`{args.run_id}` releasing this item.\n\n{marker('standdown', run_id=args.run_id)}\n"
+            f"`{args.run_id}` releasing this item.\n\n{marker('unassign', run_id=args.run_id)}\n"
         ) as note:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", note],
                 cwd=cwd, writes=True)
+        for _attempt in range(3):
+            try:
+                after = issue_view(args.issue, "labels,comments", cwd=cwd)
+            except ReadFailure:
+                continue
+            if any(index > mine["position"] and comment.get("viewerDidAuthor") is True
+                   and marker("unassign", run_id=args.run_id) in comment.get("body", "")
+                   for index, comment in enumerate(after.get("comments", []))):
+                break
+        else:
+            raise WriteFailure("release comment may have landed but was not visible after three reads")
+
+    after = after or issue_view(args.issue, "labels,comments", cwd=cwd)
+    ownership = reduce_ownership(after.get("comments", []), utc_now_stamp())
+    edit = ["gh", "issue", "edit", str(args.issue)]
+    if not holder_uses_runtime(ownership["event"], args.runtime):
+        edit.extend(["--remove-label", f"dev:{args.runtime}"])
+    if not ownership["holder"] and not args.held_by_other:
+        edit.extend(["--remove-assignee", "@me"])
+    if len(edit) > 4:
+        run(edit, cwd=cwd, writes=True)
     return {
         "ok": True,
         "issue": args.issue,
-        "assignee_kept": bool(args.held_by_other),
+        "assignee_kept": bool(ownership["holder"] or args.held_by_other),
     }
 
 
@@ -1978,7 +2071,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime", required=True)
     p.add_argument("--horizon", required=True, help="when you expect to report, e.g. 2026-07-25T23:00Z")
 
-    p = sub.add_parser("verify-claim", help="the renewal: one read, three checks")
+    p = sub.add_parser("verify-claim", help="the renewal: prove current live ownership and state")
     p.add_argument("--issue", type=int, required=True)
     p.add_argument("--run-id", required=True)
     p.add_argument("--expect-state", required=True, choices=STATES)
@@ -1990,6 +2083,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--issue", type=int, required=True)
     p.add_argument("--run-id", required=True)
     p.add_argument("--runtime", required=True)
+    p.add_argument("--horizon", help="new ownership horizon; defaults to four hours from now")
     p.add_argument("--force", action="store_true",
                    help="reclaim a holder whose horizon has NOT passed — needs a defensible reason")
 
@@ -2031,7 +2125,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("unassign", help="release the item without changing its state")
     p.add_argument("--issue", type=int, required=True)
     p.add_argument("--runtime", required=True)
-    p.add_argument("--run-id")
+    p.add_argument("--run-id", required=True)
     p.add_argument("--held-by-other", action="store_true",
                    help="lost race or stand-down: keep the shared assignee, drop only your label")
 
