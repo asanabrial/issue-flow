@@ -91,6 +91,7 @@ FORCED_EVIDENCE_SINCE = "2026-07-27T19:00:00Z"
 # migration that keeps already-written v2 forced events valid.
 FORCED_EVIDENCE_HEADING = "Forced takeover reason and evidence:"
 COMMENT_KINDS = frozenset({"note", "blocker", "diagnosis"})
+ACTIVITY_KINDS = frozenset({"heartbeat", "branch", "published"})
 
 # The two marker vocabularies, named once.
 #
@@ -499,17 +500,15 @@ def claim_is_live(claimed_at: str, run_id: str, released: dict[str, str]) -> boo
     return claimed_at > released.get(run_id, "")
 
 
-def last_activity_by(comments: list[dict], run_id: str) -> str:
-    """The newest timestamp on which this run said anything. '' when it never did."""
+def last_activity_by(comments: list[dict], run_id: str, after: str = "") -> str:
+    """Newest trusted liveness marker authored by this run; mentions and targets do not count."""
     stamps = [
         comment.get("createdAt", "")
         for comment in comments
-        if any(
-            mark.get(attr) == run_id
-            for mark in parse_markers(comment.get("body", ""))
-            for attr in TARGET_ATTRS
-        )
-        or run_id in (comment.get("body") or "")
+        if comment.get("viewerDidAuthor") is True
+        and stamp_order(comment.get("createdAt", "")) > stamp_order(after)
+        and any(mark.get("run-id") == run_id and mark.get("kind") in ACTIVITY_KINDS
+                for mark in parse_markers(comment.get("body", "")))
     ]
     return max(stamps) if stamps else ""
 
@@ -552,35 +551,18 @@ def require_horizon(value: str, after: str | None = None) -> str:
     return value
 
 
+def ownership_deadline(horizon, acquired_at, spoke_at):
+    activity = spoke_at + datetime.timedelta(hours=4) if spoke_at else None
+    if horizon and acquired_at and horizon <= acquired_at:
+        return horizon
+    if horizon and acquired_at and spoke_at and spoke_at > acquired_at:
+        return max(horizon, activity)
+    return horizon or activity
+
+
 def stale_claims(claims, comments: list[dict], now: str) -> set[str]:
-    """Claims whose declared horizon has passed with no word from the holder since.
-
-    This is the mechanical half of SKILL.md's reclaim rule. Without it a run that died mid-build
-    holds its issue forever: `claim` re-reads the timeline, finds that never-released claim as the
-    earliest live entry, and tells a live run it lost a race to a process that no longer exists —
-    reproducing the exact "abandoned work" incident this script was written against.
-
-    Deliberately conservative. A horizon is a heuristic, not a lease: only a claim that BOTH
-    declared a horizon and has been silent past it counts as stale. A claim with no horizon is
-    left alone here, because judging "a few hours is long enough" belongs to a human or to the
-    explicit `reclaim` command, not to an automatic adjudication.
-    """
-    moment = parse_stamp(now)
-    if moment is None:
-        return set()
-    stale = set()
-    for _created_at, run_id, comment in claims:
-        horizon = None
-        for mark in parse_markers(comment.get("body", "")):
-            if mark.get("kind") == "claim" and mark.get("horizon"):
-                horizon = parse_stamp(mark["horizon"])
-        # An unparseable or absent horizon is "unknown", never "expired".
-        if horizon is None or horizon >= moment:
-            continue
-        spoke_at = parse_stamp(last_activity_by(comments, run_id))
-        if spoke_at is None or spoke_at < horizon:
-            stale.add(run_id)
-    return stale
+    """Compatibility wrapper over the authoritative reducer's stale set."""
+    return {event["run_id"] for event in reduce_ownership(comments, now)["stale"]}
 
 
 def reduce_ownership(comments: list[dict], now: str) -> dict:
@@ -620,11 +602,10 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
                         key=lambda item: (stamp_order(item["created_at"]), item["position"])):
         horizon = parse_stamp(event["horizon"])
         acquired_at = parse_stamp(event["created_at"])
-        spoke_at = parse_stamp(last_activity_by(trusted, event["run_id"])) or parse_stamp(event["created_at"])
-        deadline = horizon or (spoke_at + datetime.timedelta(hours=4) if spoke_at else None)
-        expired_silent = bool(moment and deadline and deadline < moment
-                              and (not horizon or spoke_at is None or spoke_at < horizon
-                                   or (acquired_at and horizon <= acquired_at)))
+        spoke_at = (parse_stamp(last_activity_by(trusted, event["run_id"], event["created_at"]))
+                    or parse_stamp(event["created_at"]))
+        deadline = ownership_deadline(horizon, acquired_at, spoke_at)
+        expired_silent = bool(moment and deadline and deadline < moment)
         (stale if expired_silent else live).append(event)
 
     winner = live[0] if live else None
@@ -649,7 +630,9 @@ def valid_reclaim(event: dict, comments: list[dict]) -> bool:
         if marker_at < 0 or heading_at < 0 or not evidence or MARKER_RE.search(evidence):
             return False
     prior = reduce_ownership(comments[:event["position"]], event["created_at"])
-    target = prior["event"] or (prior["stale"][0] if prior["stale"] else None)
+    target = prior["event"] or next(
+        (candidate for candidate in prior["stale"] if candidate["run_id"] == event["from"]), None
+    )
     return bool(target and target["run_id"] == event["from"]
                 and (prior["holder"] is None or event["forced"]))
 
@@ -1021,9 +1004,10 @@ def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
             }
         )
     watermark = ownership["event"]["created_at"]
+    watermark_position = ownership["event"]["position"]
 
-    for comment in comments:
-        if comment.get("createdAt", "") <= watermark:
+    for position, comment in enumerate(comments):
+        if position <= watermark_position:
             continue
         if comment.get("viewerDidAuthor") is not True:
             continue
@@ -1184,6 +1168,11 @@ def cmd_claim(args, config, cwd) -> dict:
                           horizon=require_horizon(args.horizon, now))
     existing_comments = issue_view(args.issue, "comments", cwd=cwd).get("comments", [])
     before = reduce_ownership(existing_comments, now)
+    foreign_stale = {event["run_id"] for event in before["stale"]
+                     if event["run_id"] != args.run_id}
+    if not before["holder"] and foreign_stale:
+        raise Stop({"ok": False, "reason": "stale-foreign-requires-reclaim",
+                    "holders": sorted(foreign_stale)})
     mine = next((event for event in before["live"] if event["run_id"] == args.run_id
                  and (not parse_stamp(event["horizon"])
                       or parse_stamp(event["horizon"]) >= parse_stamp(now))), None)
@@ -1289,7 +1278,10 @@ def cmd_reclaim(args, config, cwd) -> dict:
     elif current:
         held_at, holder = current["created_at"], current["run_id"]
     elif before["stale"]:
-        held_at, holder = before["stale"][0]["created_at"], before["stale"][0]["run_id"]
+        target = next((event for event in before["stale"] if event["run_id"] != args.run_id), None)
+        if not target:
+            raise Stop({"ok": False, "reason": "stale-self-requires-claim"})
+        held_at, holder = target["created_at"], target["run_id"]
     else:
         raise Stop({"ok": False, "reason": "nothing-to-reclaim",
                     "action": "no live claim on this issue — use `claim` instead"})
@@ -2041,10 +2033,28 @@ def cmd_unassign(args, config, cwd) -> dict:
     ownership = reduce_ownership(data.get("comments", []), utc_now_stamp())
     events = ownership["live"] + ownership["stale"]
     mine = next((event for event in events if event["run_id"] == args.run_id), None)
+    releases = [mark for comment in data.get("comments", [])
+                if comment.get("viewerDidAuthor") is True
+                for mark in parse_markers(comment.get("body", ""))
+                if mark.get("kind") == "unassign" and mark.get("run-id") == args.run_id]
+    if not mine and not releases:
+        raise Stop({"ok": False, "reason": "nothing-to-unassign"})
+    projected = {name for name in label_names(data) if name.startswith("dev:")}
+    if not mine and ((releases[-1].get("runtime") and releases[-1]["runtime"] != args.runtime)
+                     or (not releases[-1].get("runtime")
+                         and not args.run_id.startswith(f"{args.runtime}-"))):
+        raise Stop({"ok": False, "reason": "unassign-metadata-mismatch"})
+    other_live = any(event["run_id"] != args.run_id for event in ownership["live"])
+    if args.held_by_other and not other_live:
+        raise Stop({"ok": False, "reason": "held-by-other-without-other-holder"})
     after = None
     if mine:
+        if ((mine["runtime"] and mine["runtime"] != args.runtime)
+                or (not mine["runtime"] and projected != {f"dev:{args.runtime}"})):
+            raise Stop({"ok": False, "reason": "unassign-metadata-mismatch"})
         with body_file(
-            f"`{args.run_id}` releasing this item.\n\n{marker('unassign', run_id=args.run_id)}\n"
+            f"`{args.run_id}` releasing this item.\n\n"
+            f"{marker('unassign', run_id=args.run_id, runtime=args.runtime)}\n"
         ) as note:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", note],
                 cwd=cwd, writes=True)
@@ -2054,7 +2064,8 @@ def cmd_unassign(args, config, cwd) -> dict:
             except ReadFailure:
                 continue
             if any(index > mine["position"] and comment.get("viewerDidAuthor") is True
-                   and marker("unassign", run_id=args.run_id) in comment.get("body", "")
+                   and marker("unassign", run_id=args.run_id, runtime=args.runtime)
+                   in comment.get("body", "")
                    for index, comment in enumerate(after.get("comments", []))):
                 break
         else:
@@ -2065,14 +2076,16 @@ def cmd_unassign(args, config, cwd) -> dict:
     edit = ["gh", "issue", "edit", str(args.issue)]
     if not holder_uses_runtime(ownership["event"], args.runtime):
         edit.extend(["--remove-label", f"dev:{args.runtime}"])
-    if not ownership["holder"] and not args.held_by_other:
+    if not ownership["holder"]:
         edit.extend(["--remove-assignee", "@me"])
     if len(edit) > 4:
         run(edit, cwd=cwd, writes=True)
+    if args.held_by_other and not ownership["holder"]:
+        raise Stop({"ok": False, "reason": "held-by-other-holder-disappeared"})
     return {
         "ok": True,
         "issue": args.issue,
-        "assignee_kept": bool(ownership["holder"] or args.held_by_other),
+        "assignee_kept": bool(ownership["holder"]),
     }
 
 
@@ -2197,7 +2210,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime", required=True)
     p.add_argument("--horizon", help="new ownership horizon; defaults to four hours from now")
     p.add_argument("--force", action="store_true",
-                   help="reclaim a holder whose horizon has NOT passed — needs a defensible reason")
+                   help="reclaim a holder who is not stale — needs a defensible reason")
     p.add_argument("--reason-file", help="evidence required when --force creates a new event")
 
     p = sub.add_parser("transition", help="mirror the board, swap the label, read BOTH back")
@@ -2240,7 +2253,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime", required=True)
     p.add_argument("--run-id", required=True)
     p.add_argument("--held-by-other", action="store_true",
-                   help="lost race or stand-down: keep the shared assignee, drop only your label")
+                   help="assert that the reducer still has another live holder after this release")
 
     p = sub.add_parser("changelog-notes",
                        help="extract a version's changelog entry, to carry into its tag/Release")

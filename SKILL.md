@@ -306,10 +306,9 @@ already timestamps: no daemon, no lock service, nothing to run.
 
 - **Declare a horizon when you claim** (step 2, inside the claim comment). One extra clause in a comment you already write, and
   it turns "no activity" from a judgement call into a comparison.
-- **Comment on progress, not only on completion.** From outside, a dev that has gone quiet for an
-  hour and a dev that died look identical. Each comment is a heartbeat carrying a server-side
-  timestamp; that is the liveness half of the mechanism. The other half is the read that precedes
-  the write — see below.
+- **Post progress through the binding's heartbeat operation, not a generic note.** From outside, a
+  quiet dev and a dead one look identical; the verified heartbeat carries the server timestamp that
+  extends liveness. A note, blocker or diagnosis records context but cannot renew ownership.
 
 **A heartbeat is a claim renewal: read before you write.** The claim check in step 2 runs once, but
 the control surface it read stays authoritative for the whole build — a late adjudication, a reclaim,
@@ -346,9 +345,9 @@ lets a flaky network halt every run; treating it as clearance lets a run write d
 defect this rule exists to close.
 
 **Reclaiming.** An issue is reclaimable when it carries an assignee and/or a claim comment naming a
-run-id — **in any state, not only `in-progress`** — and its last activity — any comment, label
-change or referenced commit — is past the declared horizon, or more than a few hours old when no
-horizon was declared. The state label is deliberately not part of the precondition: it is exactly
+run-id — **in any state, not only `in-progress`** — and the holder's last attributed activity is past
+the declared horizon plus its bounded renewal window, or more than a few hours old when no horizon
+was declared. Unrelated activity and control targets do not renew a holder. The state label is exactly
 what a dead run may never have gotten to write, so a claimed issue still wearing `status:ready` or
 `status:review` is reclaimable by the same rule as one caught mid-build under `in-progress`. Then:
 
