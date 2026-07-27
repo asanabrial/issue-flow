@@ -11,8 +11,8 @@ and runs still skipped them. The two incidents this script was written against:
     mirrored the project board ZERO times in an entire session with the `project` scope present
     the whole way. Not a missing permission, not an unclear config: the instruction was present
     and the run never executed it.
-  * SKILL.md "Abandoned work" — five issues claimed and commented, none ever relabeled, because
-    `claim` and `transition` are two separate calls and nothing forced the second.
+  * `references/safety-incidents.md` incident I06 — five issues were claimed and commented but never
+    relabeled, because `claim` and `transition` are two separate calls and nothing forced the second.
 
 Prose cannot fix a run that does not execute prose. Everything here is a step that is
 MECHANICAL AND VERIFIABLE, so it is executed by a program instead of remembered by an agent.

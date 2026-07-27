@@ -9,18 +9,23 @@ protection only when the surviving executable or document owner changes.
 These requirements are tracker-neutral. The selected binding and its scripts own detailed queries,
 ordering, mutations, and readbacks; they may strengthen, but never weaken, this procedure.
 
-- A claim MUST declare a horizon and report progress with heartbeats. Before writing each heartbeat,
-  before the first repository write, and before every expensive or irreversible boundary, the holder
-  MUST successfully verify the authoritative state and activity. Closure, departure from the working
-  state, or a control message revoking the claim is a stop instruction. An unreadable or ambiguous
-  control surface fails closed: write nothing and start no boundary action until verification succeeds.
-- Claimed work in any workflow state is reclaimable once its authoritative activity is past its
-  horizon, or past the binding's declared legacy inactivity window when no horizon exists. A forced
-  takeover before that boundary MUST state its exceptional reason and evidence in the audit trail.
-  The reclaimer MUST comment the takeover, take ownership, and verify that ownership
+- A claim MUST declare a horizon and report progress with heartbeats. A heartbeat renews authority by
+  successfully reading before it writes; it records liveness but is not a silent lease extension.
+  Before the first repository write and every expensive or irreversible boundary, the holder MUST
+  likewise verify the authoritative ownership, state, and activity. Closure, departure from the
+  working state, or a control message revoking the claim is a stop instruction. An unreadable or
+  ambiguous control surface fails closed: write nothing and start no boundary action until the read
+  succeeds.
+- Work with an ownership projection and/or claim event is reclaimable from any workflow state once
+  its authoritative activity is past its horizon, or after four hours of inactivity when legacy or
+  partial ownership has no horizon. A forced takeover before that boundary MUST be preceded by an
+  audit comment stating its exceptional reason and evidence; the binding also marks the takeover as
+  forced. The reclaimer MUST comment the takeover, take ownership, and verify that ownership
   before repository writes. Retain and adopt prior branches, diffs, diagnoses, ruled-out hypotheses,
-  and evidence, then transition directly to the state those artifacts support. A displaced holder
-  MUST stop on its next renewal without changing the new holder's state.
+  and evidence, then transition directly to the state those artifacts support.
+- A displaced holder MUST stop on its next renewal. If the item remains open, acknowledge once, use
+  the binding's safe release path to remove only that run's attribution while preserving projections
+  needed by the winner, and write no second claim. Never change the new holder's workflow state.
 - Handoff goes to `analysis` for a wrong or incoherent specification, `blocked` for unbuilt work
   awaiting an external change, `review` for built work awaiting delivery, or `ready` for a useful
   diagnosis that still needs implementation. Record the exact blocker and its discharger. Persist

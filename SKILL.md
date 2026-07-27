@@ -14,7 +14,7 @@ metadata:
 Use for `issue-flow analyst [conditions]`, `issue-flow dev [domain-rules] [issue-number]`, analyst or developer work, claims, and workflow-state transitions.
 Analyst conditions and dev domains are optional: a bounded target is the scope; otherwise the analyst audits the repository and the dev implements the selected issue.
 Read repository instructions first and load only the tracker binding selected by operator configuration before tracker work.
-Load [domain composition](references/domain-composition.md) for handoff, priority, or routing rules; [runtime notes](references/runtime-notes.md) for invocation, delegation, or team mechanics; and [safety incidents](references/safety-incidents.md) for race, reclaim, handoff, or failure rationale.
+Load [domain composition](references/domain-composition.md) for handoff, priority, or routing rules; [runtime notes](references/runtime-notes.md) for invocation, delegation, or team mechanics; and the [portable safety procedure](references/safety-incidents.md#portable-safety-procedure) for heartbeat, reclaim, or handoff work.
 
 ## Hard Rules
 
@@ -23,7 +23,7 @@ Load [domain composition](references/domain-composition.md) for handoff, priorit
 - Mint one `<runtime>-<session-prefix>` run-id and reuse it for every write. Keep bounded runtime attribution in `analyst:<runtime>`/`dev:<runtime>` labels and unbounded run-id attribution in text; analyst labels persist, while dev labels are removed on release but retained on delivery.
 - Resume this run's held issue before consulting queues. Use the selected binding's timeline-adjudicated claim; the earliest live claim wins. Run `verify_claim` before the first repository write, every heartbeat, and every expensive or irreversible boundary; an unreadable control surface permits no write.
 - Keep exactly one of `analysis`, `ready`, `in-progress`, `review`, `blocked`, or `done`. The binding's workflow state is authoritative; every configured projection is updated and read back, and `done` is explicit before tracker closure.
-- The selected binding MUST map `ensure_states`, `create`, `list_state`, `claim`, `verify_claim`, `transition`, `comment`, `last_activity`, `label`, `unassign`, `publish_version`, and `close`. Run executable reversible operations instead of reconstructing them; bindings MUST declare unsupported capabilities and fail closed.
+- The selected binding MUST map `ensure_states`, `create`, `list_state`, `claim`, `reclaim`, `verify_claim`, `heartbeat`, `transition`, `comment`, `last_activity`, `label`, `unassign`, `publish_version`, and `close`. Run executable reversible operations instead of reconstructing them; bindings MUST declare unsupported capabilities and fail closed.
 - Issue acceptance criteria, routed domain rules, and repository rules define done. Never invent missing gates or reinterpret the issue silently.
 
 ## Decision Gates
@@ -34,13 +34,13 @@ Load [domain composition](references/domain-composition.md) for handoff, priorit
 | Analyst has no conditions or domain | Use the autonomous `general` contract in [domain composition](references/domain-composition.md); file only the strongest deduplicated finding or nothing. |
 | A domain route is recorded | Analyst loads the left rule book; dev loads the right. State explicitly when implementation routing is absent. |
 | Runtime mechanics or independent-context acquisition vary | Follow [runtime notes](references/runtime-notes.md); runtime limits change the mechanism, never the invariant. |
-| Claim, reclaim, or handoff safety needs rationale | Follow the active binding and [safety incidents](references/safety-incidents.md), without copying incident narrative here. |
+| Heartbeat, reclaim, or handoff is required | Follow the active binding and [portable safety procedure](references/safety-incidents.md#portable-safety-procedure); consult its incident tables only for rationale. |
 | State must be chosen | Invalid specification -> `analysis`; implementable and unassigned -> `ready`; claimed build -> `in-progress`; built/published -> `review`; unbuilt external wait -> `blocked` with condition and discharger; merged and verified -> `done`. |
 
 ## Execution Steps
 
 Before either role's first tracker write in an unfamiliar project, run the selected binding's `ensure_states`; then use that binding's executable operations and readbacks rather than reconstructing them.
-Load [domain composition](references/domain-composition.md) for routing, scale validation, queue partitioning, or autonomous fallback; [runtime notes](references/runtime-notes.md) for invocation, read-only enforcement, independent-context acquisition, or runtime limits; [safety incidents](references/safety-incidents.md) only when claim, reclaim, handoff, or failure rationale is needed; and [repository delivery](references/repository-delivery.md) only when repository rules do not fully define isolation or integration.
+Load [domain composition](references/domain-composition.md) for routing, scale validation, queue partitioning, or autonomous fallback; [runtime notes](references/runtime-notes.md) for invocation, read-only enforcement, independent-context acquisition, or runtime limits; the [portable safety procedure](references/safety-incidents.md#portable-safety-procedure) for heartbeat, reclaim, or handoff; and [repository delivery](references/repository-delivery.md) only when repository rules do not fully define isolation or integration.
 
 ### Analyst
 
