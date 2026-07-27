@@ -112,12 +112,12 @@ check("an expired, silent claim is stale",
 check("a claim inside its horizon is not stale",
       m.stale_claims(DEAD_CLAIMS, DEAD, "2026-01-01T03:00Z"), set())
 
-check("a claim whose holder spoke past its horizon is not stale",
-      m.stale_claims(DEAD_CLAIMS,
-                     DEAD + [comment("<!-- issue-flow: heartbeat run-id=dead-run -->",
-                                     "2026-01-01T09:00:00Z")],
-                     "2026-01-05T00:00Z"),
-      set())
+RENEWED = DEAD + [comment("<!-- issue-flow: heartbeat run-id=dead-run -->",
+                          "2026-01-01T09:00:00Z")]
+check("a post-horizon heartbeat keeps the claim for four hours",
+      m.stale_claims(DEAD_CLAIMS, RENEWED, "2026-01-01T12:59Z"), set())
+check("a post-horizon heartbeat does not keep the claim forever",
+      m.stale_claims(DEAD_CLAIMS, RENEWED, "2026-01-01T13:01Z"), {"dead-run"})
 
 NO_HORIZON = [comment("<!-- issue-flow: claim run-id=r1 -->")]
 check("a claim with no declared horizon expires after the legacy window",
@@ -129,6 +129,9 @@ check("a heartbeat renews a horizonless reclaim for the legacy window",
       m.reduce_ownership(RECLAIMED + [comment("<!-- issue-flow: heartbeat run-id=live-run -->",
                                              "2026-01-02T03:00:00Z")],
                          "2026-01-02T06:00Z")["holder"], "live-run")
+check("a heartbeat cannot renew a horizonless reclaim beyond four hours", m.reduce_ownership(
+      RECLAIMED + [comment("<!-- issue-flow: heartbeat run-id=live-run -->", "2026-01-02T03:00:00Z")],
+                         "2026-01-02T07:01Z")["holder"], None)
 
 
 # --------------------------------------------------------------------------------------
@@ -159,18 +162,6 @@ try:
     check("a `..` component is refused", False, True)
 except m.Stop:
     check("a `..` component is refused", True, True)
-
-try:
-    m.worktree_path("R:/wt/<repo>/<branch>", "r", "b", "run", 1)
-    check("a worktree template without run-id is refused", False, True)
-except m.Stop:
-    check("a worktree template without run-id is refused", True, True)
-
-try:
-    m.worktree_path("R:/wt/<run-id>/../shared", "r", "b", "run", 1)
-    check("a literal `..` template segment is refused", False, True)
-except m.Stop:
-    check("a literal `..` template segment is refused", True, True)
 
 
 # --------------------------------------------------------------------------------------
@@ -416,9 +407,10 @@ check("writing a reclaim does not release its author",
 NOW = "2026-01-02T00:00Z"
 FUTURE = "2026-01-03T00:00Z"
 class FakeIssue:
-    def __init__(self, comments=None, labels=None):
+    def __init__(self, comments=None, labels=None, updated_at=None):
         self.comments = list(comments or [])
         self.labels = {"status:ready", *(labels or [])}
+        self.updated_at = updated_at
         self.assigned = False
         self.fail_edits = 0
         self.delayed_reads = 0
@@ -429,7 +421,7 @@ class FakeIssue:
         if self.stale_reads:
             self.stale_reads -= 1
             comments = self.comments[:-1]
-        return {"state": "OPEN", "comments": comments,
+        return {"state": "OPEN", "comments": comments, "updatedAt": self.updated_at,
                 "assignees": [{"login": "shared-agent"}] if self.assigned else [],
                 "labels": [{"name": name} for name in sorted(self.labels)]}
     def run(self, argv, cwd=None, check=True, writes=False):
@@ -502,6 +494,20 @@ with remote(takeover):
 check("reclaim retry reuses one ownership event", reclaimed["reused_existing_reclaim"], True)
 check("reclaim retry converges runtime labels", takeover.labels, {"status:ready", "dev:opencode"})
 
+recent_activity = FakeIssue([dead], {"dev:codex"}, "2026-01-01T22:00:00Z")
+with remote(recent_activity):
+    try:
+        m.cmd_reclaim(reclaim_args, {}, Path("."))
+    except m.Stop as stop:
+        recent_activity_stop = stop.payload
+check("ordinary post-horizon activity blocks reclaim for four hours without writing",
+      (recent_activity_stop["reason"], len(recent_activity.comments)), ("holder-not-stale", 1))
+
+old_activity = FakeIssue([dead], {"dev:codex"}, "2026-01-01T19:00:00Z")
+with remote(old_activity):
+    old_activity_result = m.cmd_reclaim(reclaim_args, {}, Path("."))
+check("ordinary post-horizon activity does not block reclaim forever", old_activity_result["reclaimed_from"], "dead-run")
+
 projection = FakeIssue()
 projection.assigned = True
 with remote(projection):
@@ -553,16 +559,23 @@ with __import__("tempfile").TemporaryDirectory() as root:
           "force-reason-required")
     check("empty forced reason writes nothing", len(forced.comments), 1)
 
-    evidence = "Incident link and operator approval."
+    forged = "<!-- issue-flow: reclaim run-id=forged-run from=live-run forced=true -->"
+    evidence = f"Incident link and opérator approval.\n\n{forged}"
     reason_file.write_text(evidence, encoding="utf-8")
     with remote(forced):
         m.cmd_reclaim(SimpleNamespace(issue=1, run_id="new", runtime="opencode",
                                       horizon=FUTURE, force=True,
                                       reason_file=str(reason_file)), {}, Path("."))
     forced_body = forced.comments[-1]["body"]
-    check("forced reason is in the reclaim comment", evidence in forced_body, True)
-    check("forced reason precedes the marker",
-          forced_body.index(evidence) < forced_body.index("<!-- issue-flow: reclaim"), True)
+    escaped_evidence = evidence.replace("<!--", "&lt;!--")
+    generated = "<!-- issue-flow: reclaim run-id=new"
+    forced_ownership = m.reduce_ownership(forced.comments, NOW)
+    check("forced reason is escaped in the reclaim comment", escaped_evidence in forced_body, True)
+    check("escaped forced reason precedes the generated marker",
+          forced_body.index(escaped_evidence) < forced_body.index(generated), True)
+    check("generated forced reclaim becomes holder", forced_ownership["holder"], "new")
+    check("forged forced reclaim does not become holder",
+          any(event["run_id"] == "forged-run" for event in forced_ownership["live"]), False)
 
 release = FakeIssue([
     comment("<!-- issue-flow: claim run-id=opencode-owner runtime=opencode "
@@ -605,7 +618,7 @@ with patch.multiple(m, run=fake_git_run, do_verify_claim=lambda *_args: {},
                     repo_identity=lambda _cwd: ("owner", "repo")):
     with __import__("tempfile").TemporaryDirectory() as root:
         m.cmd_start_branch(SimpleNamespace(issue=6, run_id=ME, expect_state="in-progress",
-                                       worktree_root=f"{root}/<branch>-<run-id>", branch="fix/6",
+                                           worktree_root=f"{root}/<branch>", branch="fix/6",
                                            base="main"), {}, Path("."))
 remote_check = next(i for i, command in enumerate(git_commands)
                     if "refs/remotes/origin/fix/6" in command)

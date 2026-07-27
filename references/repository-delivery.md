@@ -34,11 +34,11 @@ Place each implementation checkout outside the base working tree and include the
 in its parent path. A shared parent keyed only by branch can collide across repositories, while an
 in-tree worktree pollutes status and ignore behavior for every run.
 
-The worktree path MUST be unique per run, not merely per issue or branch. A reclaimed checkout belongs
-to the displaced run until its process is proven stopped; preserve it as evidence, then adopt its work
-without allowing two live writers. Reject every foreign or orphaned directory rather than treating its
-contents as permission to write there. Tools with per-checkout indexes or caches get a fresh local
-instance rather than one copied or linked from another checkout.
+The worktree strategy MUST prevent two live runs from writing the same directory. Either make the
+path unique per run or rely on the version-control registration of one common issue branch; under the
+latter strategy, resume only a registered checkout for that exact branch and reject every foreign or
+orphaned directory. Tools with per-checkout indexes or caches get a fresh local instance rather than
+one copied or linked from another checkout.
 
 Confirm isolation before the first edit and whenever the tree changes unexpectedly. Stop writing and
 renew the claim. A losing run leaves the tree untouched and records where its own work is; the winning

@@ -126,7 +126,8 @@ message must both **name the run-id AND instruct**. A heartbeat that mentions yo
 stand-down would have you abandon work nobody asked you to drop.
 
 Only `viewerDidAuthor=true` comments are control input. Reclaims must match the stale prior holder
-unless marked `forced=true`; horizonless acquisitions expire four hours after trusted activity.
+unless marked `forced=true`; authority ends after both the declared horizon and the four-hour window
+after trusted activity. Explicit reclaim also treats the issue's `updatedAt` as authoritative activity.
 
 **Worked example — a real claim race, 2026-07-22.** The timeline, from the issue's comment trail:
 
@@ -162,12 +163,12 @@ ones.
 | `create` | `SCRIPT create --identity <id> --title <t> --body-file <f> --priority <scale:value> --domain <name> --runtime <rt> --run-id <id> [--state ready\|blocked]` | creates every label **before** attaching it, then mirrors the initial board column — the case everyone forgets, because no `transition` ever follows a fresh issue to correct an empty `Status` |
 | `list_state` | `SCRIPT list-state --state <s>` | unassigned only, `--limit 200` (the default cap is 30 and silently truncates the queue), partitioned by `domain:<name>`. It returns the raw labels and **refuses to rank across partitions** — ordering inside one needs the domain's scale contract, and manufacturing a global rank is forbidden |
 | `claim` | `SCRIPT claim --issue <n> --run-id <id> --runtime <rt> --horizon <when>` | appends ownership before projecting assignee/label state, then accepts only the reducer's live winner. An expired self-claim gets a fresh event; same-runtime loss cleanup preserves the winner's shared label |
-| `reclaim` | `SCRIPT reclaim --issue <n> --run-id <id> --runtime <rt> [--horizon <when>] [--force --reason-file <f>]` | requires a claim/reclaim event; projection-only recovery is unsupported and fails closed. One validated event releases the named holder and establishes the new holder with a horizon before recoverable projections. `--force` requires a non-empty UTF-8 reason file and includes it in that same reclaim comment before the forced marker; missing or invalid evidence stops before any tracker write |
+| `reclaim` | `SCRIPT reclaim --issue <n> --run-id <id> --runtime <rt> [--horizon <when>] [--force --reason-file <f>]` | requires a claim/reclaim event; projection-only recovery is unsupported and fails closed. One validated event releases the named holder and establishes the new holder with a horizon before recoverable projections. `--force` requires a non-empty UTF-8 reason file; HTML comment openers are escaped before its evidence is included ahead of the authoritative forced marker, and invalid evidence stops before any tracker write |
 | `verify_claim` | `SCRIPT verify-claim --issue <n> --run-id <id> --expect-state <s> [--allow-closed-by-pr <pr>]` | proves the requested run is the reducer's current live winner, uses that ownership event as its control-message watermark, and applies the open/state checks. `--allow-closed-by-pr` remains limited to the renewal before `close` |
 | `transition` | `SCRIPT transition --issue <n> --to <s> [--from <s>]` | mirrors the board **first**, swaps the label in **one** call, then reads **both** back and repairs a board that disagrees. Omitting `--from` removes whatever stale state labels it finds |
 | `comment` | `SCRIPT comment --issue <n> --body-file <f> [--run-id <id> --kind <k>]` | file-based body, always |
 | `heartbeat` | `SCRIPT heartbeat --issue <n> --run-id <id> --expect-state <s> --body-file <f>` | renewal first, post second; **refuses to post** when the renewal says stop |
-| branch + worktree | `SCRIPT start-branch --issue <n> --branch <b> --base <base> --run-id <id>` | requires a configured path containing `<run-id>`, renews first, fetches before fallback discovery, resumes branch heads without moving them, and rejects foreign/orphaned paths. A cross-run reclaim preserves the old checkout until its writer is proven stopped |
+| branch + worktree | `SCRIPT start-branch --issue <n> --branch <b> --base <base> --run-id <id>` | renews first, fetches before fallback discovery, resumes local or remote-only branch heads without moving them, and creates from the fetched base only when the branch is absent everywhere |
 | `publish_review` | `SCRIPT publish-review --issue <n> --branch <b> --base <base> --run-id <id> --pr-title <t> --pr-body-file <f> [--worktree <p>]` | pushes, **reuses** the single open PR or creates one, refuses on more than one, scans for closing keywords, and records the PR URL with its exact head and base SHAs |
 | `changelog-notes` | `SCRIPT changelog-notes --version <x.y.z> --file <changelog> [--out <f>]` | read-only. Extracts the version's entry for its tag and Release, anchored on the version **opening** the heading. Fails closed on a missing or empty entry — a tag is immutable, so notes invented at tag time are permanent |
 | `check closing keywords` | `SCRIPT check-closing-keywords --issue <n>` | run again before merging: the branch's commit messages can introduce one after the body is already clean |
@@ -280,10 +281,25 @@ The worktree path comes from the `Worktree location` configuration row, with `<r
 `<issue>` and `<run-id>` substituted; every component is flattened, so a `docs/113-…` branch does not
 create a stray `docs/` directory under the worktree root.
 
-The template MUST contain `<run-id>`, so different runs cannot compute the same directory. A path
-that already exists is reusable only when git registers it for this run's exact branch; that is a
-same-run resume. A foreign checkout or orphaned directory is refused, and a reclaiming run gets a new
-path rather than writing into the displaced run's checkout.
+**What the path must guarantee is that no two live runs share a directory** — not that it contains
+any particular token. Two templates achieve that differently, and the choice is a real trade:
+
+| Template | Collision is prevented by | Cost |
+|---|---|---|
+| `…/<branch>-<run-id>` | construction — no two runs ever compute the same path | one orphan directory per run that dies; they accumulate |
+| `…/<branch>` | git itself — `worktree add` refuses a branch already checked out elsewhere (`fatal: '<branch>' is already used by worktree at …`) | needs the resume check below to be correct |
+
+The second is safe only because the branch carries the issue number, so two runs on one issue compute
+the same BRANCH and git blocks the second checkout. It was NOT safe in the original convention, where
+the path was derived from the issue while the branch varied — that is how, on 2026-07-24, two runs
+derived the same directory and the loser wrote its model, its migration and its tests into the
+winner's checkout mid-build.
+
+**So `start-branch` asks whether the directory is YOURS, not whether it exists.** A registered
+worktree for this exact branch is a resume: it is reused and reported as `resumed_existing_worktree`.
+Anything else — a stranger's checkout, or an orphan left by a dead run — is refused, because writing
+into either is the failure above. Merely refusing every existing path would make resume impossible
+under a run-id-free template while protecting against nothing git had not already caught.
 
 **A fresh worktree does not have the files git never tracked.** Everything gitignored — environment
 files, secrets, credentials, local settings — is simply absent, and the failure it produces is

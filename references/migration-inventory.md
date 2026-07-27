@@ -105,7 +105,7 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | K28 | Merge only the reviewed/green head and verify delivered topology. | `SKILL.md` | Preserve reviewed history. | yes | no |
 | K29 | Version tags are immutable, remote-verified, and release-aware. | `SKILL.md` | Keep publication a delivery gate. | yes | no |
 | K30 | Base is read-only; each issue uses one branch and isolated worktree. | `references/repository-delivery.md` | Consolidate repository isolation. | yes | no |
-| K31 | Worktree paths are isolated per run and never shared between live writers. | `references/repository-delivery.md` | Preserve per-run path isolation. | yes | no |
+| K31 | Worktree paths cannot be shared; resume only the branch's registered checkout. | `references/repository-delivery.md` | Preserve collision safety. | yes | no |
 | K32 | Fresh worktrees restore required ignored inputs and reuse the established environment. | `references/repository-delivery.md` | Prevent checkout-only failures. | yes | no |
 | K33 | Integrate current base and merge rather than rebase by default. | `references/repository-delivery.md` | Preserve SHA-bound evidence. | yes | no |
 | K34 | Horizons, read-before-write heartbeats, and reclaim retain prior work. | `references/safety-incidents.md` | Consolidate abandoned-work recovery. | yes | yes |

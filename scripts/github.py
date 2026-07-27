@@ -496,8 +496,13 @@ def parse_stamp(value: str):
     return None
 
 
+def ownership_deadline(horizon, activity):
+    activity_deadline = activity + datetime.timedelta(hours=4) if activity else None
+    return max((stamp for stamp in (horizon, activity_deadline) if stamp), default=None)
+
+
 def stale_claims(claims, comments: list[dict], now: str) -> set[str]:
-    """Claims whose declared horizon has passed with no word from the holder since.
+    """Claims past both their declared horizon and bounded holder activity window.
 
     This is the mechanical half of the portable safety procedure's reclaim rule. Without it a run that died mid-build
     holds its issue forever: `claim` re-reads the timeline, finds that never-released claim as the
@@ -513,21 +518,23 @@ def stale_claims(claims, comments: list[dict], now: str) -> set[str]:
     if moment is None:
         return set()
     stale = set()
+    trusted = [comment for comment in comments if comment.get("viewerDidAuthor") is True]
     for _created_at, run_id, comment in claims:
         horizon = None
         for mark in parse_markers(comment.get("body", "")):
             if mark.get("kind") == "claim" and mark.get("horizon"):
                 horizon = parse_stamp(mark["horizon"])
-        # An unparseable or absent horizon is "unknown", never "expired".
-        if horizon is None or horizon >= moment:
+        # An unparseable or absent horizon is "unknown", never automatically expired.
+        if horizon is None:
             continue
-        spoke_at = parse_stamp(last_activity_by(comments, run_id))
-        if spoke_at is None or spoke_at < horizon:
+        spoke_at = parse_stamp(last_activity_by(trusted, run_id))
+        deadline = ownership_deadline(horizon, spoke_at)
+        if deadline and deadline <= moment:
             stale.add(run_id)
     return stale
 
 
-def reduce_ownership(comments: list[dict], now: str) -> dict:
+def reduce_ownership(comments: list[dict], now: str, activity_at: str | None = None) -> dict:
     """Return the current live winner and the exact event that established ownership.
 
     A reclaim starts a new ownership epoch: losing contenders from before the takeover cannot
@@ -555,11 +562,11 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
     live, stale = [], []
     for event in sorted(latest_by_run.values(), key=lambda item: (item["created_at"], item["position"])):
         horizon = parse_stamp(event["horizon"])
-        spoke_at = parse_stamp(last_activity_by(trusted, event["run_id"])) or parse_stamp(event["created_at"])
-        deadline = horizon or (spoke_at + datetime.timedelta(hours=4) if spoke_at else None)
-        expired_silent = bool(moment and deadline and deadline < moment
-                              and (not horizon or spoke_at is None or spoke_at < horizon))
-        (stale if expired_silent else live).append(event)
+        attributed = parse_stamp(last_activity_by(trusted, event["run_id"]))
+        activity = max((stamp for stamp in (attributed, parse_stamp(activity_at),
+                                            parse_stamp(event["created_at"])) if stamp), default=None)
+        deadline = ownership_deadline(horizon, activity)
+        (stale if moment and deadline and deadline <= moment else live).append(event)
 
     winner = live[0] if live else None
     return {"holder": winner["run_id"] if winner else None, "event": winner, "live": live, "stale": stale}
@@ -1192,14 +1199,16 @@ def cmd_reclaim(args, config, cwd) -> dict:
         if not force_reason:
             raise Stop({"ok": False, "reason": "force-reason-required",
                         "action": "--reason-file must contain non-empty reason and evidence"})
+        # Escaping preserves rendered evidence while preventing it from outranking our control marker.
+        force_reason = force_reason.replace("<!--", "&lt;!--")
 
-    data = issue_view(args.issue, "state,assignees,labels,comments", cwd=cwd)
+    data = issue_view(args.issue, "state,updatedAt,assignees,labels,comments", cwd=cwd)
     if data.get("state") != "OPEN":
         raise Stop({"ok": False, "reason": "issue-not-open",
                     "action": "nothing to reclaim on a closed issue"})
 
     comments = data.get("comments", [])
-    before = reduce_ownership(comments, utc_now_stamp())
+    before = reduce_ownership(comments, utc_now_stamp(), data.get("updatedAt"))
     current = before["event"]
     reused = bool(current and current["run_id"] == args.run_id and current["kind"] == "reclaim")
     if reused:
@@ -1232,7 +1241,7 @@ def cmd_reclaim(args, config, cwd) -> dict:
                 "reason": "holder-not-stale",
                 "holder": holder,
                 "claimed_at": held_at,
-                "action": "the holder's declared horizon has not passed, or it has spoken since. "
+                "action": "the holder's horizon/activity deadline has not passed. "
                           "Reclaiming early costs someone a duplicated hour — pass --force only "
                           "with a reason you can defend on the issue",
             }
@@ -1390,18 +1399,11 @@ def worktree_path(template: str, repo: str, branch: str, run_id: str, issue: int
     only one of them is the inconsistency that becomes a traversal later. `..` segments are
     rejected outright for the same reason.
 
-    Path uniqueness comes from the run-id; `cmd_start_branch` reuses only this run's registered
-    branch path and refuses foreign or orphaned paths. The 2026-07-24 collision is told once, in
+    Path uniqueness comes from the run-id, and `cmd_start_branch` refuses a path that already
+    exists. Why that is not paranoia — the 2026-07-24 collision — is told once, in
     `bindings/github.md` under *Branch, worktree and the linked issue*. It is deliberately NOT
     retold here: an incident narrated in three files goes stale in two of them.
     """
-    if "<run-id>" not in template:
-        raise Stop({"ok": False, "reason": "unsafe-worktree-template",
-                    "action": "worktree location must contain <run-id> to isolate live writers"})
-    if ".." in re.split(r"[/\\]+", template):
-        raise Stop({"ok": False, "reason": "unsafe-worktree-template",
-                    "action": "worktree location may not contain a literal `..` path segment"})
-
     def flatten(value: str) -> str:
         cleaned = re.sub(r"[/\\]+", "-", str(value)).strip()
         if not cleaned or cleaned != cleaned.replace("..", ""):
@@ -1516,9 +1518,18 @@ def cmd_start_branch(args, config, cwd) -> dict:
     _, repo_name = repo_identity(cwd)
     path = worktree_path(template, repo_name, args.branch, args.run_id, args.issue)
 
-    # A per-run path may already exist only when this same run resumes. Git registration for the
-    # exact branch makes that case reusable; a foreign checkout or orphan is never permission to
-    # write, and a reclaiming run computes a different path from its own run-id.
+    # An existing path means one of three different things, and they are not interchangeable.
+    #
+    # This matters because the template is configurable. With `<run-id>` in it a path is unique per
+    # run, so ANY existing path is foreign. Without it — `<repo>/<branch>` — an existing path is
+    # usually your OWN branch's worktree, and refusing it would make every resume impossible while
+    # protecting against nothing: git already refuses a second checkout of a branch that is live
+    # elsewhere ("fatal: '<branch>' is already used by worktree at ..."), which is the collision
+    # that actually costs work.
+    #
+    # So the question is not "does it exist" but "is it MINE": a registered worktree for this exact
+    # branch is a resume; anything else is a stranger's tree or an orphan directory left by a dead
+    # run, and writing into either is the #58 failure.
     resuming = False
     if path.exists():
         registered = registered_worktrees(cwd)
