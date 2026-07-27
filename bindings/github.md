@@ -155,6 +155,7 @@ ones.
 
 `<n>` is the issue number throughout. `SCRIPT` abbreviates
 `python <skill>/scripts/github.py --repo-dir <repo>`. Give each ownership write a fresh lowercase 32-hex `--operation-id` and reuse it on retry; duplicate transport comments reduce to one event, while releases and takeovers target one exact acquisition epoch.
+Broad legacy release markers remain valid only before the 2026-07-28 operation-epoch cutover; incomplete newer controls are inert rather than run-wide.
 
 | Operation | Command | What it guarantees beyond the obvious |
 |---|---|---|
@@ -162,7 +163,7 @@ ones.
 | `create` | `SCRIPT create --identity <id> --title <t> --body-file <f> --priority <scale:value> --domain <name> --runtime <rt> --run-id <id> [--state ready\|blocked]` | creates every label **before** attaching it, then mirrors the initial board column — the case everyone forgets, because no `transition` ever follows a fresh issue to correct an empty `Status` |
 | `list_state` | `SCRIPT list-state --state <s>` | unassigned only, `--limit 200` (the default cap is 30 and silently truncates the queue), partitioned by `domain:<name>`. It returns the raw labels and **refuses to rank across partitions** — ordering inside one needs the domain's scale contract, and manufacturing a global rank is forbidden |
 | `claim` | `SCRIPT claim --issue <n> --run-id <id> --runtime <rt> --horizon <UTC> --operation-id <32-hex>` | renews an expired self-claim, waits boundedly for visibility, then proves the exact sole assignee and `dev:*` set; stale foreign contenders route through `reclaim` |
-| `reclaim` | `SCRIPT reclaim --issue <n> --run-id <id> --runtime <rt> --operation-id <32-hex> [--horizon <UTC>] [--force --reason-file <f>]` | waits boundedly for its event, adjudicates the winner, and proves exact projections; holder heartbeats extend liveness by at most one four-hour window |
+| `reclaim` | `SCRIPT reclaim --issue <n> --run-id <id> --runtime <rt> --operation-id <32-hex> --horizon <UTC> [--force --reason-file <f>]` | waits boundedly for its event, adjudicates the winner, and proves exact projections; holder heartbeats extend liveness by at most one four-hour window |
 | `verify_claim` | `SCRIPT verify-claim --issue <n> --run-id <id> --expect-state <s> [--allow-closed-by-pr <pr>]` | proves the requested run is the reducer's current live winner and uses timeline position, not second-precision timestamps, as its control-message watermark |
 | `transition` | `SCRIPT transition --issue <n> --to <s> [--from <s>]` | mirrors the board **first**, swaps the label in **one** call, then reads **both** back and repairs a board that disagrees. Omitting `--from` removes whatever stale state labels it finds |
 | `comment` | `SCRIPT comment --issue <n> --body-file <f> [--run-id <id> --kind note\|blocker\|diagnosis]` | file-based body, always; `--run-id` and `--kind` are a pair. Every generic comment gets a non-control marker, and quoted issue-flow markers plus claim-shaped legacy prose are escaped, so generic text cannot become a control event or fall through to the prose parser |

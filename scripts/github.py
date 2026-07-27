@@ -89,6 +89,7 @@ OPERATION_ID_RE = re.compile(r"[0-9a-f]{32}")
 # The last shipped evidence-free forced event was issue #7 at 11:59:58Z. After this activation
 # boundary, stale clients cannot mint a new "legacy" event by merely omitting the protocol attr.
 FORCED_EVIDENCE_SINCE = "2026-07-27T19:00:00Z"
+OPERATION_EPOCH_SINCE = "2026-07-28T00:00:00Z"
 # This heading is persisted protocol syntax, not presentation copy; change it only with a parser
 # migration that keeps already-written v2 forced events valid.
 FORCED_EVIDENCE_HEADING = "Forced takeover reason and evidence:"
@@ -409,7 +410,22 @@ def operation_marker(comments: list[dict], operation_id: str, kind: str,
 
 
 def ownership_epoch(event: dict) -> str:
-    return event.get("operation_id") or f"legacy-{event['position']}"
+    if event.get("operation_id"):
+        return event["operation_id"]
+    comment = event["comment"]
+    identity = comment.get("id") or hashlib.sha256(
+        f"{comment.get('createdAt')}\n{comment.get('body')}".encode()).hexdigest()[:32]
+    return f"legacy-{identity}"
+
+
+def forced_evidence_digest(comment: dict, marker_index: int | None) -> str | None:
+    body, matches = comment.get("body", ""), list(MARKER_RE.finditer(comment.get("body", "")))
+    marker_at = matches[marker_index].start() if marker_index is not None else -1
+    heading_at = body.find(FORCED_EVIDENCE_HEADING)
+    evidence = body[heading_at + len(FORCED_EVIDENCE_HEADING):marker_at].strip()
+    if marker_at < 0 or heading_at < 0 or not evidence or MARKER_RE.search(evidence):
+        return None
+    return hashlib.sha256(evidence.encode()).hexdigest()
 
 
 # Prose fallback for comments written before markers existed. Deliberately narrow: a comment that
@@ -493,6 +509,7 @@ def ownership_events(comments: list[dict]) -> list[dict]:
                 "operation_id": event.get("op-id"),
                 "from_operation": event.get("from-op"),
                 "evidence_hash": event.get("evidence-hash"),
+                "evidence_body_hash": forced_evidence_digest(comment, marker_index) if forced else None,
                 "forced": forced,
                 "evidence_required": forced and (
                     event.get("evidence") == "required" or created is None
@@ -505,7 +522,7 @@ def ownership_events(comments: list[dict]) -> list[dict]:
     ordered = sorted(events, key=lambda item: (stamp_order(item["created_at"]), item["position"]))
     first, conflicts = {}, set()
     fields = ("kind", "run_id", "runtime", "horizon", "from", "from_operation",
-              "evidence_hash", "forced")
+              "evidence_hash", "evidence_body_hash", "forced")
     for event in ordered:
         operation_id = event["operation_id"]
         if not operation_id:
@@ -634,8 +651,7 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
     """
     events = [event for event in ownership_events(comments)
               if event["kind"] != "reclaim" or valid_reclaim(event, comments)]
-    takeovers = [index for index, event in enumerate(events) if event["kind"] == "reclaim"]
-    candidates = events[takeovers[-1]:] if takeovers else events
+    acquisition_ids = {event["operation_id"] for event in events if event.get("operation_id")}
     valid_reclaims = {(event["position"], event["marker_index"])
                       for event in events if event["kind"] == "reclaim"}
     controls, conflicts = {}, set()
@@ -657,9 +673,13 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
                     conflicts.add(key)
                 else:
                     controls.setdefault(key, (signature, target_epoch, position))
+                if kind == "unassign" and operation_id in acquisition_ids:
+                    conflicts.add(key)
                 continue
-            if target_epoch:
+            if target_epoch or operation_id:
                 # A malformed operation-scoped control must not downgrade into a broad legacy release.
+                continue
+            if stamp_order(comment.get("createdAt", "")) >= stamp_order(OPERATION_EPOCH_SINCE):
                 continue
             for attr in RELEASE_ATTRS_BY_KIND.get(kind, ()):
                 target = mark.get(attr)
@@ -669,6 +689,10 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
     for key, (_signature, target, position) in controls.items():
         if key not in conflicts:
             epoch_release_positions[target] = max(position, epoch_release_positions.get(target, -1))
+    conflicted_operations = {operation_id for _kind, operation_id in conflicts}
+    events = [event for event in events if event.get("operation_id") not in conflicted_operations]
+    takeovers = [index for index, event in enumerate(events) if event["kind"] == "reclaim"]
+    candidates = events[takeovers[-1]:] if takeovers else events
     latest_by_run = {}
     for event in candidates:
         released = max(legacy_release_positions.get(event["run_id"], -1),
@@ -708,18 +732,15 @@ def holder_uses_runtime(event: dict | None, runtime: str) -> bool:
 
 def valid_reclaim(event: dict, comments: list[dict]) -> bool:
     if event["forced"] and event["evidence_required"]:
-        body = event["comment"].get("body", "")
-        matches = list(MARKER_RE.finditer(body))
-        marker_index = event["marker_index"]
-        marker_at = matches[marker_index].start() if marker_index is not None else -1
-        heading_at = body.find(FORCED_EVIDENCE_HEADING)
-        evidence = body[heading_at + len(FORCED_EVIDENCE_HEADING):marker_at].strip()
-        if marker_at < 0 or heading_at < 0 or not evidence or MARKER_RE.search(evidence):
+        digest = event["evidence_body_hash"]
+        if not digest:
             return False
         if (event.get("operation_id") or event["comment"].get("includesCreatedEdit") is not False) and (
-                not event.get("evidence_hash")
-                or hashlib.sha256(evidence.encode()).hexdigest() != event["evidence_hash"]):
+                not event.get("evidence_hash") or digest != event["evidence_hash"]):
             return False
+    if (not event.get("from_operation") and (event.get("operation_id")
+            or stamp_order(event["created_at"]) >= stamp_order(OPERATION_EPOCH_SINCE))):
+        return False
     prior = reduce_ownership(comments[:event["position"]], event["created_at"])
     if event.get("from_operation"):
         target = next((candidate for candidate in [prior["event"], *prior["stale"]]
@@ -1247,7 +1268,7 @@ def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
         body = comment.get("body", "")
         marks = parse_markers(body)
         controlled = any(
-            is_control_for(mark, run_id)
+            mark.get("kind") not in RELEASE_KINDS and is_control_for(mark, run_id)
             for mark in marks
         )
         if not controlled and not marks:
@@ -1499,8 +1520,7 @@ def cmd_reclaim(args, config, cwd) -> dict:
     """Atomically in timeline terms displace a holder and establish the new live owner."""
     now = utc_now_stamp()
     operation_id = require_operation_id(args.operation_id)
-    if args.horizon:
-        require_horizon(args.horizon, now)
+    require_horizon(args.horizon, now)
     if getattr(args, "reason_file", None) and not args.force:
         raise Stop({"ok": False, "reason": "force-required-for-reason"})
     force_reason = None
@@ -1517,8 +1537,7 @@ def cmd_reclaim(args, config, cwd) -> dict:
     comments = data.get("comments", [])
     expected = {"run-id": args.run_id, "runtime": args.runtime,
                 "forced": "true" if args.force else None}
-    if args.horizon:
-        expected["horizon"] = args.horizon
+    expected["horizon"] = args.horizon
     if force_reason:
         expected["evidence-hash"] = hashlib.sha256(force_reason.encode()).hexdigest()
     existing = operation_marker(comments, operation_id, "reclaim", expected)
@@ -1565,9 +1584,7 @@ def cmd_reclaim(args, config, cwd) -> dict:
 
     login = viewer_login(cwd)
     if not reused:
-        horizon = args.horizon or (
-            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=4)
-        ).strftime("%Y-%m-%dT%H:%MZ")
+        horizon = args.horizon
         if args.force:
             reason_file = getattr(args, "reason_file", None)
             if not reason_file:
@@ -2304,7 +2321,7 @@ def cmd_unassign(args, config, cwd) -> dict:
     login = viewer_login(cwd) if ownership["event"] else None
     if existing:
         converge_ownership_projection(args.issue, ownership["event"], cwd, login=login)
-        if args.held_by_other and not ownership["holder"]:
+        if args.held_by_other and ownership["holder"] in {None, args.run_id}:
             raise Stop({"ok": False, "reason": "held-by-other-holder-disappeared"})
         return {"ok": True, "issue": args.issue, "assignee_kept": bool(ownership["holder"])}
     events = ownership["live"] + ownership["stale"]
@@ -2328,7 +2345,6 @@ def cmd_unassign(args, config, cwd) -> dict:
         legacy = {name[4:] for name in projected if holder_uses_runtime(successor, name[4:])}
         if len(legacy) != 1:
             raise Stop({"ok": False, "reason": "holder-runtime-missing"})
-    after = data
     if mine:
         if ((mine["runtime"] and mine["runtime"] != args.runtime)
                 or (not mine["runtime"] and projected != {f"dev:{args.runtime}"})):
@@ -2351,7 +2367,7 @@ def cmd_unassign(args, config, cwd) -> dict:
 
     ownership = reduce_ownership(after.get("comments", []), utc_now_stamp())
     converge_ownership_projection(args.issue, ownership["event"], cwd, login=login)
-    if args.held_by_other and not ownership["holder"]:
+    if args.held_by_other and ownership["holder"] in {None, args.run_id}:
         raise Stop({"ok": False, "reason": "held-by-other-holder-disappeared"})
     return {
         "ok": True,
@@ -2481,7 +2497,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-id", required=True)
     p.add_argument("--runtime", required=True)
     p.add_argument("--operation-id", required=True, help="32 lowercase hex chars; reuse on retry")
-    p.add_argument("--horizon", help="new ownership horizon; defaults to four hours from now")
+    p.add_argument("--horizon", required=True, help="new ownership horizon")
     p.add_argument("--force", action="store_true",
                    help="reclaim a holder who is not stale — needs a defensible reason")
     p.add_argument("--reason-file", help="evidence required when --force creates a new event")
