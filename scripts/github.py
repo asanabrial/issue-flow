@@ -992,7 +992,7 @@ def ownership_identity(event: dict | None) -> tuple:
 def converge_ownership_projection(issue: int, event: dict | None, cwd: Path,
                                   login: str | None = None) -> dict:
     """Project the reducer's holder across bounded races, then prove the exact sets landed."""
-    login = login or (viewer_login(cwd) if event else None)
+    login = login or viewer_login(cwd)
     changed = wrote = False
     for _attempt in range(READBACK_ATTEMPTS):
         expected_identity = ownership_identity(event)
@@ -1054,6 +1054,10 @@ def converge_ownership_projection(issue: int, event: dict | None, cwd: Path,
                 "ownership projection write did not read back exactly", consecutive=2,
                 ambiguous_write=len(edit) > 4,
             )
+        except ReadFailure as exc:
+            if wrote:
+                raise WriteFailure("ownership projection repair could not be read back") from exc
+            raise
         except (Stop, WriteFailure) as failure:
             try:
                 latest = issue_view(issue, "assignees,labels,comments", cwd=cwd)
@@ -1065,6 +1069,8 @@ def converge_ownership_projection(issue: int, event: dict | None, cwd: Path,
             if ownership_identity(latest_event) != expected_identity:
                 event, changed = latest_event, True
                 continue
+            if wrote and not isinstance(failure, WriteFailure):
+                raise WriteFailure("ownership projection repair did not stabilize") from failure
             raise failure
         if unresolved_runtime:
             raise Stop({"ok": False, "reason": "holder-runtime-missing"})

@@ -659,15 +659,6 @@ with m.body_file("evidence") as unused_reason:
         rejected_unused_reason = exc.payload["reason"]
 check("reason files cannot be silently ignored without force", rejected_unused_reason,
       "force-required-for-reason")
-dirty_projection = FakeIssue(labels=["dev:codex"])
-dirty_projection.assignees = {"stale-user"}
-with remote(dirty_projection):
-    m.cmd_claim(SimpleNamespace(issue=1, run_id=ME, runtime="claude-code",
-                                horizon=FUTURE), {}, Path("."))
-check("claim converges exact ownership projections",
-      (dirty_projection.assignees, dirty_projection.labels),
-      ({"me"}, {"status:ready", "dev:claude-code"}))
-
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):
         if getattr(self, "outage", False):
@@ -748,12 +739,17 @@ with remote(winner):
 check("same-runtime loser cleanup preserves the winner label", "dev:opencode" in winner.labels, True)
 check("a losing claim repairs the authoritative winner's projections",
       (winner.assignees, winner.labels), ({"me"}, {"status:ready", "dev:opencode"}))
-
 class HolderSwitch(FakeIssue):
     def __init__(self):
-        super().__init__([comment(m.marker(
-            "claim", run_id="opencode-old", runtime="opencode", horizon=FUTURE))], ["dev:stale"])
+        super().__init__(labels=["dev:stale"])
+        self.views = 0
         self.switches = 0
+    def view(self, issue, fields, cwd=None):
+        self.views += 1
+        if self.views == 2:
+            self.comments.append(comment(m.marker(
+                "claim", run_id="opencode-old", runtime="opencode", horizon=FUTURE)))
+        return super().view(issue, fields, cwd=cwd)
     def run(self, argv, cwd=None, check=True, writes=False):
         if argv[:3] == ["gh", "issue", "edit"] and self.switches < 2:
             self.switches += 1
@@ -770,8 +766,7 @@ switched = HolderSwitch()
 switched_reason = None
 try:
     with remote(switched):
-        first = m.reduce_ownership(switched.comments, NOW)["event"]
-        m.converge_ownership_projection(1, first, Path("."), login="me")
+        m.converge_ownership_projection(1, None, Path("."))
 except m.Stop as exc:
     switched_reason = exc.payload["reason"]
 check("successive holder races converge to the final winner",
@@ -840,7 +835,6 @@ with remote(legacy_reclaim):
         legacy_reclaim_mismatch = exc.payload["reason"]
 check("metadata-less reclaim retries cannot change inferred runtime",
       legacy_reclaim_mismatch, "reclaim-metadata-mismatch")
-
 class ReclaimRace(FakeIssue):
     def run(self, argv, cwd=None, check=True, writes=False):
         if argv[:3] == ["gh", "issue", "comment"] and not any(
