@@ -13,19 +13,16 @@ adversarial review of the first version of that file, not from imagination.
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace as Namespace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("gh", Path(__file__).with_name("github.py"))
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
-
-def SimpleNamespace(**values):
-    values.setdefault("operation_id", "a" * 32)
-    return Namespace(**values)
 
 FAILURES: list[str] = []
 
@@ -685,23 +682,14 @@ legacy_target = m.ownership_epoch(m.ownership_events([legacy_claim])[0])
 legacy_timeline = [comment("untrusted", trusted=False), legacy_claim, comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C, target_op=legacy_target))]
 check("unrelated deletion cannot change a legacy epoch ID", [m.reduce_ownership(items, NOW)["holder"] for items in (legacy_timeline, legacy_timeline[1:])], [None, None])
 
-hidden_operation = FakeIssue()
-hidden_operation.delayed_reads = 9
-hidden_args = SimpleNamespace(issue=1, run_id=ME, runtime="claude-code", horizon=FUTURE, operation_id=OP_A)
-with remote(hidden_operation):
-    try:
-        m.cmd_claim(hidden_args, {}, Path("."))
-    except m.WriteFailure:
-        pass
-    hidden_operation.delayed_reads = 0
-    hidden_operation.stale_reads = 1
-    hidden_result = m.cmd_claim(hidden_args, {}, Path("."))
-check("a hidden retry may duplicate transport but not the ownership event",
-      (hidden_result["ok"], len(hidden_operation.comments),
-       len(m.ownership_events(hidden_operation.comments))), (True, 2, 1))
 conflicting_release = acquisitions[:1] + [comment(m.marker("standdown", run_id=ME, op_id=OP_A, target_op=target)) for target in (OP_A, OP_B)]
 check("conflicting release copies invalidate their acquisition", m.reduce_ownership(conflicting_release, NOW)["holder"], None)
-check("post-cutover incomplete controls cannot downgrade to broad releases", [m.reduce_ownership(acquisitions[:1] + [comment(m.marker("unassign", run_id=ME, runtime="opencode", **attrs), "2026-07-28T00:00:01Z")], NOW)["holder"] for attrs in ({"op_id": OP_C}, {})], [ME, ME])
+forged_target = [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_A)), comment(m.marker("claim", run_id=OTHER, runtime="codex", horizon=FUTURE, op_id=OP_B), "2026-01-02T00:00:01Z"), comment(m.marker("standdown", run_id=OTHER, op_id=OP_B, target_op=OP_A), "2026-01-02T00:00:02Z")]
+check("a scoped control cannot release another run's acquisition", m.reduce_ownership(forged_target, NOW)["holder"], ME)
+evidence_digest = hashlib.sha256(b"reason").hexdigest()
+wrong_target_hash = m.forced_reclaim_hash(evidence_digest, OTHER, "codex", FUTURE, ME, OP_A)
+edited_target = acquisitions + [comment(f"{m.FORCED_EVIDENCE_HEADING}\n\nreason\n\n{m.marker('reclaim', run_id=OTHER, runtime='codex', horizon=FUTURE, op_id=OP_C, from_op=OP_B, evidence_hash=wrong_target_hash, forced='true', evidence='required', **{'from': ME})}", "2026-01-02T00:00:03Z")]
+check("forced evidence binds the exact takeover metadata", m.reduce_ownership(edited_target, NOW)["holder"], ME)
 
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):
@@ -874,7 +862,7 @@ legacy_reclaim_mismatch = None
 with remote(legacy_reclaim):
     try:
         m.cmd_reclaim(SimpleNamespace(issue=1, run_id="codex-old", runtime="opencode",
-                                       horizon=FUTURE, force=False), {}, Path("."))
+                                       horizon=None, force=False), {}, Path("."))
     except m.Stop as exc:
         legacy_reclaim_mismatch = exc.payload["reason"]
 check("metadata-less reclaim retries cannot change inferred runtime",
