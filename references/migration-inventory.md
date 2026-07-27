@@ -1,6 +1,6 @@
 # Runtime contract migration inventory
 
-This ledger prevents the issue #7 refactor from silently deleting policy, rationale, or incident knowledge. A row is complete only when its final owner contains the knowledge and the old source is separately retired.
+This ledger prevents the issue #7 refactor from silently deleting policy, rationale, or incident knowledge. Source citations resolve against the frozen pre-migration revision `16dc4afe271109eca0767779c1f94777866d5da9`; a row is complete only when its final owner contains the knowledge and that baseline source is separately retired.
 
 | Status | Meaning |
 |---|---|
@@ -22,11 +22,11 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | S09 | Role: ANALYST (`SKILL.md:308-322`) | `SKILL.md` | The read-only boundary and one-finding limit remain direct runtime rules. | yes | yes |
 | S10 | Drain analysis and blocked (`SKILL.md:323-365`) | `SKILL.md` | Queue order and analyst tool boundary remain executable steps. | yes | yes |
 | S11 | Autonomous discovery (`SKILL.md:366-384`) | `references/domain-composition.md` | Consolidate the built-in fallback domain contract and deduplication bar. | yes | yes |
-| S12 | What the analyst produces (`SKILL.md:385-436`) | `SKILL.md` | Keep create/blocked instructions at runtime; the body schema moves to the asset. | yes | yes |
-| S13 | Role: DEV (`SKILL.md:440-602`) | `SKILL.md` | Preserve resume, claim, build, review, and delivery as the dev execution path. | yes | yes |
+| S12 | What the analyst produces (`SKILL.md:385-436`) | `SKILL.md` | Keep create/blocked instructions at runtime; the body schema moves to the asset. | yes | no |
+| S13 | Role: DEV (`SKILL.md:440-602`) | `SKILL.md` | Preserve resume, claim, build, review, and delivery as the dev execution path. | yes | no |
 | S14 | Repository default flow (`SKILL.md:603-742`) | `references/repository-delivery.md` | Consolidate branching, worktree, integration, review, and cleanup rationale. | yes | no |
-| S15 | Abandoned work (`SKILL.md:743-840`) | `references/safety-incidents.md` | Keep horizon, heartbeat, reclaim, and retention failure modes together. | yes | no |
-| S16 | Work that cannot finish (`SKILL.md:841-921`) | `references/safety-incidents.md` | Consolidate handoff-state rationale while retaining the decision gate in `SKILL.md`. | yes | no |
+| S15 | Abandoned work (`SKILL.md:743-840`) | `references/safety-incidents.md` | Keep horizon, heartbeat, reclaim, and retention failure modes together. | no | no |
+| S16 | Work that cannot finish (`SKILL.md:841-921`) | `references/safety-incidents.md` | Consolidate handoff-state rationale while retaining the decision gate in `SKILL.md`. | no | no |
 | S17 | State machine (`SKILL.md:922-972`) | `SKILL.md` | State meanings, exclusivity, blockers, and explicit done remain runtime decisions. | yes | yes |
 | S18 | Optional board view (`SKILL.md:973-1006`) | `references/safety-incidents.md` | Preserve authoritative-label and verified-projection rationale once; bindings own mechanics. | yes | no |
 | S19 | In-session agent team (`SKILL.md:1007-1036`) | `references/runtime-notes.md` | Isolate runtime-specific team lifetime and hook behavior. | yes | yes |
@@ -49,7 +49,7 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 
 | ID | Current source | Final owner/path | Intentional-consolidation rationale | Owner copied | Old source retired |
 |---|---|---|---|---|---|
-| I01 | Mechanical steps omitted despite correct prose (`SKILL.md:154-162`) | `references/safety-incidents.md` | Preserve why reversible transport operations are executable. | yes | no |
+| I01 | Mechanical steps omitted despite correct prose (`SKILL.md:154-162`) | `references/safety-incidents.md` | Preserve why reversible transport operations are executable. | yes | yes |
 | I02 | Five-minute loop nearly selected second work (`SKILL.md:444-460`) | `references/safety-incidents.md` | Preserve why self-held work is checked before queues. | yes | yes |
 | I03 | Issue #58 loser wrote into winner checkout (`SKILL.md:497-505`) | `references/safety-incidents.md` | Preserve the pre-filesystem claim-renewal incident. | yes | yes |
 | I04 | Dev marker attached only at close (`SKILL.md:510-516`) | `references/safety-incidents.md` | Preserve why attribution is projected during transition. | yes | yes |
@@ -60,15 +60,15 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | I09 | Wrong handoff state buried recoverable work (`SKILL.md:841-867`) | `references/safety-incidents.md` | Preserve why analysis, blocked, and review are distinct. | yes | no |
 | I10 | Long run repeated its documented `$?` mistake (`SKILL.md:887-900`) | `references/safety-incidents.md` | Preserve the evidence-based handoff threshold. | yes | no |
 | I11 | Issues #61/#62 never mirrored to the board (`SKILL.md:984-1005`) | `references/safety-incidents.md` | Preserve why transition verifies both state projections. | yes | no |
-| X01 | Codex rejects the slash skill sigil (`SKILL.md:27-34`) | `references/runtime-notes.md` | Consolidate runtime invocation differences. | yes | no |
-| X02 | Unknown labels fail at issue creation (`SKILL.md:121-125,967-971`) | `references/safety-incidents.md` | Preserve why create/ensure operations provision labels first. | yes | no |
-| X03 | Different priority scales cannot be globally ranked (`SKILL.md:130-141`) | `references/domain-composition.md` | Preserve partitioned selection semantics. | yes | no |
+| X01 | Codex rejects the slash skill sigil (`SKILL.md:27-34`) | `references/runtime-notes.md` | Consolidate runtime invocation differences. | yes | yes |
+| X02 | Unknown labels fail at issue creation (`SKILL.md:121-125,967-971`) | `references/safety-incidents.md` | Preserve why create/ensure operations provision labels first. | yes | yes |
+| X03 | Different priority scales cannot be globally ranked (`SKILL.md:130-141`) | `references/domain-composition.md` | Preserve partitioned selection semantics. | yes | yes |
 | X04 | Loading the wrong routing-arrow side applies the wrong job rules (`SKILL.md:277-287`) | `references/domain-composition.md` | Preserve explicit analyst/dev rule-book selection. | yes | yes |
 | X05 | Shell write access and teammate skill loading limits (`SKILL.md:352-364`) | `references/runtime-notes.md` | Consolidate runtime enforcement caveats. | yes | yes |
 | X06 | Fresh worktrees omit ignored credentials and settings (`SKILL.md:666-672`) | `references/repository-delivery.md` | Preserve environment reuse requirements. | yes | no |
 | X07 | Rebase invalidates SHA evidence and shared refs (`SKILL.md:706-714`) | `references/repository-delivery.md` | Preserve the merge-by-default rationale. | yes | no |
 | X08 | Missing acceptance criteria invites a fabricated done bar (`SKILL.md:902-918`) | `references/safety-incidents.md` | Preserve the pre-build criteria gate. | yes | no |
-| X09 | Human-decision blockers become abandoned (`SKILL.md:937-958`) | `references/safety-incidents.md` | Preserve precise exit-condition and discharger requirements. | yes | no |
+| X09 | Human-decision blockers become abandoned (`SKILL.md:937-958`) | `references/safety-incidents.md` | Preserve precise exit-condition and discharger requirements. | yes | yes |
 | X10 | Parallel A/B died from machine contention (`SKILL.md:1053-1060`) | `references/runtime-notes.md` | Preserve resource-coordination and sequential-rerun guidance. | yes | yes |
 
 ## Invariant families

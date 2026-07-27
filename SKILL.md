@@ -19,7 +19,7 @@ Load [domain composition](references/domain-composition.md) for handoff, priorit
 ## Hard Rules
 
 - Issue Flow owns roles, states, claims, and transitions; routed domains own value, priority, evidence, and done criteria. Neither side invents the other's policy.
-- An analyst, including an adversarial reviewer, is repository- and external-system-read-only: it creates no branch/worktree/commit/PR and runs no migration, sync, database write, or delivery action. It files at most one evidenced issue. Review MUST use a context that did not write the change.
+- An analyst, including an adversarial reviewer, is read-only for the repository and every external system except the configured tracker operations required below: it creates no branch/worktree/commit/PR and runs no migration, sync, database write, or delivery action. It files at most one evidenced issue. Review MUST use a context that did not write the change.
 - Mint one `<runtime>-<session-prefix>` run-id and reuse it for every write. Keep bounded runtime attribution in `analyst:<runtime>`/`dev:<runtime>` labels and unbounded run-id attribution in text; analyst labels persist, while dev labels are removed on release but retained on delivery.
 - Resume this run's held issue before consulting queues. Use the selected binding's timeline-adjudicated claim; the earliest live claim wins. Run `verify_claim` before the first repository write, every heartbeat, and every expensive or irreversible boundary; an unreadable control surface permits no write.
 - Keep exactly one of `analysis`, `ready`, `in-progress`, `review`, `blocked`, or `done`. The binding's workflow state is authoritative; every configured projection is updated and read back, and `done` is explicit before tracker closure.
@@ -44,9 +44,9 @@ Load [domain composition](references/domain-composition.md) for routing, scale v
 
 ### Analyst
 
-1. Keep the repository and external systems read-only. Drain `analysis` oldest first, then inspect `blocked`: move discharged conditions to `ready` with evidence, date conditions that still hold, and name how long a person has owed any pending decision.
+1. Keep the repository and non-tracker external systems read-only. Drain `analysis` oldest first, then inspect `blocked`: move discharged conditions to `ready` with evidence, date conditions that still hold, and name how long a person has owed any pending decision.
 2. Analyse only the bounded scope under the left-hand domain rule book. With no conditions or domain, use the autonomous `general` contract; verify evidence and duplicates, then keep at most the strongest defensible finding or report that none survived.
-3. For queued work, comment the evidence and transition that same item rather than creating a replacement. For a new finding, validate its fields, route, and declared priority scale, fill the [analyst issue template](assets/analyst-issue-template.md), and `create` it with every marker plus `analyst:<runtime>` and run-id attribution. Use `ready`, or `blocked` with the exact missing condition and discharger; then STOP without implementing or assigning it.
+3. Validate the fields, route, scale, and body contract for queued and new findings. For queued work, add missing handoff material with `comment` and transition only that same complete item; never create a replacement. For a new finding, fill the [analyst issue template](assets/analyst-issue-template.md) and `create` it with every marker plus `analyst:<runtime>` and run-id attribution. Use `ready`, or `blocked` with the exact missing condition and discharger; then STOP without implementing or assigning it.
 
 ### What the analyst produces
 
@@ -100,6 +100,42 @@ re-check the analysis without repeating it.
 4. Load the route's right-hand implementation rule book before planning; if absent, state that none applies and build to written acceptance criteria. Follow repository rules, use the repository-delivery fallback for missing isolation/integration policy, verify the claim immediately before the first branch/worktree/file write, and implement in the isolated checkout.
 5. Renew before publishing, publish or reuse the shared review target, then transition to `review`. Acquire an independent context only when `Review delegation` authorises this run; otherwise request a separately started review. Require its verdict and green CI on the same exact head/base; every push invalidates both. Leave blocked delivery in `review`, restore local state changed by the failed attempt, record the precise blocker, and unassign rather than bypassing it; conflicting repository rules get a separate issue.
 6. Renew at each irreversible boundary; merge only when reviewed, green, and current head/base identities match. For a merge-commit route, require the delivered SHA's exact parents to be the reviewed base and head; other configured strategies require their binding-declared equivalent topology and any delivered-SHA gate. For each changed version, publish and remotely verify its immutable annotated tag and required Release; renew again, transition to `done`, record review/CI/tests/measurements/PR/delivering SHA/publications with the run-id, and close. On handoff, preserve all evidence: wrong specification goes to `analysis`, unbuilt external wait to `blocked`, built-undeliverable work to `review`, and a useful partial diagnosis to `ready`.
+
+#### Detailed review gate retained until the final retirement slice
+
+6. **Get the published change reviewed by a context that did not write it, then require green CI on
+   the latest PR head.** Capture the head and base SHAs before review and require the verdict artifact
+   to name both explicitly; a floating "approved" is not evidence for any particular revision or
+   diff. Where the
+   configuration authorises it, obtain that context yourself — a
+   sub-agent or teammate; where it does not, hand the PR to a separately started analyst run and say
+   on the issue that you are waiting for it. What the configuration decides is who starts the
+   review, never whether it runs. Every push invalidates the prior verdict and CI result: re-review
+   the changed surface and wait for the required checks again.
+
+   If review, CI or delivery is blocked, STOP THERE and leave it in `review`. Work that is built and
+   published but cannot be shipped — a reviewer requests changes, a check fails, required native
+   approval cannot be supplied by a distinct identity, a permission is
+   missing, two project rules contradict each other — is *finished work awaiting delivery*, which
+   is exactly what `review` means. Do not move it to `done`: that state says delivered. Do not work
+   around the blocker either; a rule you bypass to ship is a rule that stops meaning anything.
+
+   Comment the blocker precisely — what refused it, what that thing expects, what the project
+   requires instead — then unassign so another actor can complete the delivery. Restore any local
+   state you changed trying.
+
+   **A blocker that comes from two project rules contradicting each other deserves its own issue.**
+   It will hit the next task, and the one after that, and each run will re-diagnose it from scratch.
+   One filed finding turns a recurring tax into a decision someone can make once.
+7. **Merge only the reviewed PR head after its required CI is green, publish any version tags, then
+   `close`.** Renew the claim
+   immediately before merging, require `reviewed head/base == CI head/base == current head/base`,
+   bind the merge to the reviewed head SHA, and refuse if either side moved. Use the configured merge strategy; a `merge commit`
+   preserves the branch boundary and PR ancestry, while squash and rebase deliberately discard that
+   information. Retrieve the delivered SHA after merge and verify it has exactly the reviewed base
+   and reviewed head as its parents; do not claim topology preservation from a command flag alone.
+   A merge queue is eligible only when its configured method guarantees that same topology. If the
+   project requires CI on the exact delivered SHA, wait for that post-merge gate.
 
 ### Working in a repository — the default flow
 
