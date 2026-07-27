@@ -1,8 +1,35 @@
 # Safety incidents and failure cases
 
-This ledger owns the historical evidence behind Issue Flow's safety rules. IDs are stable: keep each
-incident here exactly once, preserve its dates and issue links, and change the protection only when
-the surviving executable or document owner changes.
+This reference owns the portable safety procedure and the historical evidence behind it. Incident
+IDs are stable: keep each one here exactly once, preserve its dates and issue links, and change the
+protection only when the surviving executable or document owner changes.
+
+## Portable safety procedure
+
+These requirements are tracker-neutral. The selected binding and its scripts own detailed queries,
+ordering, mutations, and readbacks; they may strengthen, but never weaken, this procedure.
+
+- A claim MUST declare a horizon and report progress with heartbeats. Before writing each heartbeat,
+  before the first repository write, and before every expensive or irreversible boundary, the holder
+  MUST successfully verify the authoritative state and activity. Closure, departure from the working
+  state, or a control message revoking the claim is a stop instruction. An unreadable or ambiguous
+  control surface fails closed: write nothing and start no boundary action until verification succeeds.
+- Claimed work in any workflow state is reclaimable once its authoritative activity is past its
+  horizon, or past the binding's declared legacy inactivity window when no horizon exists. A forced
+  takeover before that boundary MUST state its exceptional reason and evidence in the audit trail.
+  The reclaimer MUST comment the takeover, take ownership, and verify that ownership
+  before repository writes. Retain and adopt prior branches, diffs, diagnoses, ruled-out hypotheses,
+  and evidence, then transition directly to the state those artifacts support. A displaced holder
+  MUST stop on its next renewal without changing the new holder's state.
+- Handoff goes to `analysis` for a wrong or incoherent specification, `blocked` for unbuilt work
+  awaiting an external change, `review` for built work awaiting delivery, or `ready` for a useful
+  diagnosis that still needs implementation. Record the exact blocker and its discharger. Persist
+  useful diagnoses, ruled-out hypotheses, methodological errors, and out-of-scope discoveries,
+  filing a separate finding when appropriate, so the next run does not repeat them.
+- Acceptance criteria MUST be written before building; otherwise state them first or return the work
+  to `analysis`. A partial fix never ships as complete. Hand off when the run repeats a documented
+  mistake, reaches three failed hypotheses without narrowing the problem, or edits more than it
+  measures.
 
 ## Omitted mechanics and stale projections
 
@@ -10,7 +37,7 @@ the surviving executable or document owner changes.
 |---|---|---|---|
 | I01 | Correct prose was repeatedly remembered incompletely: board mirroring was skipped for a whole session, five claimed issues were never relabeled, and heartbeat loops wrote without reading. | Put reversible, mechanical operations and their readbacks in the selected binding executable; leave judgement in prose. | `scripts/github.py`; each selected binding's operations table |
 | I04 | A correctly assigned and transitioned issue received its `dev:<runtime>` marker only at close, so live-holder queries could not find it during the build. | Project the bounded runtime marker when work becomes held; do not add a second claim event. | `SKILL.md` dev step 3; binding claim/transition operations |
-| I06 | Five runs died after claim and before transition, leaving assigned issues labeled `ready` after their horizons expired. | Treat claim and state as separate evidence, reclaim from any state, and transition to the state supported by retained work. | `SKILL.md` abandoned-work rules; binding claim/reclaim/transition operations |
+| I06 | Five runs died after claim and before transition, leaving assigned issues labeled `ready` after their horizons expired. | Treat claim and state as separate evidence, reclaim from any state, and transition to the state supported by retained work. | Portable safety procedure above; binding claim/reclaim/transition operations |
 | I11 | On 2026-07-25, issues #61 and #62 traversed labels through delivery while their configured board cards stayed on `Ready`; the mirror ran zero times. | A transition includes every configured projection and readback; both surfaces must agree before success. | Binding transition executable and board audit; `SKILL.md` state contract |
 | X02 | A tracker that rejects unknown labels can fail only after the analyst has completed all judgement and attempts the first create. | Provision the state vocabulary and supplied marker labels before attaching them; make setup idempotent. | Binding ensure/create operations; `SKILL.md` Hard Rules and Execution Steps |
 
@@ -20,8 +47,8 @@ the surviving executable or document owner changes.
 |---|---|---|---|
 | I02 | On 2026-07-26, a five-minute dev loop repeatedly re-entered selection while already holding one issue and nearly started additional work on every tick. | Resume self-held work before consulting any queue; one run holds one task. | `SKILL.md` dev step 1 |
 | I03 | On 2026-07-24, issue #58 was claimed by two runs 1m46s apart; the loser did not renew before filesystem work and wrote a model, migration, and tests into the winner's checkout. | Verify the live claim immediately before branch, worktree, or file creation; stop if the timeline says another run won. | Binding verify-claim and start-branch operations; `SKILL.md` dev step 4 |
-| I07 | On 2026-07-22, a run lost a claim race by five seconds, was told 33 seconds later, then posted three heartbeats and worked about 48 more minutes without rereading control messages. | Every heartbeat reads before it writes, and the same renewal precedes expensive or irreversible boundaries. | Binding heartbeat/verify-claim operations; `SKILL.md` abandoned-work rules |
-| I08 | Agent-team tasks have remained incomplete and blocked dependants after their session disappeared, requiring manual status repair. | Treat in-session task lists as ephemeral; persist progress on the issue and recover abandoned work from server-timestamped evidence. | `references/runtime-notes.md`; `SKILL.md` abandoned-work rules |
+| I07 | On 2026-07-22, a run lost a claim race by five seconds, was told 33 seconds later, then posted three heartbeats and worked about 48 more minutes without rereading control messages. | Every heartbeat reads before it writes, and the same renewal precedes expensive or irreversible boundaries. | Binding heartbeat/verify-claim operations; Portable safety procedure above |
+| I08 | Agent-team tasks have remained incomplete and blocked dependants after their session disappeared, requiring manual status repair. | Treat in-session task lists as ephemeral; persist progress on the issue and recover abandoned work from server-timestamped evidence. | `references/runtime-notes.md`; Portable safety procedure above |
 
 ## Repository isolation and immutable evidence
 
