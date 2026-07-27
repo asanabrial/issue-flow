@@ -23,7 +23,7 @@ Load [domain composition](references/domain-composition.md) for handoff, priorit
 - Mint one `<runtime>-<session-prefix>` run-id and reuse it for every write. Keep bounded runtime attribution in `analyst:<runtime>`/`dev:<runtime>` labels and unbounded run-id attribution in text; analyst labels persist, while dev labels are removed on release but retained on delivery.
 - Resume this run's held issue before consulting queues. Use the selected binding's timeline-adjudicated claim; the earliest live claim wins. Run `verify_claim` before the first repository write, every heartbeat, and every expensive or irreversible boundary; an unreadable control surface permits no write.
 - Keep exactly one of `analysis`, `ready`, `in-progress`, `review`, `blocked`, or `done`. The binding's workflow state is authoritative; every configured projection is updated and read back, and `done` is explicit before tracker closure.
-- The selected binding MUST map `ensure_states`, `create`, `list_state`, `claim`, `verify_claim`, `transition`, `comment`, `last_activity`, `label`, `unassign`, `publish_version`, and `close`. Run executable reversible operations instead of reconstructing them; bindings MUST declare unsupported capabilities and fail closed.
+- The selected binding MUST map `ensure_states`, `create`, `list_state`, `claim`, `reclaim`, `verify_claim`, `heartbeat`, `transition`, `comment`, `last_activity`, `label`, `unassign`, `publish_version`, and `close`. Run executable reversible operations instead of reconstructing them; bindings MUST declare unsupported capabilities and fail closed.
 - Issue acceptance criteria, routed domain rules, and repository rules define done. Never invent missing gates or reinterpret the issue silently.
 
 ## Decision Gates

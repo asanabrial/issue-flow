@@ -45,7 +45,7 @@ records which run did what even when every agent shares one login.
 
 ## Supported trackers
 
-The workflow is written as ten abstract operations (`claim`, `transition`, `comment`, …); each
+The workflow is written as fourteen abstract operations (`claim`, `transition`, `comment`, …); each
 tracker's binding says how its API performs them — and, just as important, what that tracker does
 NOT provide, so no rule silently stops applying.
 
@@ -53,6 +53,7 @@ NOT provide, so no rule silently stops applying.
 |---|---|---|---|
 | State model | `status:*` labels (discipline) | native workflow states (enforced) | lists — a card is in exactly one |
 | Claim verification | comment timeline | state check + comment timeline | comment trail (`commentCard`) |
+| Reclaim / heartbeat | executable | unsupported / fail-closed | unsupported / fail-closed |
 | Stable identity | issue number | `ENG-123` identifiers | `shortLink` / board-key prefix |
 | Transport | `gh` CLI or REST API | official MCP server or GraphQL | REST API |
 
