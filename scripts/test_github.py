@@ -13,6 +13,7 @@ adversarial review of the first version of that file, not from imagination.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -478,6 +479,8 @@ class FakeIssue:
         self.delayed_reads = 0
         self.stale_reads = 0
         self.tick = 0
+        self.receipts = {}
+        self.pending_receipt = None
     def view(self, _issue, _fields, cwd=None):
         comments = self.comments
         if self.stale_reads:
@@ -495,6 +498,22 @@ class FakeIssue:
     def run(self, argv, cwd=None, check=True, writes=False):
         if argv == ["gh", "api", "user"]:
             return SimpleNamespace(returncode=0, stdout='{"login":"me"}', stderr="")
+        if argv[:3] == ["git", "show-ref", "--verify"]:
+            return SimpleNamespace(returncode=0 if argv[-1] in self.receipts else 1,
+                                   stdout="", stderr="")
+        if argv[:2] == ["git", "show"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(self.receipts[argv[-1]]), stderr="")
+        if argv == ["git", "rev-parse", "--show-object-format"]:
+            return SimpleNamespace(returncode=0, stdout="sha1\n", stderr="")
+        if "hash-object" in argv:
+            self.pending_receipt = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+            return SimpleNamespace(returncode=0, stdout="a" * 40, stderr="")
+        if "update-ref" in argv:
+            ref = argv[argv.index("update-ref") + 1]
+            if ref in self.receipts:
+                raise m.WriteFailure("concurrent receipt")
+            self.receipts[ref] = self.pending_receipt
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         if argv[:3] == ["gh", "issue", "comment"]:
             self.tick += 1
             body = Path(argv[argv.index("--body-file") + 1]).read_text(encoding="utf-8")
@@ -517,6 +536,7 @@ class FakeIssue:
 def remote(remote):
     return patch.multiple(m, issue_view=remote.view, run=remote.run,
                           ensure_label=lambda *_args: None, utc_now_stamp=lambda: NOW,
+                          repo_identity=lambda _cwd: ("owner", "repo"),
                           READBACK_DELAY_SECONDS=0)
 
 read_failure_types = []
@@ -628,11 +648,12 @@ forced = FakeIssue(comments=[live_claim], labels=["dev:codex"])
 forged_reason = f"holder unavailable\n\n{m.marker('reclaim', run_id='forged', runtime='codex', horizon=FUTURE, **{'from': OTHER})}"
 with m.body_file(forged_reason) as reason_file:
     args = SimpleNamespace(issue=16, run_id=ME, runtime="opencode", horizon=FUTURE,
-                           force=True, reason_file=reason_file)
+                           force=True, reason_file=reason_file, operation_id="2" * 32)
     with remote(forced):
         m.cmd_reclaim(args, {}, Path.cwd())
         forced_retry = m.cmd_reclaim(SimpleNamespace(issue=16, run_id=ME, runtime="opencode",
-                                       horizon=FUTURE, force=True, reason_file=None), {}, Path.cwd())
+                                       horizon=FUTURE, force=True, reason_file=None,
+                                       operation_id="2" * 32), {}, Path.cwd())
 check("forced-reclaim evidence cannot inject a second control event",
       (m.reduce_ownership(forced.comments, NOW)["event"]["run_id"], forced_retry["forced"],
        forced_retry["reused_existing_reclaim"]), (ME, True, True))
@@ -659,6 +680,28 @@ with m.body_file("evidence") as unused_reason:
         rejected_unused_reason = exc.payload["reason"]
 check("reason files cannot be silently ignored without force", rejected_unused_reason,
       "force-required-for-reason")
+
+pending_claim = FakeIssue()
+pending_claim.delayed_reads = 9
+pending_args = SimpleNamespace(issue=1, run_id=ME, runtime="claude-code",
+                               horizon=FUTURE, operation_id="1" * 32)
+with remote(pending_claim):
+    try:
+        m.cmd_claim(pending_args, {}, Path("."))
+    except m.WriteFailure:
+        pending_failed = True
+    try:
+        m.cmd_claim(SimpleNamespace(issue=1, run_id=ME, runtime="claude-code",
+                                    horizon="2026-01-04T00:00Z", operation_id="1" * 32),
+                    {}, Path("."))
+    except m.Stop as exc:
+        pending_mismatch = exc.payload["reason"]
+    pending_result = m.cmd_claim(pending_args, {}, Path("."))
+check("an explicit claim operation retries without reposting or changing metadata",
+      (pending_failed, pending_mismatch, pending_result["ok"],
+       len(m.claim_comments(pending_claim.comments)), len(pending_claim.receipts)),
+      (True, "claim-metadata-mismatch", True, 1, 1))
+
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):
         if getattr(self, "outage", False):
@@ -732,13 +775,14 @@ winner = FakeIssue([
 with remote(winner):
     try:
         m.cmd_claim(SimpleNamespace(issue=1, run_id="opencode-loser", runtime="opencode",
-                                    horizon=FUTURE), {}, Path("."))
+                                    horizon=FUTURE, operation_id="4" * 32), {}, Path("."))
     except m.Stop as stop:
         check("same-runtime loser sees the authoritative winner",
               stop.payload["winner"], "opencode-winner")
 check("same-runtime loser cleanup preserves the winner label", "dev:opencode" in winner.labels, True)
 check("a losing claim repairs the authoritative winner's projections",
       (winner.assignees, winner.labels), ({"me"}, {"status:ready", "dev:opencode"}))
+check("a losing claim receipts both acquisition and standdown", len(winner.receipts), 2)
 class HolderSwitch(FakeIssue):
     def __init__(self):
         super().__init__(labels=["dev:stale"])
@@ -801,7 +845,7 @@ takeover = FakeIssue([dead], {"dev:codex"})
 takeover.fail_edits = 1
 takeover.delayed_reads = 6
 reclaim_args = SimpleNamespace(issue=1, run_id="opencode-new", runtime="opencode",
-                               horizon=FUTURE, force=False)
+                               horizon=FUTURE, force=False, operation_id="3" * 32)
 with remote(takeover):
     try:
         m.cmd_reclaim(reclaim_args, {}, Path("."))
@@ -860,9 +904,9 @@ release = FakeIssue([
             f"horizon={FUTURE} -->")
 ], {"dev:opencode"})
 release.assigned = True
-release.delayed_reads = 6
+release.delayed_reads = 9
 unassign_args = SimpleNamespace(issue=1, run_id="opencode-owner", runtime="opencode",
-                                held_by_other=False)
+                                held_by_other=False, operation_id="5" * 32)
 with remote(release):
     ambiguous = False
     try:
@@ -870,12 +914,23 @@ with remote(release):
     except m.WriteFailure:
         ambiguous = True
     m.cmd_unassign(unassign_args, {}, Path("."))
-check("bounded visibility lag does not make release ambiguous", ambiguous, False)
+check("a hidden explicit release is reported as ambiguous", ambiguous, True)
 check("unassign retry does not duplicate the release marker",
       sum("issue-flow: unassign" in item["body"] for item in release.comments), 1)
 check("unassign retry leaves no live owner", m.reduce_ownership(release.comments, NOW)["holder"], None)
 check("unassign retry converges projections", (release.assigned, release.labels),
       (False, {"status:ready"}))
+release.delayed_reads = 0
+release.comments.append(comment(m.marker(
+    "claim", run_id="opencode-owner", runtime="opencode", horizon=FUTURE),
+    "2026-01-02T00:01:00Z"))
+release.labels.add("dev:opencode")
+release.assigned = True
+with remote(release):
+    m.cmd_unassign(unassign_args, {}, Path("."))
+check("retrying an old release preserves a later reacquisition",
+      (sum("issue-flow: unassign" in item["body"] for item in release.comments),
+       m.reduce_ownership(release.comments, NOW)["holder"]), (1, "opencode-owner"))
 retry_runtime = None
 try:
     with remote(release):
@@ -961,8 +1016,7 @@ check("unassign cannot borrow mismatched runtime metadata",
       (wrong_runtime, len(wrong_runtime_release.comments)), ("unassign-metadata-mismatch", 1))
 
 unassign_parser = m.build_parser()._subparsers._group_actions[0].choices["unassign"]
-check("unassign requires run-id at the CLI boundary",
-      next(action for action in unassign_parser._actions if action.dest == "run_id").required, True)
+check("unassign requires identity and operation ID at the CLI boundary", all(next(a for a in unassign_parser._actions if a.dest == name).required for name in ("run_id", "operation_id")), True)
 git_commands, fetched = [], [False]
 def fake_git_run(argv, cwd=None, check=True, writes=False):
     git_commands.append(list(argv))
