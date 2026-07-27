@@ -19,7 +19,7 @@ Load [domain composition](references/domain-composition.md) for handoff, priorit
 ## Hard Rules
 
 - Issue Flow owns roles, states, claims, and transitions; routed domains own value, priority, evidence, and done criteria. Neither side invents the other's policy.
-- An analyst, including an adversarial reviewer, is repository-read-only, creates no branch/worktree/commit/PR, and files at most one evidenced issue. Review MUST use a context that did not write the change.
+- An analyst, including an adversarial reviewer, is repository- and external-system-read-only: it creates no branch/worktree/commit/PR and runs no migration, sync, database write, or delivery action. It files at most one evidenced issue. Review MUST use a context that did not write the change.
 - Mint one `<runtime>-<session-prefix>` run-id and reuse it for every write. Keep bounded runtime attribution in `analyst:<runtime>`/`dev:<runtime>` labels and unbounded run-id attribution in text; analyst labels persist, while dev labels are removed on release but retained on delivery.
 - Resume this run's held issue before consulting queues. Use the selected binding's timeline-adjudicated claim; the earliest live claim wins. Run `verify_claim` before the first repository write, every heartbeat, and every expensive or irreversible boundary; an unreadable control surface permits no write.
 - Keep exactly one of `analysis`, `ready`, `in-progress`, `review`, `blocked`, or `done`. The binding's workflow state is authoritative; every configured projection is updated and read back, and `done` is explicit before tracker closure.
@@ -44,9 +44,53 @@ Load [domain composition](references/domain-composition.md) for routing, scale v
 
 ### Analyst
 
-1. Keep the repository read-only. Drain `analysis` oldest first, then inspect `blocked`: move discharged conditions to `ready` with evidence, date conditions that still hold, and name how long a person has owed any pending decision.
+1. Keep the repository and external systems read-only. Drain `analysis` oldest first, then inspect `blocked`: move discharged conditions to `ready` with evidence, date conditions that still hold, and name how long a person has owed any pending decision.
 2. Analyse only the bounded scope under the left-hand domain rule book. With no conditions or domain, use the autonomous `general` contract; verify evidence and duplicates, then keep at most the strongest defensible finding or report that none survived.
-3. Validate the finding fields, route, and declared priority scale, fill the [analyst issue template](assets/analyst-issue-template.md), and `create` it with every marker plus `analyst:<runtime>` and run-id attribution. Use `ready`, or `blocked` with the exact missing condition and discharger; then STOP without implementing or assigning it.
+3. For queued work, comment the evidence and transition that same item rather than creating a replacement. For a new finding, validate its fields, route, and declared priority scale, fill the [analyst issue template](assets/analyst-issue-template.md), and `create` it with every marker plus `analyst:<runtime>` and run-id attribution. Use `ready`, or `blocked` with the exact missing condition and discharger; then STOP without implementing or assigning it.
+
+### What the analyst produces
+
+An issue a developer can pick up **without redoing the analysis**. If the dev has to re-derive your
+reasoning, the analysis bought nothing.
+
+```markdown
+## Description for dumb humans
+
+> [!NOTE]
+> One or two sentences, plain language, no jargon, no file paths, no metrics — what this issue is
+> about, for someone who will never read past this line. Written in whatever language the operator
+> configuration names for this installation (see the table at the end of this file). The header
+> itself is the fixed, literal title above — always in English, always that exact phrase, never
+> reworded per issue. `> [!NOTE]` is GitHub's native alert syntax — it renders as a bordered,
+> coloured callout, which is the point: this has to be visually impossible to miss on an issue
+> otherwise full of technical prose.
+
+This is the first thing on the issue, before `## Problem`.
+
+## Problem
+What is wrong or missing, and how you know. Evidence, not assertion:
+file:line references, measured numbers, logs, reproduction steps.
+
+## Why it matters
+Impact if left alone. If you cannot state one, say so plainly — a documented
+"low impact, filed for completeness" is honest and lets the dev deprioritise.
+
+## Proposed approach
+The design. Alternatives you considered and why you rejected them.
+If you are NOT confident, say which part is uncertain and what would settle it.
+
+## Acceptance criteria
+Checkable statements. "Faster" is not a criterion; "p95 under 200 ms measured
+by X" is. Include what must NOT change (invariants, byte-identical outputs).
+
+## Out of scope
+What a dev should explicitly not do here. This prevents scope creep more
+reliably than any amount of prose in the sections above.
+
+## Evidence
+Commands run, files read, numbers measured. Enough that a reviewer can
+re-check the analysis without repeating it.
+```
 
 ### Developer
 
@@ -54,8 +98,8 @@ Load [domain composition](references/domain-composition.md) for routing, scale v
 2. For `ready`, partition valid candidates by stable domain and declared scale, rank only within each partition, and choose the oldest partition head; a selected domain limits selection to its highest-ranked oldest item. Use oldest-first only when no candidate has a valid scale contract.
 3. `claim` with the run-id and horizon, then adjudicate the server-timestamped timeline; the earliest live claim wins, and a loser comments, releases, and selects again. Keep claimed review work in `review` unless a code change requires `in-progress` and a fresh publish/review/CI cycle; for ready work, transition once to `in-progress` with `dev:<runtime>` and no second claim event.
 4. Load the route's right-hand implementation rule book before planning; if absent, state that none applies and build to written acceptance criteria. Follow repository rules, use the repository-delivery fallback for missing isolation/integration policy, verify the claim immediately before the first branch/worktree/file write, and implement in the isolated checkout.
-5. Renew before publishing, publish or reuse the shared review target, then transition to `review`. Require an independent verdict and green CI on the same exact head/base; every push invalidates both. Leave blocked delivery in `review`, record the precise blocker, and unassign rather than bypassing it.
-6. Renew at each irreversible boundary; merge only when reviewed, green, and current head/base identities match, then verify delivered topology and any required delivered-SHA gate. For each changed version, publish and remotely verify its immutable annotated tag and required Release; renew again, transition to `done`, record review/CI/tests/measurements/PR/delivering SHA/publications with the run-id, and close. On handoff, preserve all evidence: wrong specification goes to `analysis`, unbuilt external wait to `blocked`, built-undeliverable work to `review`, and a useful partial diagnosis to `ready`.
+5. Renew before publishing, publish or reuse the shared review target, then transition to `review`. Acquire an independent context only when `Review delegation` authorises this run; otherwise request a separately started review. Require its verdict and green CI on the same exact head/base; every push invalidates both. Leave blocked delivery in `review`, restore local state changed by the failed attempt, record the precise blocker, and unassign rather than bypassing it; conflicting repository rules get a separate issue.
+6. Renew at each irreversible boundary; merge only when reviewed, green, and current head/base identities match. For a merge-commit route, require the delivered SHA's exact parents to be the reviewed base and head; other configured strategies require their binding-declared equivalent topology and any delivered-SHA gate. For each changed version, publish and remotely verify its immutable annotated tag and required Release; renew again, transition to `done`, record review/CI/tests/measurements/PR/delivering SHA/publications with the run-id, and close. On handoff, preserve all evidence: wrong specification goes to `analysis`, unbuilt external wait to `blocked`, built-undeliverable work to `review`, and a useful partial diagnosis to `ready`.
 
 ### Working in a repository — the default flow
 
