@@ -1178,7 +1178,22 @@ def cmd_verify_claim(args, config, cwd) -> dict:
 
 def cmd_reclaim(args, config, cwd) -> dict:
     """Atomically in timeline terms displace a holder and establish the new live owner."""
-    data = issue_view(args.issue, "state,labels,comments", cwd=cwd)
+    force_reason = None
+    if args.force:
+        reason_file = getattr(args, "reason_file", None)
+        if not reason_file:
+            raise Stop({"ok": False, "reason": "force-reason-required",
+                        "action": "pass --reason-file with non-empty UTF-8 reason and evidence"})
+        try:
+            force_reason = Path(reason_file).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            raise Stop({"ok": False, "reason": "force-reason-invalid", "detail": str(exc),
+                        "action": "provide a readable UTF-8 --reason-file"}) from exc
+        if not force_reason:
+            raise Stop({"ok": False, "reason": "force-reason-required",
+                        "action": "--reason-file must contain non-empty reason and evidence"})
+
+    data = issue_view(args.issue, "state,assignees,labels,comments", cwd=cwd)
     if data.get("state") != "OPEN":
         raise Stop({"ok": False, "reason": "issue-not-open",
                     "action": "nothing to reclaim on a closed issue"})
@@ -1195,6 +1210,13 @@ def cmd_reclaim(args, config, cwd) -> dict:
     elif before["stale"]:
         held_at, holder = before["stale"][0]["created_at"], before["stale"][0]["run_id"]
     else:
+        projected = bool(data.get("assignees")) or any(
+            label.startswith("dev:") for label in label_names(data)
+        )
+        if projected:
+            raise Stop({"ok": False, "reason": "projection-only-ownership",
+                        "action": "stop; assignee/dev projection exists without timeline authority; "
+                                  "repair or audit the ownership evidence"})
         raise Stop({"ok": False, "reason": "nothing-to-reclaim",
                     "action": "no live claim on this issue — use `claim` instead"})
 
@@ -1220,10 +1242,12 @@ def cmd_reclaim(args, config, cwd) -> dict:
         horizon = args.horizon or (
             datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=4)
         ).strftime("%Y-%m-%dT%H:%MZ")
+        reason = (f"\n\nForced takeover reason and evidence:\n\n{force_reason}"
+                  if force_reason else "")
         with body_file(
             f"Reclaiming from `{holder}`; last activity {last_activity_by(comments, holder) or 'none'}, "
             f"claimed at {held_at}.\n\nTaken over by `{args.run_id}`; expect to report by {horizon}. "
-            f"Nothing the previous run left will be discarded.\n\n"
+            f"Nothing the previous run left will be discarded.{reason}\n\n"
             f"{marker('reclaim', run_id=args.run_id, runtime=args.runtime, horizon=horizon, forced='true' if args.force else None, **{'from': holder})}\n"
         ) as note:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", note],
@@ -1366,14 +1390,17 @@ def worktree_path(template: str, repo: str, branch: str, run_id: str, issue: int
     only one of them is the inconsistency that becomes a traversal later. `..` segments are
     rejected outright for the same reason.
 
-    Path uniqueness comes from the run-id, and `cmd_start_branch` refuses a path that already
-    exists. Why that is not paranoia — the 2026-07-24 collision — is told once, in
+    Path uniqueness comes from the run-id; `cmd_start_branch` reuses only this run's registered
+    branch path and refuses foreign or orphaned paths. The 2026-07-24 collision is told once, in
     `bindings/github.md` under *Branch, worktree and the linked issue*. It is deliberately NOT
     retold here: an incident narrated in three files goes stale in two of them.
     """
     if "<run-id>" not in template:
         raise Stop({"ok": False, "reason": "unsafe-worktree-template",
                     "action": "worktree location must contain <run-id> to isolate live writers"})
+    if ".." in re.split(r"[/\\]+", template):
+        raise Stop({"ok": False, "reason": "unsafe-worktree-template",
+                    "action": "worktree location may not contain a literal `..` path segment"})
 
     def flatten(value: str) -> str:
         cleaned = re.sub(r"[/\\]+", "-", str(value)).strip()
@@ -1489,18 +1516,9 @@ def cmd_start_branch(args, config, cwd) -> dict:
     _, repo_name = repo_identity(cwd)
     path = worktree_path(template, repo_name, args.branch, args.run_id, args.issue)
 
-    # An existing path means one of three different things, and they are not interchangeable.
-    #
-    # This matters because the template is configurable. With `<run-id>` in it a path is unique per
-    # run, so ANY existing path is foreign. Without it — `<repo>/<branch>` — an existing path is
-    # usually your OWN branch's worktree, and refusing it would make every resume impossible while
-    # protecting against nothing: git already refuses a second checkout of a branch that is live
-    # elsewhere ("fatal: '<branch>' is already used by worktree at ..."), which is the collision
-    # that actually costs work.
-    #
-    # So the question is not "does it exist" but "is it MINE": a registered worktree for this exact
-    # branch is a resume; anything else is a stranger's tree or an orphan directory left by a dead
-    # run, and writing into either is the #58 failure.
+    # A per-run path may already exist only when this same run resumes. Git registration for the
+    # exact branch makes that case reusable; a foreign checkout or orphan is never permission to
+    # write, and a reclaiming run computes a different path from its own run-id.
     resuming = False
     if path.exists():
         registered = registered_worktrees(cwd)
@@ -2089,7 +2107,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime", required=True)
     p.add_argument("--horizon", help="new ownership horizon; defaults to four hours from now")
     p.add_argument("--force", action="store_true",
-                   help="reclaim a holder whose horizon has NOT passed — needs a defensible reason")
+                   help="reclaim before the horizon; requires --reason-file")
+    p.add_argument("--reason-file",
+                   help="non-empty UTF-8 reason and evidence included in the forced reclaim comment")
 
     p = sub.add_parser("transition", help="mirror the board, swap the label, read BOTH back")
     p.add_argument("--issue", type=int, required=True)

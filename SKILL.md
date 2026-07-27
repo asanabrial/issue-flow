@@ -135,7 +135,147 @@ re-check the analysis without repeating it.
    information. Retrieve the delivered SHA after merge and verify it has exactly the reviewed base
    and reviewed head as its parents; do not claim topology preservation from a command flag alone.
    A merge queue is eligible only when its configured method guarantees that same topology. If the
-   project requires CI on the exact delivered SHA, wait for that post-merge gate.
+    project requires CI on the exact delivered SHA, wait for that post-merge gate.
+
+### Working in a repository — the default flow
+
+**The repository's rules win, always.** Read its agent instructions (`AGENTS.md`, `CLAUDE.md` or
+equivalent) before anything else and follow them. What follows is the fallback for a repo that
+prescribes nothing, and a floor under one that prescribes only part of it — never a competing
+standard.
+
+The older fallback — *use the commit history as the convention* — does not stretch this far, and it
+is worth saying why. A git log tells you how commit messages are written. It cannot tell you whether
+two agents may share a checkout, or whether a branch verified last hour is still valid after someone
+else merged. Those answers decide whether parallel work corrupts itself, so this skill supplies
+them rather than leaving them to a domain that has no reason to know.
+
+**1. Never work in the base tree.** For a dev, the default branch is read-only: no edits, no commits.
+Check before the first change instead of assuming:
+
+```bash
+git branch --show-current   # main / master -> stop, branch first
+```
+
+If you find you already committed to the base branch and have NOT pushed, move the commits to a
+branch and reset. **If you already pushed, do not force-push** — revert and redo it properly.
+Force-pushing a shared base is how another agent's checkout silently diverges from history it has
+already built on.
+
+**2. One issue, one branch, one isolated checkout.** Branch from the freshly fetched remote base, not
+from a local copy that may be days stale, and give each dev its own worktree so that a half-written
+tree is never visible to anyone else:
+
+```bash
+git fetch origin
+git branch <branch> origin/<base>
+git worktree add <path> <branch>
+```
+
+**Where the worktree goes is not a free choice, and one repository is not the unit to think about.**
+Two constraints bind it. It must live **outside the working tree** — git allows a worktree inside the
+repository and it then pollutes status and ignores for everyone. And its path must be **unique per
+repository**, not merely per branch: a shared parent like `<somewhere>/worktrees/<branch>` collides
+the moment two repositories both have a `fix/login`, and the second `worktree add` fails with a
+message about a path that already exists, naming neither repository. Put the repository's name in the
+path. Some tooling adds a third constraint — a per-worktree index or cache that must not be shared —
+so check what your setup expects before settling on a pattern.
+
+**Record the branch on the issue the moment it exists** — natively where the tracker supports it,
+as a comment where it does not; the binding says which. A branch nobody can find from the issue is
+work nobody can follow, and the board's whole value is that following work never requires guessing.
+
+**Name the BRANCH after the issue; make the WORKTREE PATH unique per RUN.** The issue number is what
+joins the code back to the board without anyone parsing prose, and it survives a run whose
+attribution nobody can explain any more — so the branch carries it, and the branch is what the PR,
+the development sidebar and the merge all key on.
+
+The worktree path is a different question with a different answer. It is a *local directory* joined
+to nothing, and deriving it purely from the issue means two runs that both want issue 58 compute the
+same path and share one checkout. Git will not save you: `worktree add` refuses a branch already
+checked out elsewhere, but **nothing refuses a second process writing into a directory that already
+exists**. So put the run-id in the path — `<root>/<repo>/<issue>-<slug>-<run-id>` — and the collision
+becomes impossible instead of merely unlikely. The cost is one stale directory when a run dies; the
+cost of the shared path is two agents editing one tree with no record anywhere that it happened
+(seen live on #58, 2026-07-24: model, migration and test files appearing in a checkout their author
+had created clean minutes earlier).
+
+**A fresh worktree does not have the files git never tracked.** Everything gitignored — environment
+files, secrets, credentials, local settings — is simply absent, and the failure it produces is
+confusing rather than obvious: the tool starts normally and then dies on a variable it has never had
+trouble with, in a tree that looks identical to the one that works. Copy across whatever the project
+needs before running anything. Reuse the interpreter or dependency tree the main checkout already
+has, with the worktree as the working directory, instead of building a second one — per-worktree
+installs are slow, drift apart, and are the reason a test can pass in one tree and fail in the other.
+
+**Isolation is verified on both sides, exactly like a claim.** Whoever creates the worktree creates
+it; the dev that starts working confirms it is in one before touching a file. Skipping that check and
+working in the shared tree clobbers whoever else is building — and unlike two devs on one issue,
+**nothing on the board records it**. That is precisely why this rule cannot be left to a domain.
+
+**Verify it again the moment the tree surprises you.** A file you did not write, a modification to a
+file you never touched, a tool reporting that something changed under you — inside a worktree that is
+supposed to be yours alone, every one of those means another process is in your directory. Stop
+writing and run `verify_claim`; the timeline, not the filesystem, decides who continues:
+
+- **You are not the earliest claimant** → stand down. Leave what is there, change no state, and say
+  on the issue what you saw and where your own work is, so the holder can pick it up.
+- **You are** → say so on the issue naming the other run, and **adopt what it left rather than
+  deleting it**. Its work is real even though the coordination failed, and two runs converging on one
+  issue usually converge on a similar design.
+
+What is never right is editing around the intruder. That produces one tree holding two designs and a
+build that belongs to nobody — strictly worse than either run's work alone.
+
+**3. Integrate the base before publishing the PR, then verify again.** Your branch was verified
+against the base as it stood when you started; every merge landed since then ages that result. Bring
+the base in, resolve honestly, and **re-run the verification**:
+
+```bash
+git fetch origin
+git merge origin/<base>     # inside your worktree
+```
+
+Resolving a conflict is a code change. An unverified resolution is an untested commit with better
+manners, and picking one side wholesale to make the markers go away is how a merge quietly deletes
+someone else's fix.
+
+**Merge, do not rebase — and the default is this way round for reasons, not taste.** Rebase buys a
+tidier history by rewriting every commit SHA, which costs two things that matter more here. Anything
+bound to those SHAs is silently invalidated: a recorded review result, a signed gate, a pinned
+deployment, a CI run recorded against the commit. And rebasing a branch that is already pushed forces a
+force-push, on a branch another agent may have fetched and built on — the one operation this flow
+tells you never to perform on the base, applied to work someone else is holding.
+
+Rebase only where the repository asks for it and nothing points at the SHAs. A repo rule outranks
+this default like every other.
+
+**4. Preserve the reviewed history through the configured delivery route.** For a pull-request
+route, push the branch, open the PR, and bind review and required CI to its latest head SHA. Merge
+with a merge commit when preservation of merge information is configured: the merge commit records
+the branch boundary and the PR retains the review and CI evidence. Never squash or rebase in that
+mode; both replace the reviewed topology with a different history.
+
+The merge commit itself is a new SHA, so distinguish two gates instead of pretending otherwise:
+pre-merge CI proves the PR head (and, where the host provides it, its merge candidate); a repository
+that requires the exact delivered SHA must also run its post-merge gate before the issue closes.
+For both gates, the expected set is the union of host-required checks and every applicable lane the
+repository names; a missing or skipped expected lane is not green. If the base or PR head moves
+before merge, return to step 3, re-verify, re-review the changed surface, and re-run required CI.
+Never bypass the race with an administrative override.
+
+**Whether you may land it at all is a project decision, not yours.** Some repositories require a
+human decision; some pre-authorise delivery after review and CI. **Default to asking** unless the
+repository or configuration says otherwise. A pull request is a configured delivery route, not a
+silent workaround for a refused direct push.
+
+**5. Clean up what you created.** Remove the worktree once the work is delivered or abandoned. An
+orphaned worktree keeps its branch checked out, and the next run that tries to use that branch gets a
+refusal it did not cause and cannot explain.
+
+**Where the repo says otherwise, do it their way and say so on the issue.** And if the repo's rules
+make isolation impossible while another dev is active, that is not a rule to bypass — it is a blocker
+to file, exactly as in step 6.
 
 ### Where to put work you cannot finish
 

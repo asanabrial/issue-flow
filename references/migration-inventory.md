@@ -24,7 +24,7 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | S11 | Autonomous discovery (`SKILL.md:366-384`) | `references/domain-composition.md` | Consolidate the built-in fallback domain contract and deduplication bar. | yes | yes |
 | S12 | What the analyst produces (`SKILL.md:385-436`) | `SKILL.md` | Keep create/blocked instructions at runtime; the body schema moves to the asset. | yes | no |
 | S13 | Role: DEV (`SKILL.md:440-602`) | `SKILL.md` | Preserve resume, claim, build, review, and delivery as the dev execution path. | yes | no |
-| S14 | Repository default flow (`SKILL.md:603-742`) | `references/repository-delivery.md` | Consolidate branching, worktree, integration, review, and cleanup rationale. | yes | yes |
+| S14 | Repository default flow (`SKILL.md:603-742`) | `references/repository-delivery.md` | Consolidate branching, worktree, integration, review, and cleanup rationale. | yes | no |
 | S15 | Abandoned work (`SKILL.md:743-840`) | `references/safety-incidents.md` | Keep horizon, heartbeat, reclaim, and retention failure modes together. | yes | yes |
 | S16 | Work that cannot finish (`SKILL.md:841-921`) | `references/safety-incidents.md` | Consolidate handoff-state rationale while retaining the decision gate in `SKILL.md`. | yes | no |
 | S17 | State machine (`SKILL.md:922-972`) | `SKILL.md` | State meanings, exclusivity, blockers, and explicit done remain runtime decisions. | yes | yes |
@@ -53,7 +53,7 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | I02 | Five-minute loop nearly selected second work (`SKILL.md:444-460`) | `references/safety-incidents.md` | Preserve why self-held work is checked before queues. | yes | yes |
 | I03 | Issue #58 loser wrote into winner checkout (`SKILL.md:497-505`) | `references/safety-incidents.md` | Preserve the pre-filesystem claim-renewal incident. | yes | yes |
 | I04 | Dev marker attached only at close (`SKILL.md:510-516`) | `references/safety-incidents.md` | Preserve why attribution is projected during transition. | yes | yes |
-| I05 | Issue #58 shared worktree collision (`SKILL.md:656-664`) | `references/repository-delivery.md` | Preserve why worktree identity must prevent cross-run writes. | yes | yes |
+| I05 | Issue #58 shared worktree collision (`SKILL.md:656-664`) | `references/repository-delivery.md` | Preserve why worktree identity must prevent cross-run writes. | yes | no |
 | I06 | Five claims never transitioned (`SKILL.md:751-759`) | `references/safety-incidents.md` | Preserve the claim/transition partial-failure case. | yes | yes |
 | I07 | Claim loser worked 48 minutes after adjudication (`SKILL.md:777-802`) | `references/safety-incidents.md` | Preserve why every heartbeat reads before writing. | yes | yes |
 | I08 | Agent-team tasks left incomplete (`SKILL.md:761-766`) | `references/runtime-notes.md` | Preserve the external-session recovery limitation. | yes | yes |
@@ -65,8 +65,8 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | X03 | Different priority scales cannot be globally ranked (`SKILL.md:130-141`) | `references/domain-composition.md` | Preserve partitioned selection semantics. | yes | yes |
 | X04 | Loading the wrong routing-arrow side applies the wrong job rules (`SKILL.md:277-287`) | `references/domain-composition.md` | Preserve explicit analyst/dev rule-book selection. | yes | yes |
 | X05 | Shell write access and teammate skill loading limits (`SKILL.md:352-364`) | `references/runtime-notes.md` | Consolidate runtime enforcement caveats. | yes | yes |
-| X06 | Fresh worktrees omit ignored credentials and settings (`SKILL.md:666-672`) | `references/repository-delivery.md` | Preserve environment reuse requirements. | yes | yes |
-| X07 | Rebase invalidates SHA evidence and shared refs (`SKILL.md:706-714`) | `references/repository-delivery.md` | Preserve the merge-by-default rationale. | yes | yes |
+| X06 | Fresh worktrees omit ignored credentials and settings (`SKILL.md:666-672`) | `references/repository-delivery.md` | Preserve environment reuse requirements. | yes | no |
+| X07 | Rebase invalidates SHA evidence and shared refs (`SKILL.md:706-714`) | `references/repository-delivery.md` | Preserve the merge-by-default rationale. | yes | no |
 | X08 | Missing acceptance criteria invites a fabricated done bar (`SKILL.md:902-918`) | `references/safety-incidents.md` | Preserve the pre-build criteria gate. | yes | no |
 | X09 | Human-decision blockers become abandoned (`SKILL.md:937-958`) | `references/safety-incidents.md` | Preserve precise exit-condition and discharger requirements. | yes | yes |
 | X10 | Parallel A/B died from machine contention (`SKILL.md:1053-1060`) | `references/runtime-notes.md` | Preserve resource-coordination and sequential-rerun guidance. | yes | yes |
@@ -104,10 +104,10 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | K27 | Built but undeliverable work stays in review and is never bypassed. | `SKILL.md` | Preserve honest delivery state. | yes | no |
 | K28 | Merge only the reviewed/green head and verify delivered topology. | `SKILL.md` | Preserve reviewed history. | yes | no |
 | K29 | Version tags are immutable, remote-verified, and release-aware. | `SKILL.md` | Keep publication a delivery gate. | yes | no |
-| K30 | Base is read-only; each issue uses one branch and isolated worktree. | `references/repository-delivery.md` | Consolidate repository isolation. | yes | yes |
-| K31 | Worktree paths cannot be shared; resume only the branch's registered checkout. | `references/repository-delivery.md` | Preserve collision safety. | yes | yes |
-| K32 | Fresh worktrees restore required ignored inputs and reuse the established environment. | `references/repository-delivery.md` | Prevent checkout-only failures. | yes | yes |
-| K33 | Integrate current base and merge rather than rebase by default. | `references/repository-delivery.md` | Preserve SHA-bound evidence. | yes | yes |
+| K30 | Base is read-only; each issue uses one branch and isolated worktree. | `references/repository-delivery.md` | Consolidate repository isolation. | yes | no |
+| K31 | Worktree paths are isolated per run and never shared between live writers. | `references/repository-delivery.md` | Preserve per-run path isolation. | yes | no |
+| K32 | Fresh worktrees restore required ignored inputs and reuse the established environment. | `references/repository-delivery.md` | Prevent checkout-only failures. | yes | no |
+| K33 | Integrate current base and merge rather than rebase by default. | `references/repository-delivery.md` | Preserve SHA-bound evidence. | yes | no |
 | K34 | Horizons, read-before-write heartbeats, and reclaim retain prior work. | `references/safety-incidents.md` | Consolidate abandoned-work recovery. | yes | yes |
 | K35 | Analysis, blocked, and review handoffs remain distinct and documented on the issue. | `references/safety-incidents.md` | Prevent recoverable work burial. | yes | no |
 | K36 | Acceptance criteria precede implementation; partial fixes never ship as complete. | `references/safety-incidents.md` | Preserve the done bar. | yes | no |

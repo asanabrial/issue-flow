@@ -205,7 +205,7 @@ Edit it by hand, or from the installer:
 
 ```sh
 ./install.sh config                                              # print the table
-./install.sh config --set "Worktree location=/wt/<repo>/<branch>"
+./install.sh config --set "Worktree location=/wt/<repo>/<branch>-<run-id>"
 ```
 
 The installer matches a setting **by its name** and carries no list of its own, so a default row

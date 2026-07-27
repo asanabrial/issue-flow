@@ -166,6 +166,12 @@ try:
 except m.Stop:
     check("a worktree template without run-id is refused", True, True)
 
+try:
+    m.worktree_path("R:/wt/<run-id>/../shared", "r", "b", "run", 1)
+    check("a literal `..` template segment is refused", False, True)
+except m.Stop:
+    check("a literal `..` template segment is refused", True, True)
+
 
 # --------------------------------------------------------------------------------------
 # Closing keywords. The defect: the check reported the SYMPTOM (a live close reference) as the
@@ -424,6 +430,7 @@ class FakeIssue:
             self.stale_reads -= 1
             comments = self.comments[:-1]
         return {"state": "OPEN", "comments": comments,
+                "assignees": [{"login": "shared-agent"}] if self.assigned else [],
                 "labels": [{"name": name} for name in sorted(self.labels)]}
     def run(self, argv, cwd=None, check=True, writes=False):
         if argv[:3] == ["gh", "issue", "comment"]:
@@ -494,6 +501,69 @@ with remote(takeover):
     m.do_verify_claim(1, "opencode-new", "ready", Path("."))
 check("reclaim retry reuses one ownership event", reclaimed["reused_existing_reclaim"], True)
 check("reclaim retry converges runtime labels", takeover.labels, {"status:ready", "dev:opencode"})
+
+projection = FakeIssue()
+projection.assigned = True
+with remote(projection):
+    try:
+        m.cmd_reclaim(SimpleNamespace(issue=1, run_id="new", runtime="opencode",
+                                      horizon=FUTURE, force=False), {}, Path("."))
+    except m.Stop as stop:
+        projection_stop = stop.payload
+check("projection-only ownership fails closed", projection_stop["reason"],
+      "projection-only-ownership")
+check("projection-only refusal does not advise claim", "`claim`" in projection_stop["action"], False)
+
+unowned = FakeIssue()
+with remote(unowned):
+    try:
+        m.cmd_reclaim(SimpleNamespace(issue=1, run_id="new", runtime="opencode",
+                                      horizon=FUTURE, force=False), {}, Path("."))
+    except m.Stop as stop:
+        unowned_stop = stop.payload
+check("truly unowned reclaim reports nothing-to-reclaim", unowned_stop["reason"],
+      "nothing-to-reclaim")
+check("truly unowned reclaim advises claim", "`claim`" in unowned_stop["action"], True)
+
+live = comment("<!-- issue-flow: claim run-id=live-run runtime=codex "
+               f"horizon={FUTURE} -->")
+forced = FakeIssue([live], {"dev:codex"})
+forced.assigned = True
+with remote(forced):
+    try:
+        m.cmd_reclaim(SimpleNamespace(issue=1, run_id="new", runtime="opencode",
+                                      horizon=FUTURE, force=True), {}, Path("."))
+    except m.Stop as stop:
+        missing_reason_stop = stop.payload
+check("forced reclaim requires a reason file", missing_reason_stop["reason"],
+      "force-reason-required")
+check("missing forced reason writes nothing", len(forced.comments), 1)
+
+with __import__("tempfile").TemporaryDirectory() as root:
+    reason_file = Path(root) / "reason.md"
+    reason_file.write_text("", encoding="utf-8")
+    with remote(forced):
+        try:
+            m.cmd_reclaim(SimpleNamespace(issue=1, run_id="new", runtime="opencode",
+                                          horizon=FUTURE, force=True,
+                                          reason_file=str(reason_file)), {}, Path("."))
+        except m.Stop as stop:
+            empty_reason_stop = stop.payload
+    check("empty forced reason is refused", empty_reason_stop["reason"],
+          "force-reason-required")
+    check("empty forced reason writes nothing", len(forced.comments), 1)
+
+    evidence = "Incident link and operator approval."
+    reason_file.write_text(evidence, encoding="utf-8")
+    with remote(forced):
+        m.cmd_reclaim(SimpleNamespace(issue=1, run_id="new", runtime="opencode",
+                                      horizon=FUTURE, force=True,
+                                      reason_file=str(reason_file)), {}, Path("."))
+    forced_body = forced.comments[-1]["body"]
+    check("forced reason is in the reclaim comment", evidence in forced_body, True)
+    check("forced reason precedes the marker",
+          forced_body.index(evidence) < forced_body.index("<!-- issue-flow: reclaim"), True)
+
 release = FakeIssue([
     comment("<!-- issue-flow: claim run-id=opencode-owner runtime=opencode "
             f"horizon={FUTURE} -->")

@@ -20,9 +20,10 @@ the resulting takeover are mechanical binding responsibilities.
   succeeds.
 - Work with an ownership projection and/or claim event is reclaimable from any workflow state once
   its authoritative activity is past its horizon, or after four hours of inactivity when legacy or
-  partial ownership has no horizon. A forced takeover before that boundary MUST be preceded by an
-  audit comment stating its exceptional reason and evidence; the binding also marks the takeover as
-  forced. The reclaimer MUST comment the takeover, take ownership, and verify that ownership
+  partial ownership has no horizon. A forced takeover before that boundary MUST supply a non-empty
+  UTF-8 reason-and-evidence file. The binding includes it in the same takeover comment before the
+  forced marker and writes nothing when that evidence is missing, empty, or unreadable. The
+  reclaimer MUST comment the takeover, take ownership, and verify that ownership
   before repository writes. Retain and adopt prior branches, diffs, diagnoses, ruled-out hypotheses,
   and evidence, then transition directly to the state those artifacts support. A forced takeover does
   not prove the displaced process stopped: do not reuse its checkout until it acknowledges or
@@ -63,7 +64,7 @@ the resulting takeover are mechanical binding responsibilities.
 
 | ID | Failure mode and evidence | Protection or invariant | Surviving executable or document owner |
 |---|---|---|---|
-| I05 | On 2026-07-24, issue #58 runs derived the same worktree directory; files appeared in a checkout its owner had created clean minutes earlier. | Use one issue branch and an external checkout whose construction or registered branch prevents live runs from sharing it; reject foreign or orphaned paths. | `references/repository-delivery.md`; binding start-branch operation |
+| I05 | On 2026-07-24, issue #58 runs derived the same worktree directory; files appeared in a checkout its owner had created clean minutes earlier. | Give every run a distinct external checkout path; reject foreign or orphaned paths and never reuse a displaced run's checkout. | `references/repository-delivery.md`; binding start-branch operation |
 | X06 | Fresh worktrees omit ignored credentials, environment files, and local settings, so a familiar tool can start normally and fail only when an absent value is needed. | Restore required ignored inputs and run the worktree's code while reusing the established environment when safe. | `references/repository-delivery.md`; selected binding's worktree guidance |
 | X07 | Rebasing rewrites SHAs already named by reviews, CI, signatures, or deployments and can require a force-push over refs another actor fetched. | Integrate the current base without rewriting published evidence unless repository policy explicitly requires otherwise; reverify after integration. | `references/repository-delivery.md`; `SKILL.md` delivery steps |
 
