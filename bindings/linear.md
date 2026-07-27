@@ -109,10 +109,10 @@ type — resolve both at setup and store both ids.
 | `create` | resolve or `issueLabelCreate` each label first, then `issueCreate(input: { teamId, title, description, stateId: <ready>, labelIds: [priority, domain, analyst] })` |
 | `list_state` | `issues(filter: { state: { id: { eq: <state> } }, assignee: { null: true } })` |
 | `claim` | check state is not `started`-type → `issueUpdate(id, input: { assigneeId, stateId: <in-progress> })` → write the claim comment → **re-read comments for an earlier claim** |
-| `reclaim` | unsupported: no reducer currently establishes a takeover epoch and converges projections; fail closed rather than inventing one |
-| `verify_claim` | one read — `issue(id) { state { id type } comments { nodes { createdAt body } } }` — then four checks, any failed check is a stop instruction, not a retry: the earliest unreleased claim is yours; the state type is not `completed`/`canceled`; the state id is the one you are working under (ids, not types — `in-progress` and `review` share `started`); and no later comment names your run-id in a stand-down, reclaim or adjudication. Semantics in the [portable safety procedure](../references/safety-incidents.md#portable-safety-procedure) |
-| `heartbeat` | unsupported until it can run `verify_claim` and append progress as one fail-closed operation |
-| `transition` | `issueUpdate(id, input: { stateId })`, then re-read and require that exact state id — single-valued, so nothing to remove |
+| `reclaim` | unsupported / fail-closed |
+| `verify_claim` | one read — `issue(id) { state { id type } comments { nodes { createdAt body } } }` — then three checks, any failed check is a stop instruction, not a retry: the state type is not `completed`/`canceled`; the state id is the one you are working under (ids, not types — `in-progress` and `review` share `started`); and no comment created after your own claim comment names your run-id in a stand-down, reclaim or adjudication. Semantics in `SKILL.md`, *A heartbeat is a claim renewal* |
+| `heartbeat` | unsupported / fail-closed |
+| `transition` | `issueUpdate(id, input: { stateId })` — single-valued, so nothing to remove |
 | `comment` | `commentCreate(input: { issueId, body })` |
 | `last_activity` | `issue(id) { updatedAt comments { nodes { createdAt body } } }` |
 | `label` | resolve the label id, `issueLabelCreate` if absent, then `issueUpdate(id, input: { labelIds })` — the full set, so read-modify-write |

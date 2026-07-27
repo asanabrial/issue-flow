@@ -14,7 +14,7 @@ metadata:
 Use for `issue-flow analyst [conditions]`, `issue-flow dev [domain-rules] [issue-number]`, analyst or developer work, claims, and workflow-state transitions.
 Analyst conditions and dev domains are optional: a bounded target is the scope; otherwise the analyst audits the repository and the dev implements the selected issue.
 Read repository instructions first and load only the tracker binding selected by operator configuration before tracker work.
-Load [domain composition](references/domain-composition.md) for handoff, priority, or routing rules; [runtime notes](references/runtime-notes.md) for invocation, delegation, or team mechanics; and the [portable safety procedure](references/safety-incidents.md#portable-safety-procedure) for heartbeat, reclaim, or handoff work.
+Load [domain composition](references/domain-composition.md) for handoff, priority, or routing rules; [runtime notes](references/runtime-notes.md) for invocation, delegation, or team mechanics; and [safety incidents](references/safety-incidents.md) for race, reclaim, handoff, or failure rationale.
 
 ## Hard Rules
 
@@ -34,13 +34,13 @@ Load [domain composition](references/domain-composition.md) for handoff, priorit
 | Analyst has no conditions or domain | Use the autonomous `general` contract in [domain composition](references/domain-composition.md); file only the strongest deduplicated finding or nothing. |
 | A domain route is recorded | Analyst loads the left rule book; dev loads the right. State explicitly when implementation routing is absent. |
 | Runtime mechanics or independent-context acquisition vary | Follow [runtime notes](references/runtime-notes.md); runtime limits change the mechanism, never the invariant. |
-| Heartbeat, reclaim, or handoff is required | Follow the active binding and [portable safety procedure](references/safety-incidents.md#portable-safety-procedure); consult its incident tables only for rationale. |
+| Claim, reclaim, or handoff safety needs rationale | Follow the active binding and [safety incidents](references/safety-incidents.md), without copying incident narrative here. |
 | State must be chosen | Invalid specification -> `analysis`; implementable and unassigned -> `ready`; claimed build -> `in-progress`; built/published -> `review`; unbuilt external wait -> `blocked` with condition and discharger; merged and verified -> `done`. |
 
 ## Execution Steps
 
 Before either role's first tracker write in an unfamiliar project, run the selected binding's `ensure_states`; then use that binding's executable operations and readbacks rather than reconstructing them.
-Load [domain composition](references/domain-composition.md) for routing, scale validation, queue partitioning, or autonomous fallback; [runtime notes](references/runtime-notes.md) for invocation, read-only enforcement, independent-context acquisition, or runtime limits; the [portable safety procedure](references/safety-incidents.md#portable-safety-procedure) for heartbeat, reclaim, or handoff; and [repository delivery](references/repository-delivery.md) only when repository rules do not fully define isolation or integration.
+Load [domain composition](references/domain-composition.md) for routing, scale validation, queue partitioning, or autonomous fallback; [runtime notes](references/runtime-notes.md) for invocation, read-only enforcement, independent-context acquisition, or runtime limits; [safety incidents](references/safety-incidents.md) only when claim, reclaim, handoff, or failure rationale is needed; and [repository delivery](references/repository-delivery.md) only when repository rules do not fully define isolation or integration.
 
 ### Analyst
 
@@ -135,7 +135,7 @@ re-check the analysis without repeating it.
    information. Retrieve the delivered SHA after merge and verify it has exactly the reviewed base
    and reviewed head as its parents; do not claim topology preservation from a command flag alone.
    A merge queue is eligible only when its configured method guarantees that same topology. If the
-    project requires CI on the exact delivered SHA, wait for that post-merge gate.
+   project requires CI on the exact delivered SHA, wait for that post-merge gate.
 
 ### Working in a repository — the default flow
 

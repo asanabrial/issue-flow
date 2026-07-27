@@ -30,8 +30,8 @@ analysis ──> ready ──> in-progress ──> review ──> done
 
 - **analysis** — being investigated, or returned by a dev as under-specified. Drained by analysts.
 - **ready** — specified, unassigned, implementable. Drained by devs, highest priority first.
-- **in-progress** — claimed and being built. A supporting binding detects a dead holder by its silence
-  and reclaims the retained work; unsupported reclaim paths are explicit and fail closed.
+- **in-progress** — claimed and being built. Guarded by a stale-claim rule: a run that dies holding
+  an issue is detected by its silence and the work is reclaimed, never stuck forever.
 - **review** — built and published; awaiting or undergoing independent review, CI and delivery.
   Unassigned items here outrank the whole `ready` queue: finishing beats starting.
 - **blocked** — waiting on something external, with the blocker *and who can discharge it* named.
@@ -53,7 +53,7 @@ NOT provide, so no rule silently stops applying.
 |---|---|---|---|
 | State model | `status:*` labels (discipline) | native workflow states (enforced) | lists — a card is in exactly one |
 | Claim verification | comment timeline | state check + comment timeline | comment trail (`commentCard`) |
-| Reclaim / heartbeat | executable and verified | unsupported; fails closed | unsupported; fails closed |
+| Reclaim / heartbeat | executable | unsupported / fail-closed | unsupported / fail-closed |
 | Stable identity | issue number | `ENG-123` identifiers | `shortLink` / board-key prefix |
 | Transport | `gh` CLI or REST API | official MCP server or GraphQL | REST API |
 
@@ -141,9 +141,9 @@ timeline stays the control channel for the whole build: every heartbeat re-reads
 so a stand-down issued later is actually received.
 
 **What happens when an agent dies mid-task?**
-Claims carry a self-declared report-by horizon and heartbeat comments. GitHub's executable binding
-can reclaim stale work on the record while retaining prior output. Bindings without verified reclaim
-declare it unsupported and fail closed rather than inventing a takeover.
+Claims carry a self-declared report-by horizon and heartbeat comments. An `in-progress` issue whose
+last activity is past its horizon is reclaimable: the next dev takes over on the record, keeping
+whatever the dead run already pushed or diagnosed.
 
 **Can an agent without filesystem access participate?**
 Yes — as an analyst. Its only output is an issue on the tracker, which is a network call. That is a
@@ -151,8 +151,7 @@ design goal, not an accident: sandboxed runtimes are first-class analysts.
 
 **Do I need GitHub?**
 No. Bindings exist for GitHub Issues, Linear (official MCP server or GraphQL) and Trello (REST).
-Each binding declares unsupported operations explicitly; you pick the tracker in the configuration
-block and fail closed when it lacks a required capability.
+The workflow itself never names a tracker; you pick one in the configuration block.
 
 **How do I write a domain rule book?**
 Copy `examples/domain-test-coverage.md` and replace what it considers worth doing. A domain names

@@ -94,10 +94,10 @@ GET /members/me?key=<key>&token=<token>
 | `create` | ensure the board labels exist (`POST /boards/{board}/labels`), then `POST /cards?idList=<ready>&name=<identity>: <title>&desc=<body>&idLabels=<priority,domain,analyst>` |
 | `list_state` | `GET /lists/<state>/cards?fields=id,idShort,shortLink,name,idMembers,dateLastActivity,labels` then keep those with an empty `idMembers` |
 | `claim` | `POST /cards/{id}/idMembers` with your member id, write the claim comment, then **read the `commentCard` actions** — an earlier claim than yours means you lost. Re-reading `idMembers` catches the race only when every agent is a distinct member |
-| `reclaim` | unsupported: no reducer currently establishes a takeover epoch and converges member/label projections; fail closed rather than inventing one |
-| `verify_claim` | one read — `GET /cards/{id}?fields=idList,closed&actions=commentCard` — then four checks, any failed check is a stop instruction, not a retry: the earliest unreleased claim is yours; `closed` is false (archived is Trello's killed); the card is in the list you are working under; and no later comment names your run-id in a stand-down, reclaim or adjudication. Semantics in the [portable safety procedure](../references/safety-incidents.md#portable-safety-procedure) |
-| `heartbeat` | unsupported until it can run `verify_claim` and append progress as one fail-closed operation |
-| `transition` | `PUT /cards/{id}?idList=<target list>`, then re-read and require that exact list id — single field, nothing to remove |
+| `reclaim` | unsupported / fail-closed |
+| `verify_claim` | one read — `GET /cards/{id}?fields=idList,closed&actions=commentCard` — then three checks, any failed check is a stop instruction, not a retry: `closed` is false (archived is Trello's killed); the card is in the list you are working under; and no `commentCard` action created after your own claim comment names your run-id in a stand-down, reclaim or adjudication. Semantics in `SKILL.md`, *A heartbeat is a claim renewal* |
+| `heartbeat` | unsupported / fail-closed |
+| `transition` | `PUT /cards/{id}?idList=<target list>` — single field, nothing to remove |
 | `comment` | `POST /cards/{id}/actions/comments?text=<text>` |
 | `last_activity` | `GET /cards/{id}?fields=dateLastActivity` |
 | `label` | `POST /boards/{board}/labels` if it does not exist yet, then `POST /cards/{id}/idLabels` with its id — **adds**, it does not replace |
