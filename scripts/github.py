@@ -330,7 +330,10 @@ def marker(kind: str, **attrs) -> str:
 
 def escape_control_markers(body: str) -> str:
     """Preserve quoted evidence without letting it become control-plane input."""
-    return re.sub(r"<!--(?=\s*issue-flow:)", "&lt;!--", body or "")
+    escaped = re.sub(r"<!--(?=\s*issue-flow:)", "&lt;!--", body or "")
+    if CLAIM_PROSE.match(escaped) and CLAIM_HORIZON_PROSE.search(escaped):
+        escaped = f"Quoted evidence:\n\n{escaped}"
+    return escaped
 
 
 def parse_markers(body: str) -> list[dict[str, str]]:
@@ -462,16 +465,14 @@ def claim_is_live(claimed_at: str, run_id: str, released: dict[str, str]) -> boo
 
 
 def last_activity_by(comments: list[dict], run_id: str) -> str:
-    """The newest timestamp on which this run said anything. '' when it never did."""
+    """Newest server timestamp explicitly authored by this run-id."""
     stamps = [
         comment.get("createdAt", "")
         for comment in comments
         if any(
-            mark.get(attr) == run_id
+            mark.get("run-id") == run_id
             for mark in parse_markers(comment.get("body", ""))
-            for attr in TARGET_ATTRS
         )
-        or run_id in (comment.get("body") or "")
     ]
     return max(stamps) if stamps else ""
 
@@ -1124,7 +1125,7 @@ def cmd_claim(args, config, cwd) -> dict:
     projected = bool(data.get("assignees")) or any(
         label.startswith("dev:") for label in label_names(data)
     )
-    if stale_others or (projected and not before["event"] and not before["stale"]):
+    if (stale_others and not before["event"]) or (projected and not before["event"] and not before["stale"]):
         raise Stop({"ok": False, "reason": "existing-ownership-requires-reclaim",
                     "action": "stop; use audited `reclaim` instead of creating a new claim epoch"})
 
@@ -1386,6 +1387,9 @@ def cmd_transition(args, config, cwd) -> dict:
 
 
 def cmd_comment(args, config, cwd) -> dict:
+    if args.kind not in {None, "note", "blocker", "diagnosis"}:
+        raise Stop({"ok": False, "reason": "reserved-comment-kind",
+                    "action": "use note, blocker, or diagnosis; ownership markers have dedicated commands"})
     body = escape_control_markers(Path(args.body_file).read_text(encoding="utf-8"))
     if args.run_id and args.kind:
         body = body.rstrip() + f"\n\n{marker(args.kind, run_id=args.run_id)}\n"
@@ -2146,7 +2150,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--issue", type=int, required=True)
     p.add_argument("--body-file", required=True)
     p.add_argument("--run-id")
-    p.add_argument("--kind", help="marker kind, e.g. note, blocker, diagnosis")
+    p.add_argument("--kind", choices=["note", "blocker", "diagnosis"])
 
     p = sub.add_parser("heartbeat", help="verify the claim, then post progress — never the reverse")
     p.add_argument("--issue", type=int, required=True)
