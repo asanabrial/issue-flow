@@ -25,7 +25,7 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | S12 | What the analyst produces (`SKILL.md:385-436`) | `SKILL.md` | Keep create/blocked instructions at runtime; the body schema moves to the asset. | yes | no |
 | S13 | Role: DEV (`SKILL.md:440-602`) | `SKILL.md` | Preserve resume, claim, build, review, and delivery as the dev execution path. | yes | no |
 | S14 | Repository default flow (`SKILL.md:603-742`) | `references/repository-delivery.md` | Consolidate branching, worktree, integration, review, and cleanup rationale. | yes | no |
-| S15 | Abandoned work (`SKILL.md:743-840`) | `references/safety-incidents.md` | Keep horizon, heartbeat, reclaim, and retention failure modes together. | yes | yes |
+| S15 | Abandoned work (`SKILL.md:743-840`) | `references/safety-incidents.md` | Keep horizon, heartbeat, reclaim, and retention failure modes together. | yes | no |
 | S16 | Work that cannot finish (`SKILL.md:841-921`) | `references/safety-incidents.md` | Consolidate handoff-state rationale while retaining the decision gate in `SKILL.md`. | yes | no |
 | S17 | State machine (`SKILL.md:922-972`) | `SKILL.md` | State meanings, exclusivity, blockers, and explicit done remain runtime decisions. | yes | yes |
 | S18 | Optional board view (`SKILL.md:973-1006`) | `references/safety-incidents.md` | Preserve authoritative-label and verified-projection rationale once; bindings own mechanics. | yes | no |
@@ -54,9 +54,9 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | I03 | Issue #58 loser wrote into winner checkout (`SKILL.md:497-505`) | `references/safety-incidents.md` | Preserve the pre-filesystem claim-renewal incident. | yes | yes |
 | I04 | Dev marker attached only at close (`SKILL.md:510-516`) | `references/safety-incidents.md` | Preserve why attribution is projected during transition. | yes | yes |
 | I05 | Issue #58 shared worktree collision (`SKILL.md:656-664`) | `references/repository-delivery.md` | Preserve why worktree identity must prevent cross-run writes. | yes | no |
-| I06 | Five claims never transitioned (`SKILL.md:751-759`) | `references/safety-incidents.md` | Preserve the claim/transition partial-failure case. | yes | yes |
-| I07 | Claim loser worked 48 minutes after adjudication (`SKILL.md:777-802`) | `references/safety-incidents.md` | Preserve why every heartbeat reads before writing. | yes | yes |
-| I08 | Agent-team tasks left incomplete (`SKILL.md:761-766`) | `references/runtime-notes.md` | Preserve the external-session recovery limitation. | yes | yes |
+| I06 | Five claims never transitioned (`SKILL.md:751-759`) | `references/safety-incidents.md` | Preserve the claim/transition partial-failure case. | yes | no |
+| I07 | Claim loser worked 48 minutes after adjudication (`SKILL.md:777-802`) | `references/safety-incidents.md` | Preserve why every heartbeat reads before writing. | yes | no |
+| I08 | Agent-team tasks left incomplete (`SKILL.md:761-766`) | `references/runtime-notes.md` | Preserve the external-session recovery limitation. | yes | no |
 | I09 | Wrong handoff state buried recoverable work (`SKILL.md:841-867`) | `references/safety-incidents.md` | Preserve why analysis, blocked, and review are distinct. | yes | no |
 | I10 | Long run repeated its documented `$?` mistake (`SKILL.md:887-900`) | `references/safety-incidents.md` | Preserve the evidence-based handoff threshold. | yes | no |
 | I11 | Issues #61/#62 never mirrored to the board (`SKILL.md:984-1005`) | `references/safety-incidents.md` | Preserve why transition verifies both state projections. | yes | no |
@@ -108,7 +108,7 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | K31 | Worktree paths cannot be shared; resume only the branch's registered checkout. | `references/repository-delivery.md` | Preserve collision safety. | yes | no |
 | K32 | Fresh worktrees restore required ignored inputs and reuse the established environment. | `references/repository-delivery.md` | Prevent checkout-only failures. | yes | no |
 | K33 | Integrate current base and merge rather than rebase by default. | `references/repository-delivery.md` | Preserve SHA-bound evidence. | yes | no |
-| K34 | Horizons, read-before-write heartbeats, and reclaim retain prior work. | `references/safety-incidents.md` | Consolidate abandoned-work recovery. | yes | yes |
+| K34 | Horizons, read-before-write heartbeats, and reclaim retain prior work. | `references/safety-incidents.md` | Consolidate abandoned-work recovery. | yes | no |
 | K35 | Analysis, blocked, and review handoffs remain distinct and documented on the issue. | `references/safety-incidents.md` | Prevent recoverable work burial. | yes | no |
 | K36 | Acceptance criteria precede implementation; partial fixes never ship as complete. | `references/safety-incidents.md` | Preserve the done bar. | yes | no |
 | K37 | Exactly one workflow state exists; done is explicit before tracker closure. | `SKILL.md` | Keep state integrity direct. | yes | no |

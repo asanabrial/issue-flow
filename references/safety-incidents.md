@@ -12,16 +12,17 @@ exceptional evidence justifies a force is judgement and remains prose-owned; mar
 the resulting takeover are mechanical binding responsibilities.
 
 - A claim MUST declare a horizon and report progress with heartbeats. A heartbeat renews authority by
-  successfully reading before it writes; activity extends authority for at most four hours without
-  changing the declared horizon.
+  successfully reading before it writes; holder-attributed activity with a server timestamp extends
+  authority for at most four hours without changing the declared horizon.
   Before the first repository write and every expensive or irreversible boundary, the holder MUST
-  likewise verify the authoritative ownership, state, and activity. Closure, departure from the
-  working state, or a control message revoking the claim is a stop instruction. An unreadable or
-  ambiguous control surface fails closed: write nothing and start no boundary action until the read
-  succeeds.
-- Work with an ownership projection and/or claim event is reclaimable from any workflow state once
-  both its declared horizon and the four-hour window after its latest authoritative activity have
-  ended. Legacy or partial ownership without a horizon uses the four-hour activity window alone. A
+  likewise verify the authoritative ownership and state plus the holder-attributed server activity
+  used for liveness. Closure, departure from the working state, or a control message revoking the
+  claim is a stop instruction. An unreadable or ambiguous control surface fails closed: write nothing
+  and start no boundary action until the read succeeds.
+- Work with an authoritative claim or reclaim event and any accompanying ownership projection is
+  reclaimable from any workflow state once both its declared horizon and the four-hour window after
+  its latest holder-attributed server activity have ended. Legacy or partial ownership without a
+  horizon uses that four-hour window alone. A
   forced takeover before that boundary MUST supply a non-empty UTF-8 reason-and-evidence file. The
   binding escapes HTML comment openers and includes the evidence in the same takeover comment before
   the forced marker; it writes nothing when that evidence is missing, empty, or unreadable. The

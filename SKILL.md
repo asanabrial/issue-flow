@@ -277,6 +277,104 @@ refusal it did not cause and cannot explain.
 make isolation impossible while another dev is active, that is not a rule to bypass — it is a blocker
 to file, exactly as in step 6.
 
+### Abandoned work — the run that never came back
+
+A run dies. The process is killed, the sandbox expires, the budget runs out mid-task. The issue stays
+`in-progress` with an assignee, and selection never surfaces it — step 1 drains `review` and
+`ready`, never `in-progress` — so **nobody ever picks it up again**. This is not an exotic failure — it is the ordinary end of
+a long autonomous run, and it is the one way this board rots without anyone doing anything wrong.
+
+**The same death can land one step earlier, before the state ever moved.** Step 2 (claim: assignee +
+comment) and step 3 (`transition` to `in-progress`) are two separate calls — a run that dies between
+them leaves an issue with an assignee and a claim comment that still carries `status:ready`, because
+the label swap never ran. The same gap exists at the other end: a run that dies after step 4 (the work
+is done) but before step 5's `transition` to `review` leaves finished, working code sitting on an issue
+that still says `in-progress`. Seen live: five issues claimed and commented, none ever relabeled — the
+dead runs' horizons had long passed, but every one of them still read `status:ready` to anyone
+scanning labels. In every case `list_state` still filters correctly (`no:assignee` excludes it from its
+queue), but the label lies to anyone reading it directly, and — unless the rule below is read for what
+it actually covers — the issue looks neither claimed nor reclaimable.
+
+Worth knowing before you assume you are missing something obvious: **nothing else solves it either.**
+Claude Code's agent teams document the same failure — *"teammates sometimes fail to mark tasks as
+completed, which blocks dependent tasks"* — and answer it by asking a human to fix the status by
+hand. The closest GitHub-native skill set preserves worktrees and resumes by session id, but has no
+rule for work whose holder is simply gone. So what follows is convention over data the tracker
+already timestamps: no daemon, no lock service, nothing to run.
+
+**The holder leaves a trail.** Two habits make a claim auditable:
+
+- **Declare a horizon when you claim** (step 2, inside the claim comment). One extra clause in a comment you already write, and
+  it turns "no activity" from a judgement call into a comparison.
+- **Comment on progress, not only on completion.** From outside, a dev that has gone quiet for an
+  hour and a dev that died look identical. Each comment is a heartbeat carrying a server-side
+  timestamp; that is the liveness half of the mechanism. The other half is the read that precedes
+  the write — see below.
+
+**A heartbeat is a claim renewal: read before you write.** The claim check in step 2 runs once, but
+the control surface it read stays authoritative for the whole build — a late adjudication, a reclaim,
+a stand-down all arrive there while you work. A heartbeat that only writes is deaf to the one channel
+that can revoke the claim. This happened live: a run that had lost a claim race by five seconds
+was told so in an adjudication comment 33 seconds later, and then posted three more
+heartbeats and worked another ~48 minutes because nothing in its heartbeat loop ever read the
+timeline again. So **every heartbeat runs `verify_claim` first and is written only when the answer is
+"still holder, nothing said"**. The same renewal runs immediately before any expensive or
+irreversible boundary that can fall between heartbeats — starting an evaluation, launching a review,
+delivering — so a long quiet phase cannot bypass it. Two answers mean stop, not retry:
+
+- **A control message naming your run-id** — a stand-down, a reclaim, an adjudication. Stop
+  repository work immediately. If the issue is still open, leave ONE acknowledgement so the record
+  shows the message was received, and release your `dev:<runtime>` marker — it is per-runtime and
+  yours to drop. The assignee is different: where the tracker attributes it to a shared account the
+  winner holds it too, so the binding decides whether it comes off (on all three current bindings it
+  stays — each one's account is shared or singular); follow it rather than assuming. Do not alter the
+  workflow state and do not write a second claim comment — the race record is not yours to edit.
+- **The item is closed, or no longer carries the state you are working under.** Someone else
+  finished or moved it. Stop, release your marker exactly as above, and change nothing about the
+  state — it belongs to whoever moved it.
+
+Renewal does not pretend the control surface is a lock, and it does not try to. It caps the cost of
+losing a race — or being legitimately displaced — at one renewal interval, and it makes "the original
+holder reads your comment and backs off" in *Reclaiming is not a race won* something that actually
+happens rather than something the prose hopes for.
+
+**A failed read is not a failed answer.** If the renewal's read itself fails — network, auth, rate
+limit — the control surface answered nothing, and "nothing" is not a stand-down. Fail closed on the
+write: post no heartbeat, start no evaluation, launch no review, deliver nothing — and retry the
+read. Only a stop answer from a *successful* read ends the work. Treating a timeout as a stand-down
+lets a flaky network halt every run; treating it as clearance lets a run write deaf, which is the
+defect this rule exists to close.
+
+**Reclaiming.** An issue is reclaimable when it carries an assignee and/or a claim comment naming a
+run-id — **in any state, not only `in-progress`** — and its last activity — any comment, label
+change or referenced commit — is past the declared horizon, or more than a few hours old when no
+horizon was declared. The state label is deliberately not part of the precondition: it is exactly
+what a dead run may never have gotten to write, so a claimed issue still wearing `status:ready` or
+`status:review` is reclaimable by the same rule as one caught mid-build under `in-progress`. Then:
+
+1. **Comment before touching anything**: `Reclaiming from <run-id>; last activity <timestamp>,
+   horizon <declared or none>.` The record of the takeover matters more than the takeover.
+2. Replace the assignee with your own, **and remove the dead run's attribution marker as you add
+   yours** — it cannot do it itself, which is the whole reason you are here. Skip this and the item
+   ends up claiming two runtimes hold it. Then continue from whatever the dead run left on the issue.
+3. **Do not discard its work, and do not assume the label is where the work actually got to.** A
+   pushed branch, a commented diagnosis, a ruled-out hypothesis are all still valid — which is
+   precisely why everything goes on the issue as it happens. If what the dead run left shows the
+   work is further along than the label says — a linked PR or a finished diff sitting there while
+   the issue still reads `ready` — transition straight to the state the evidence supports instead of
+   restarting from `in-progress`; re-doing already-finished work is the exact waste this rule exists
+   to avoid.
+
+**Reclaiming is not a race won.** If the original holder was alive and merely slow, its next
+`verify_claim` surfaces your comment — which is why the comment names who you took it from. It then
+backs off exactly like the loser of a claim race in step 2. Either way no work is lost, and the
+worst case is one duplicated hour rather than an issue that is stuck forever.
+
+**A run ending deliberately needs none of this**: unassign, write the state, say so. Reclaiming is
+for the runs that never got the chance.
+
+---
+
 ### Where to put work you cannot finish
 
 Three states can receive work a dev is putting down, and choosing wrong buries it. Two questions

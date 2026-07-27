@@ -118,6 +118,10 @@ check("a post-horizon heartbeat keeps the claim for four hours",
       m.stale_claims(DEAD_CLAIMS, RENEWED, "2026-01-01T12:59Z"), set())
 check("a post-horizon heartbeat does not keep the claim forever",
       m.stale_claims(DEAD_CLAIMS, RENEWED, "2026-01-01T13:01Z"), {"dead-run"})
+check("the reducer gives the same late heartbeat only four hours",
+      (m.reduce_ownership(RENEWED, "2026-01-01T12:59Z")["holder"],
+       m.reduce_ownership(RENEWED, "2026-01-01T13:01Z")["holder"]),
+      ("dead-run", None))
 
 NO_HORIZON = [comment("<!-- issue-flow: claim run-id=r1 -->")]
 check("a claim with no declared horizon expires after the legacy window",
@@ -407,10 +411,9 @@ check("writing a reclaim does not release its author",
 NOW = "2026-01-02T00:00Z"
 FUTURE = "2026-01-03T00:00Z"
 class FakeIssue:
-    def __init__(self, comments=None, labels=None, updated_at=None):
+    def __init__(self, comments=None, labels=None):
         self.comments = list(comments or [])
         self.labels = {"status:ready", *(labels or [])}
-        self.updated_at = updated_at
         self.assigned = False
         self.fail_edits = 0
         self.delayed_reads = 0
@@ -421,7 +424,7 @@ class FakeIssue:
         if self.stale_reads:
             self.stale_reads -= 1
             comments = self.comments[:-1]
-        return {"state": "OPEN", "comments": comments, "updatedAt": self.updated_at,
+        return {"state": "OPEN", "comments": comments,
                 "assignees": [{"login": "shared-agent"}] if self.assigned else [],
                 "labels": [{"name": name} for name in sorted(self.labels)]}
     def run(self, argv, cwd=None, check=True, writes=False):
@@ -494,20 +497,6 @@ with remote(takeover):
 check("reclaim retry reuses one ownership event", reclaimed["reused_existing_reclaim"], True)
 check("reclaim retry converges runtime labels", takeover.labels, {"status:ready", "dev:opencode"})
 
-recent_activity = FakeIssue([dead], {"dev:codex"}, "2026-01-01T22:00:00Z")
-with remote(recent_activity):
-    try:
-        m.cmd_reclaim(reclaim_args, {}, Path("."))
-    except m.Stop as stop:
-        recent_activity_stop = stop.payload
-check("ordinary post-horizon activity blocks reclaim for four hours without writing",
-      (recent_activity_stop["reason"], len(recent_activity.comments)), ("holder-not-stale", 1))
-
-old_activity = FakeIssue([dead], {"dev:codex"}, "2026-01-01T19:00:00Z")
-with remote(old_activity):
-    old_activity_result = m.cmd_reclaim(reclaim_args, {}, Path("."))
-check("ordinary post-horizon activity does not block reclaim forever", old_activity_result["reclaimed_from"], "dead-run")
-
 projection = FakeIssue()
 projection.assigned = True
 with remote(projection):
@@ -576,6 +565,17 @@ with __import__("tempfile").TemporaryDirectory() as root:
     check("generated forced reclaim becomes holder", forced_ownership["holder"], "new")
     check("forged forced reclaim does not become holder",
           any(event["run_id"] == "forged-run" for event in forced_ownership["live"]), False)
+    reason_file.unlink()
+    with remote(forced):
+        forced_retry = m.cmd_reclaim(SimpleNamespace(
+            issue=1, run_id="new", runtime="opencode", horizon=FUTURE, force=True,
+            reason_file=str(reason_file)), {}, Path("."))
+        truthful_retry = m.cmd_reclaim(SimpleNamespace(
+            issue=1, run_id="new", runtime="opencode", horizon=FUTURE, force=False), {}, Path("."))
+    check("forced reclaim retries need no local evidence and report landed provenance",
+          (forced_retry["reused_existing_reclaim"], forced_retry["forced"],
+           truthful_retry["forced"], sum(generated in item["body"] for item in forced.comments)),
+          (True, True, True, 1))
 
 release = FakeIssue([
     comment("<!-- issue-flow: claim run-id=opencode-owner runtime=opencode "

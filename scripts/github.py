@@ -358,10 +358,10 @@ STANDDOWN_PROSE = re.compile(
 # `dev:<runtime>` label on the strength of text written by someone else entirely.
 #
 # So the fallback demands the shape of an actual claim comment, not the words: the phrase must
-# OPEN the comment, and the horizon clause must be present. `SKILL.md` prescribes exactly one
-# form — `Claimed by <run-id>, expect to report by <time>` — and every binding writes it, so
-# requiring both costs no real claim and rejects every mention. This mirrors the deliberate
-# narrowness of STANDDOWN_PROSE below, which the original of this pattern lacked.
+# OPEN the comment, and the horizon clause must be present. The GitHub binding and its compatibility
+# contract own the form — `Claimed by <run-id>, expect to report by <time>` — so requiring both
+# costs no real claim and rejects every mention. This mirrors the deliberate narrowness of
+# STANDDOWN_PROSE below, which the original of this pattern lacked.
 CLAIM_PROSE = re.compile(r"^\s*(?:[*_>#\s]*)claimed by\s+(?P<run>[\w.-]+)", re.IGNORECASE)
 CLAIM_HORIZON_PROSE = re.compile(r"expect(?:s|ing)?\s+to\s+report\s+by", re.IGNORECASE)
 
@@ -504,10 +504,11 @@ def ownership_deadline(horizon, activity):
 def stale_claims(claims, comments: list[dict], now: str) -> set[str]:
     """Claims past both their declared horizon and bounded holder activity window.
 
-    This is the mechanical half of the portable safety procedure's reclaim rule. Without it a run that died mid-build
-    holds its issue forever: `claim` re-reads the timeline, finds that never-released claim as the
-    earliest live entry, and tells a live run it lost a race to a process that no longer exists —
-    reproducing the exact "abandoned work" incident this script was written against.
+    This is the mechanical half of the portable safety procedure's reclaim rule. Without it a run
+    that died mid-build holds its issue forever: `claim` re-reads the timeline, finds that
+    never-released claim as the earliest live entry, and tells a live run it lost a race to a process
+    that no longer exists — reproducing the exact "abandoned work" incident this script was written
+    against.
 
     Deliberately conservative. A horizon is a heuristic, not a lease: only a claim that BOTH
     declared a horizon and has been silent past it counts as stale. A claim with no horizon is
@@ -534,7 +535,7 @@ def stale_claims(claims, comments: list[dict], now: str) -> set[str]:
     return stale
 
 
-def reduce_ownership(comments: list[dict], now: str, activity_at: str | None = None) -> dict:
+def reduce_ownership(comments: list[dict], now: str) -> dict:
     """Return the current live winner and the exact event that established ownership.
 
     A reclaim starts a new ownership epoch: losing contenders from before the takeover cannot
@@ -563,8 +564,7 @@ def reduce_ownership(comments: list[dict], now: str, activity_at: str | None = N
     for event in sorted(latest_by_run.values(), key=lambda item: (item["created_at"], item["position"])):
         horizon = parse_stamp(event["horizon"])
         attributed = parse_stamp(last_activity_by(trusted, event["run_id"]))
-        activity = max((stamp for stamp in (attributed, parse_stamp(activity_at),
-                                            parse_stamp(event["created_at"])) if stamp), default=None)
+        activity = attributed or parse_stamp(event["created_at"])
         deadline = ownership_deadline(horizon, activity)
         (stale if moment and deadline and deadline <= moment else live).append(event)
 
@@ -1185,32 +1185,16 @@ def cmd_verify_claim(args, config, cwd) -> dict:
 
 def cmd_reclaim(args, config, cwd) -> dict:
     """Atomically in timeline terms displace a holder and establish the new live owner."""
-    force_reason = None
-    if args.force:
-        reason_file = getattr(args, "reason_file", None)
-        if not reason_file:
-            raise Stop({"ok": False, "reason": "force-reason-required",
-                        "action": "pass --reason-file with non-empty UTF-8 reason and evidence"})
-        try:
-            force_reason = Path(reason_file).read_text(encoding="utf-8").strip()
-        except (OSError, UnicodeError) as exc:
-            raise Stop({"ok": False, "reason": "force-reason-invalid", "detail": str(exc),
-                        "action": "provide a readable UTF-8 --reason-file"}) from exc
-        if not force_reason:
-            raise Stop({"ok": False, "reason": "force-reason-required",
-                        "action": "--reason-file must contain non-empty reason and evidence"})
-        # Escaping preserves rendered evidence while preventing it from outranking our control marker.
-        force_reason = force_reason.replace("<!--", "&lt;!--")
-
-    data = issue_view(args.issue, "state,updatedAt,assignees,labels,comments", cwd=cwd)
+    data = issue_view(args.issue, "state,assignees,labels,comments", cwd=cwd)
     if data.get("state") != "OPEN":
         raise Stop({"ok": False, "reason": "issue-not-open",
                     "action": "nothing to reclaim on a closed issue"})
 
     comments = data.get("comments", [])
-    before = reduce_ownership(comments, utc_now_stamp(), data.get("updatedAt"))
+    before = reduce_ownership(comments, utc_now_stamp())
     current = before["event"]
     reused = bool(current and current["run_id"] == args.run_id and current["kind"] == "reclaim")
+    forced = current["forced"] if reused else bool(args.force)
     if reused:
         holder = current["from"]
         held_at = current["created_at"]
@@ -1248,6 +1232,23 @@ def cmd_reclaim(args, config, cwd) -> dict:
         )
 
     if not reused:
+        force_reason = None
+        if forced:
+            reason_file = getattr(args, "reason_file", None)
+            if not reason_file:
+                raise Stop({"ok": False, "reason": "force-reason-required",
+                            "action": "pass --reason-file with non-empty UTF-8 reason and evidence"})
+            try:
+                force_reason = Path(reason_file).read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError) as exc:
+                raise Stop({"ok": False, "reason": "force-reason-invalid", "detail": str(exc),
+                            "action": "provide a readable UTF-8 --reason-file"}) from exc
+            if not force_reason:
+                raise Stop({"ok": False, "reason": "force-reason-required",
+                            "action": "--reason-file must contain non-empty reason and evidence"})
+            # Escaping preserves rendered evidence while preventing it from outranking our marker.
+            force_reason = force_reason.replace("<!--", "&lt;!--")
+
         horizon = args.horizon or (
             datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=4)
         ).strftime("%Y-%m-%dT%H:%MZ")
@@ -1257,7 +1258,7 @@ def cmd_reclaim(args, config, cwd) -> dict:
             f"Reclaiming from `{holder}`; last activity {last_activity_by(comments, holder) or 'none'}, "
             f"claimed at {held_at}.\n\nTaken over by `{args.run_id}`; expect to report by {horizon}. "
             f"Nothing the previous run left will be discarded.{reason}\n\n"
-            f"{marker('reclaim', run_id=args.run_id, runtime=args.runtime, horizon=horizon, forced='true' if args.force else None, **{'from': holder})}\n"
+            f"{marker('reclaim', run_id=args.run_id, runtime=args.runtime, horizon=horizon, forced='true' if forced else None, **{'from': holder})}\n"
         ) as note:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", note],
                 cwd=cwd, writes=True)
@@ -1281,7 +1282,7 @@ def cmd_reclaim(args, config, cwd) -> dict:
         "issue": args.issue,
         "reclaimed_from": holder,
         "run_id": args.run_id,
-        "forced": bool(args.force),
+        "forced": forced,
         "reused_existing_reclaim": reused,
         "next": "read what the dead run left on the issue — the work may be further along than the label",
     }
