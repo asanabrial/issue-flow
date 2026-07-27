@@ -16,12 +16,16 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import SimpleNamespace as Namespace
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("gh", Path(__file__).with_name("github.py"))
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
+
+def SimpleNamespace(**values):
+    values.setdefault("operation_id", "a" * 32)
+    return Namespace(**values)
 
 FAILURES: list[str] = []
 
@@ -111,7 +115,8 @@ check("previously shipped forced reclaims remain authoritative",
       m.reduce_ownership(LEGACY_FORCED, "2026-01-01T02:01Z")["holder"], "legacy")
 EDITED_FORCED = [dict(item) for item in LEGACY_FORCED]
 EDITED_FORCED[-1]["includesCreatedEdit"] = True
-check("edited pre-cutover comments cannot mint evidence-free reclaims",
+EDITED_FORCED[-1]["body"] = f"{m.FORCED_EVIDENCE_HEADING}\n\nchanged\n\n<!-- issue-flow: reclaim run-id=legacy from=dead-run forced=true evidence=required -->"
+check("edited forced evidence cannot downgrade receipt hashing",
       m.reduce_ownership(EDITED_FORCED, "2026-01-01T02:01Z")["holder"], "dead-run")
 
 RAW_FORCED = RECLAIMED[:1] + [comment(
@@ -469,6 +474,7 @@ check("writing a reclaim does not release its author",
 
 NOW = "2026-01-02T00:00Z"
 FUTURE = "2026-01-03T00:00Z"
+OP_A, OP_B, OP_C = "a" * 32, "b" * 32, "c" * 32
 class FakeIssue:
     def __init__(self, comments=None, labels=None):
         self.comments = list(comments or [])
@@ -659,6 +665,97 @@ with m.body_file("evidence") as unused_reason:
         rejected_unused_reason = exc.payload["reason"]
 check("reason files cannot be silently ignored without force", rejected_unused_reason,
       "force-required-for-reason")
+
+duplicate_epoch = [comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE, op_id=OP_A), stamp) for stamp in (NOW, "2026-01-02T00:00:01Z")]
+check("duplicate operation comments reduce to one acquisition event",
+      len(m.ownership_events(duplicate_epoch)), 1)
+conflicting_epoch = duplicate_epoch + [comment(m.marker(
+    "claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_A),
+    "2026-01-02T00:00:02Z")]
+check("conflicting copies invalidate an operation", m.reduce_ownership(conflicting_epoch, NOW)["holder"], None)
+delayed_release = [
+    comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_A)),
+    comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_B),
+            "2026-01-02T00:00:01Z"),
+    comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C, target_op=OP_A),
+            "2026-01-02T00:00:02Z"),
+]
+check("a delayed release cannot cancel a later reacquisition",
+      (m.reduce_ownership(delayed_release, NOW)["event"] or {}).get("operation_id"), OP_B)
+delayed_standdown = delayed_release[:2] + [comment(m.marker("standdown", run_id=ME, op_id=OP_A, target_op=OP_A), "2026-01-02T00:00:02Z")]
+check("a delayed standdown cannot cancel a later reacquisition",
+      (m.reduce_ownership(delayed_standdown, NOW)["event"] or {}).get("operation_id"), OP_B)
+delayed_takeover = delayed_release + [comment(m.marker(
+    "reclaim", run_id=OTHER, runtime="codex", horizon=FUTURE, op_id=OP_C,
+    from_op=OP_A, **{"from": ME}), "2026-01-02T00:00:03Z")]
+check("a delayed reclaim cannot take over a later holder epoch",
+      (m.reduce_ownership(delayed_takeover, NOW)["event"] or {}).get("operation_id"), OP_B)
+
+hidden_operation = FakeIssue()
+hidden_operation.delayed_reads = 9
+hidden_args = SimpleNamespace(issue=1, run_id=ME, runtime="claude-code", horizon=FUTURE, operation_id=OP_A)
+with remote(hidden_operation):
+    try:
+        m.cmd_claim(hidden_args, {}, Path("."))
+    except m.WriteFailure:
+        pass
+    hidden_operation.delayed_reads = 0
+    hidden_operation.stale_reads = 1
+    hidden_result = m.cmd_claim(hidden_args, {}, Path("."))
+check("a hidden retry may duplicate transport but not the ownership event",
+      (hidden_result["ok"], len(hidden_operation.comments),
+       len(m.ownership_events(hidden_operation.comments))), (True, 2, 1))
+empty_operation, empty_reason = FakeIssue(), None
+try:
+    with remote(empty_operation):
+        m.cmd_claim(SimpleNamespace(issue=1, run_id=ME, runtime="claude-code",
+                                    horizon=FUTURE, operation_id=""), {}, Path("."))
+except m.Stop as exc:
+    empty_reason = exc.payload["reason"]
+check("empty operation IDs fail before tracker writes",
+      (empty_reason, len(empty_operation.comments)), ("invalid-operation-id", 0))
+
+release_retry = FakeIssue(delayed_release, ["dev:opencode"])
+release_retry.assigned = True
+with remote(release_retry):
+    m.cmd_unassign(SimpleNamespace(issue=1, run_id=ME, runtime="opencode",
+                                   held_by_other=False, operation_id=OP_C), {}, Path("."))
+check("retrying an old release preserves the later acquisition",
+      (len(release_retry.comments), m.reduce_ownership(release_retry.comments, NOW)["event"]["operation_id"]),
+      (3, OP_B))
+try:
+    with remote(release_retry):
+        m.cmd_claim(SimpleNamespace(issue=1, run_id=ME, runtime="opencode", horizon=FUTURE,
+                                    operation_id=OP_A), {}, Path("."))
+except m.Stop as exc:
+    old_claim_reason = exc.payload["reason"]
+check("retrying an old claim cannot borrow a later acquisition", old_claim_reason,
+      "claim-operation-no-longer-current")
+with remote(release_retry):
+    m.cmd_unassign(SimpleNamespace(issue=1, run_id=ME, runtime="opencode",
+                                   held_by_other=False, operation_id="d" * 32), {}, Path("."))
+check("a fresh release targets the current acquisition", m.reduce_ownership(
+    release_retry.comments, NOW)["holder"], None)
+stale_reclaim_retry, stale_reclaim_reason = FakeIssue(delayed_takeover, ["dev:opencode"]), None
+try:
+    with remote(stale_reclaim_retry):
+        m.cmd_reclaim(SimpleNamespace(issue=1, run_id=OTHER, runtime="codex", horizon=FUTURE,
+                                      force=False, operation_id=OP_C), {}, Path("."))
+except m.Stop as exc:
+    stale_reclaim_reason = exc.payload["reason"]
+check("retrying an old reclaim cannot claim a later epoch",
+      (stale_reclaim_reason, len(stale_reclaim_retry.comments),
+       m.reduce_ownership(stale_reclaim_retry.comments, NOW)["event"]["operation_id"]),
+      ("reclaim-operation-no-longer-current", 4, OP_B))
+conflicting_release = delayed_release[:1] + [
+    comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C, target_op=OP_A)),
+    comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C, target_op=OP_B),
+            "2026-01-02T00:00:01Z"),
+]
+check("conflicting release copies fail closed", m.reduce_ownership(
+    conflicting_release, NOW)["event"]["operation_id"], OP_A)
+check("malformed scoped controls cannot downgrade to broad releases", m.reduce_ownership(delayed_release[:1] + [comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id="bad", target_op=OP_A))], NOW)["holder"], ME)
+
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):
         if getattr(self, "outage", False):
