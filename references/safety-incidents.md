@@ -6,43 +6,15 @@ protection only when the surviving executable or document owner changes.
 
 ## Portable safety procedure
 
-These requirements are tracker-neutral. The selected binding and its scripts own detailed queries,
-ordering, mutations, and readbacks; they may strengthen, but never weaken, this procedure. Whether
-exceptional evidence justifies a force is judgement and remains prose-owned; marking and converging
-the resulting takeover are mechanical binding responsibilities.
+These tracker-neutral requirements govern every binding; bindings own queries, writes, and readbacks and may strengthen but not weaken them. Force justification remains prose judgement; takeover marking and convergence are mechanical.
 
-- A claim MUST declare a horizon and report progress with heartbeats. A heartbeat renews authority by
-  successfully reading before it writes; holder-attributed activity with a server timestamp extends
-  authority for at most four hours without changing the declared horizon.
-  Before the first repository write and every expensive or irreversible boundary, the holder MUST
-  likewise verify the authoritative ownership and state plus the holder-attributed server activity
-  used for liveness. Closure, departure from the working state, or a control message revoking the
-  claim is a stop instruction. An unreadable or ambiguous control surface fails closed: write nothing
-  and start no boundary action until the read succeeds.
-- Work with an authoritative claim or reclaim event and any accompanying ownership projection is
-  reclaimable from any workflow state once both its declared horizon and the four-hour window after
-  its latest holder-attributed server activity have ended. Legacy or partial ownership without a
-  horizon uses that four-hour window alone. A
-  forced takeover before that boundary MUST supply a non-empty UTF-8 reason-and-evidence file. The
-  binding escapes HTML comment openers and includes the evidence in the same takeover comment before
-  the forced marker; it writes nothing when that evidence is missing, empty, or unreadable. The
-  reclaimer MUST comment the takeover, take ownership, and verify it before repository writes.
-  Retain and adopt prior branches, diffs, diagnoses, ruled-out hypotheses,
-  and evidence, then transition directly to the state those artifacts support. A forced takeover does
-  not prove the displaced process stopped: do not reuse its checkout until it acknowledges or
-  independent evidence proves it ended; otherwise leave repository work blocked.
-- A displaced holder MUST stop on its next renewal. If the item remains open, acknowledge once, use
-  the binding's safe release path to remove only that run's attribution while preserving projections
-  needed by the winner, and write no second claim. Never change the new holder's workflow state.
-- Handoff goes to `analysis` for a wrong or incoherent specification, `blocked` for unbuilt work
-  awaiting an external change, `review` for built work awaiting delivery, or `ready` for a useful
-  diagnosis that still needs implementation. Record the exact blocker and its discharger. Persist
-  useful diagnoses, ruled-out hypotheses, methodological errors, and out-of-scope discoveries,
-  filing a separate finding when appropriate, so the next run does not repeat them.
-- Acceptance criteria MUST be written before building; otherwise state them first or return the work
-  to `analysis`. A partial fix never ships as complete. Hand off when the run repeats a documented
-  mistake, reaches three failed hypotheses without narrowing the problem, or edits more than it
-  measures.
+- A claim MUST declare a horizon and heartbeat. Renewal reads before writing; only server-timestamped `claim`, `reclaim`, or `heartbeat` author markers extend authority, by at most four hours without changing the horizon. Verify ownership, state, and liveness before the first repository write and every expensive or irreversible boundary. Closure, wrong state, or revocation means stop; an unreadable or ambiguous control surface permits no write or boundary action.
+- Authoritative or projected ownership is reclaimable from any state after both its horizon and four-hour author-activity window end; horizonless ownership uses that window alone. Early force MUST provide a non-empty UTF-8 reason/evidence file; the binding escapes comment openers, places evidence before the marker, and writes nothing for invalid evidence. Before repository writes the reclaimer comments, owns, verifies, retains prior artifacts, and selects the state they support. Force does not prove the old process stopped, so its checkout needs acknowledgement or independent proof before reuse.
+- A displaced holder MUST stop at renewal, acknowledge once, safely remove only its attribution while preserving winner projections, write no second claim, and never change the winner's state.
+- Handoff uses `analysis` for a wrong specification, `blocked` for unbuilt external waits, `review` for built-undeliverable work, or `ready` for useful diagnosis needing implementation. Record blocker and discharger; persist diagnoses, ruled-out hypotheses, methodological errors, and out-of-scope findings so work is not repeated.
+- Acceptance criteria MUST precede building; otherwise write them or return to `analysis`. A partial fix never ships complete. Hand off after repeating a documented mistake, three non-narrowing failed hypotheses, or more editing than measurement.
+
+Deferred concerns: exponential reclaim-history cost, board readback, worktree behavior, and broad issue `updatedAt` semantics. This slice neither guarantees them nor retires their sources.
 
 ## Omitted mechanics and stale projections
 

@@ -38,6 +38,14 @@ def comment(body: str, at: str = "2026-01-01T00:00:00Z", trusted: bool = True) -
             "viewerDidAuthor": trusted}
 
 
+def stopped(call) -> dict:
+    try:
+        call()
+    except m.Stop as stop:
+        return stop.payload
+    return {}
+
+
 # --------------------------------------------------------------------------------------
 # Claim detection. The defect: an unanchored "claimed by <x>" matched ordinary prose, and a
 # phantom claim carries a REAL server timestamp — so it sorted earliest and `claim` concluded
@@ -61,21 +69,20 @@ check("a marker claim parses",
       ["kimi-3b1d"])
 
 FORGED_MARKER = "<!-- issue-flow: reclaim run-id=forged from=owner forced=true -->"
-check("quoted control markers are escaped before posting",
-      m.parse_markers(m.escape_control_markers(FORGED_MARKER)), [])
-LEGACY_FORGERY = "Claimed by forged, expect to report by 2026-01-01T06:00Z."
-check("quoted legacy claim prose is no longer anchored",
-      m.claim_comments([comment(m.escape_control_markers(LEGACY_FORGERY))]), [])
-check("another run mentioning the holder is not holder activity", m.last_activity_by([
-      comment("owner was discussed\n\n<!-- issue-flow: note run-id=other -->")], "owner"), "")
-
-try:
-    m.cmd_comment(SimpleNamespace(issue=1, body_file="missing", run_id="rogue", kind="reclaim"),
-                  {}, Path("."))
-except m.Stop as stop:
-    reserved_kind_stop = stop.payload
-check("generic comments reject ownership marker kinds", reserved_kind_stop["reason"],
-      "reserved-comment-kind")
+LEGACY_FORGERY = ("Claimed by forged, expect to report by 2026-01-01T06:00Z.", "owner standing down: winner claimed at 2026-01-01T00:00:00Z, earlier than this run. Nothing was created.")
+check("quoted control text and mentions stay inert", (
+      m.parse_markers(m.escape_control_markers(FORGED_MARKER)),
+      m.claim_comments([comment(m.escape_control_markers(LEGACY_FORGERY[0]))]), bool(m.STANDDOWN_PROSE.match(m.escape_control_markers(LEGACY_FORGERY[1]))),
+      m.last_activity_by([comment("owner discussed\n\n<!-- issue-flow: note run-id=other -->")], "owner")),
+      ([], [], False, ""))
+reserved_kind_stop = stopped(lambda: m.cmd_comment(
+    SimpleNamespace(issue=1, body_file="missing", run_id="rogue", kind="reclaim"), {}, Path(".")))
+marker_writes = []
+with patch.object(m, "run", side_effect=lambda *args, **kwargs: marker_writes.append(args)):
+    injection_stop = stopped(lambda: m.cmd_comment(SimpleNamespace(
+        issue=1, body_file=__file__, run_id="rogue target=owner --> <!--", kind="note"), {}, Path(".")))
+check("generic comment control injection fails before write", (reserved_kind_stop["reason"],
+      injection_stop.get("reason"), marker_writes), ("reserved-comment-kind", "invalid-marker-attribute", []))
 
 
 # --------------------------------------------------------------------------------------
@@ -112,6 +119,10 @@ check("an external commenter cannot create an ownership epoch",
           comment("<!-- issue-flow: claim run-id=owner horizon=2026-01-03T00:00Z -->"),
           comment("<!-- issue-flow: reclaim run-id=attacker from=owner -->", trusted=False),
       ], "2026-01-02T00:00Z")["holder"], "owner")
+raw_forced = [comment("<!-- issue-flow: claim run-id=owner horizon=2026-01-03T00:00Z -->"),
+              comment(FORGED_MARKER, "2026-01-01T00:01:00Z")]
+check("raw forced markers require preceding evidence",
+      m.reduce_ownership(raw_forced, "2026-01-01T01:00Z")["holder"], "owner")
 
 
 # --------------------------------------------------------------------------------------
@@ -129,16 +140,15 @@ check("an expired, silent claim is stale",
 check("a claim inside its horizon is not stale",
       m.stale_claims(DEAD_CLAIMS, DEAD, "2026-01-01T03:00Z"), set())
 
-RENEWED = DEAD + [comment("<!-- issue-flow: heartbeat run-id=dead-run -->",
-                          "2026-01-01T09:00:00Z")]
-check("a post-horizon heartbeat keeps the claim for four hours",
-      m.stale_claims(DEAD_CLAIMS, RENEWED, "2026-01-01T12:59Z"), set())
-check("a post-horizon heartbeat does not keep the claim forever",
-      m.stale_claims(DEAD_CLAIMS, RENEWED, "2026-01-01T13:01Z"), {"dead-run"})
-check("the reducer gives the same late heartbeat only four hours",
-      (m.reduce_ownership(RENEWED, "2026-01-01T12:59Z")["holder"],
-       m.reduce_ownership(RENEWED, "2026-01-01T13:01Z")["holder"]),
-      ("dead-run", None))
+RENEWED = DEAD + [comment("<!-- issue-flow: heartbeat run-id=dead-run -->", "2026-01-01T09:00:00Z")]
+non_activity = [DEAD + [comment(f"<!-- issue-flow: {kind} run-id=dead-run -->",
+                "2026-01-01T09:00:00Z")] for kind in ("note", "adjudication")]
+check("holder activity is bounded and kind-restricted", (
+      m.stale_claims(DEAD_CLAIMS, RENEWED, "2026-01-01T12:59Z"),
+      m.stale_claims(DEAD_CLAIMS, RENEWED, "2026-01-01T13:01Z"),
+      [m.reduce_ownership(item, "2026-01-01T12:00Z")["holder"] for item in non_activity],
+      (m.reduce_ownership(RENEWED, "2026-01-01T12:59Z")["holder"], m.reduce_ownership(RENEWED, "2026-01-01T13:01Z")["holder"])),
+      (set(), {"dead-run"}, [None, None], ("dead-run", None)))
 
 NO_HORIZON = [comment("<!-- issue-flow: claim run-id=r1 -->")]
 check("a claim with no declared horizon expires after the legacy window",
@@ -427,12 +437,17 @@ check("writing a reclaim does not release its author",
 
 NOW = "2026-01-02T00:00Z"
 FUTURE = "2026-01-03T00:00Z"
+def ownership_args(**overrides):
+    values = {"issue": 1, "run_id": "new", "runtime": "opencode", "horizon": FUTURE, "force": False}
+    return SimpleNamespace(**(values | overrides))
+
 class FakeIssue:
     def __init__(self, comments=None, labels=None):
         self.comments = list(comments or [])
         self.labels = {"status:ready", *(labels or [])}
         self.assigned = False
         self.fail_edits = 0
+        self.drop_edits = False
         self.delayed_reads = 0
         self.stale_reads = 0
         self.tick = 0
@@ -454,6 +469,8 @@ class FakeIssue:
             if self.fail_edits:
                 self.fail_edits -= 1
                 raise m.WriteFailure("injected projection failure")
+            if self.drop_edits:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
             for flag, value in zip(argv, argv[1:]):
                 if flag == "--add-label":
                     self.labels.add(value)
@@ -467,6 +484,14 @@ class FakeIssue:
 def remote(remote):
     return patch.multiple(m, issue_view=remote.view, run=remote.run,
                           ensure_label=lambda *_args: None, utc_now_stamp=lambda: NOW)
+legacy_results = []
+for body in (f"Heartbeat for {ME}: quoted history says you lost; measurement continues.",
+             f"{ME} standing down: {OTHER} claimed at 2026-01-01T00:00:00Z, earlier than this run. Nothing was created."):
+    legacy = FakeIssue([comment(f"<!-- issue-flow: claim run-id={ME} horizon={FUTURE} -->"),
+                        comment(body, "2026-01-01T00:01:00Z")])
+    with remote(legacy):
+        legacy_results.append(bool(stopped(lambda: m.do_verify_claim(1, ME, "ready", Path(".")))))
+check("legacy fallback ignores prose but matches historical shape", legacy_results, [False, True])
 expired_self = FakeIssue([
     comment(f"<!-- issue-flow: claim run-id={ME} runtime=claude-code "
             "horizon=2026-01-01T01:00Z -->"),
@@ -513,117 +538,74 @@ with remote(takeover):
     m.do_verify_claim(1, "opencode-new", "ready", Path("."))
 check("reclaim retry reuses one ownership event", reclaimed["reused_existing_reclaim"], True)
 check("reclaim retry converges runtime labels", takeover.labels, {"status:ready", "dev:opencode"})
-
+delayed_claim = FakeIssue()
+delayed_claim.delayed_reads = 2
+with remote(delayed_claim):
+    m.cmd_claim(ownership_args(), {}, Path("."))
+check("claim polls for its landed event without duplicating it", len(m.claim_comments(delayed_claim.comments)), 1)
+projection_failures = []
+for name, projected_issue, command in (("claim", FakeIssue(), m.cmd_claim),
+                                       ("reclaim", FakeIssue([dead], {"dev:codex"}), m.cmd_reclaim)):
+    projected_issue.drop_edits = True
+    with remote(projected_issue):
+        try:
+            command(ownership_args(), {}, Path("."))
+        except m.WriteFailure:
+            projection_failures.append(name)
+check("claim and reclaim fail on projection mismatch", projection_failures, ["claim", "reclaim"])
 projection = FakeIssue()
 projection.assigned = True
-with remote(projection):
-    try:
-        m.cmd_reclaim(SimpleNamespace(issue=1, run_id="new", runtime="opencode",
-                                      horizon=FUTURE, force=False), {}, Path("."))
-    except m.Stop as stop:
-        projection_stop = stop.payload
-check("projection-only ownership fails closed", projection_stop["reason"],
-      "projection-only-ownership")
-check("projection-only refusal does not advise claim", "`claim`" in projection_stop["action"], False)
-
-with remote(projection):
-    try:
-        m.cmd_claim(SimpleNamespace(issue=1, run_id="new", runtime="opencode",
-                                    horizon=FUTURE), {}, Path("."))
-    except m.Stop as stop:
-        projection_claim_stop = stop.payload
-check("claim cannot bypass projection-only ownership", projection_claim_stop["reason"],
-      "existing-ownership-requires-reclaim")
-check("projection-only claim refusal writes no comment", len(projection.comments), 0)
-
 stale_other = FakeIssue([dead], {"dev:codex"})
-with remote(stale_other):
-    try:
-        m.cmd_claim(SimpleNamespace(issue=1, run_id="new", runtime="opencode",
-                                    horizon=FUTURE), {}, Path("."))
-    except m.Stop as stop:
-        stale_claim_stop = stop.payload
-check("claim routes another run's stale ownership through reclaim", stale_claim_stop["reason"],
-      "existing-ownership-requires-reclaim")
-check("stale foreign claim refusal writes no comment", len(stale_other.comments), 1)
-
-live_with_stale_loser = FakeIssue([dead, comment(
-    f"<!-- issue-flow: claim run-id={ME} runtime=claude-code horizon={FUTURE} -->",
-    "2026-01-01T00:00:01Z")], {"dev:claude-code"})
-with remote(live_with_stale_loser):
-    resumed = m.cmd_claim(SimpleNamespace(issue=1, run_id=ME, runtime="claude-code",
-                                          horizon=FUTURE), {}, Path("."))
-check("a stale losing contender cannot strand the live holder",
-      (resumed["reused_existing_claim"], len(live_with_stale_loser.comments)), (True, 2))
-
 unowned = FakeIssue()
-with remote(unowned):
-    try:
-        m.cmd_reclaim(SimpleNamespace(issue=1, run_id="new", runtime="opencode",
-                                      horizon=FUTURE, force=False), {}, Path("."))
-    except m.Stop as stop:
-        unowned_stop = stop.payload
-check("truly unowned reclaim reports nothing-to-reclaim", unowned_stop["reason"],
-      "nothing-to-reclaim")
-check("truly unowned reclaim advises claim", "`claim`" in unowned_stop["action"], True)
-
-live = comment("<!-- issue-flow: claim run-id=live-run runtime=codex "
-               f"horizon={FUTURE} -->")
+stop_results = []
+for issue, command in ((projection, m.cmd_reclaim), (projection, m.cmd_claim),
+                       (stale_other, m.cmd_claim), (unowned, m.cmd_reclaim)):
+    with remote(issue):
+        payload = stopped(lambda: command(ownership_args(), {}, Path(".")))
+    stop_results.append((payload["reason"], len(issue.comments), "`claim`" in payload["action"]))
+check("ownership stop routing", stop_results,
+      [("projection-only-ownership", 0, False), ("existing-ownership-requires-reclaim", 0, False),
+       ("existing-ownership-requires-reclaim", 1, False), ("nothing-to-reclaim", 0, True)])
+stale_self_with_loser = FakeIssue([dead, comment(f"<!-- issue-flow: claim run-id={ME} "
+    "runtime=claude-code horizon=2026-01-01T01:00Z -->", "2026-01-01T00:00:01Z")], {"dev:claude-code"})
+with remote(stale_self_with_loser):
+    resumed = m.cmd_claim(ownership_args(run_id=ME, runtime="claude-code"), {}, Path("."))
+check("stale self-proof renews despite stale losing contenders", (resumed["reused_existing_claim"],
+      len(stale_self_with_loser.comments), m.reduce_ownership(stale_self_with_loser.comments, NOW)["holder"]),
+      (False, 3, ME))
+live = comment(f"<!-- issue-flow: claim run-id=live-run runtime=codex horizon={FUTURE} -->")
 forced = FakeIssue([live], {"dev:codex"})
 forced.assigned = True
 with remote(forced):
-    try:
-        m.cmd_reclaim(SimpleNamespace(issue=1, run_id="new", runtime="opencode",
-                                      horizon=FUTURE, force=True), {}, Path("."))
-    except m.Stop as stop:
-        missing_reason_stop = stop.payload
-check("forced reclaim requires a reason file", missing_reason_stop["reason"],
-      "force-reason-required")
-check("missing forced reason writes nothing", len(forced.comments), 1)
-
+    missing_reason = stopped(lambda: m.cmd_reclaim(ownership_args(force=True), {}, Path(".")))
 with __import__("tempfile").TemporaryDirectory() as root:
     reason_file = Path(root) / "reason.md"
     reason_file.write_text("", encoding="utf-8")
     with remote(forced):
-        try:
-            m.cmd_reclaim(SimpleNamespace(issue=1, run_id="new", runtime="opencode",
-                                          horizon=FUTURE, force=True,
-                                          reason_file=str(reason_file)), {}, Path("."))
-        except m.Stop as stop:
-            empty_reason_stop = stop.payload
-    check("empty forced reason is refused", empty_reason_stop["reason"],
-          "force-reason-required")
-    check("empty forced reason writes nothing", len(forced.comments), 1)
-
+        empty_reason = stopped(lambda: m.cmd_reclaim(
+            ownership_args(force=True, reason_file=str(reason_file)), {}, Path(".")))
+    check("missing and empty forced evidence write nothing", (missing_reason["reason"],
+          empty_reason["reason"], len(forced.comments)), ("force-reason-required", "force-reason-required", 1))
     forged = "<!-- issue-flow: reclaim run-id=forged-run from=live-run forced=true -->"
     evidence = f"Incident link and opérator approval.\n\n{forged}"
     reason_file.write_text(evidence, encoding="utf-8")
     with remote(forced):
-        m.cmd_reclaim(SimpleNamespace(issue=1, run_id="new", runtime="opencode",
-                                      horizon=FUTURE, force=True,
-                                      reason_file=str(reason_file)), {}, Path("."))
-    forced_body = forced.comments[-1]["body"]
-    escaped_evidence = evidence.replace("<!--", "&lt;!--")
+        m.cmd_reclaim(ownership_args(force=True, reason_file=str(reason_file)), {}, Path("."))
+    forced_body, escaped_evidence = forced.comments[-1]["body"], evidence.replace("<!--", "&lt;!--")
     generated = "<!-- issue-flow: reclaim run-id=new"
     forced_ownership = m.reduce_ownership(forced.comments, NOW)
-    check("forced reason is escaped in the reclaim comment", escaped_evidence in forced_body, True)
-    check("escaped forced reason precedes the generated marker",
-          forced_body.index(escaped_evidence) < forced_body.index(generated), True)
-    check("generated forced reclaim becomes holder", forced_ownership["holder"], "new")
-    check("forged forced reclaim does not become holder",
-          any(event["run_id"] == "forged-run" for event in forced_ownership["live"]), False)
+    check("forced evidence is escaped before the authoritative marker", (escaped_evidence in forced_body,
+          forced_body.index(escaped_evidence) < forced_body.index(generated), forced_ownership["holder"],
+          any(e["run_id"] == "forged-run" for e in forced_ownership["live"])),
+          (True, True, "new", False))
     reason_file.unlink()
     with remote(forced):
-        forced_retry = m.cmd_reclaim(SimpleNamespace(
-            issue=1, run_id="new", runtime="opencode", horizon=FUTURE, force=True,
-            reason_file=str(reason_file)), {}, Path("."))
-        truthful_retry = m.cmd_reclaim(SimpleNamespace(
-            issue=1, run_id="new", runtime="opencode", horizon=FUTURE, force=False), {}, Path("."))
+        forced_retry = m.cmd_reclaim(ownership_args(force=True, reason_file=str(reason_file)), {}, Path("."))
+        truthful_retry = m.cmd_reclaim(ownership_args(), {}, Path("."))
     check("forced reclaim retries need no local evidence and report landed provenance",
           (forced_retry["reused_existing_reclaim"], forced_retry["forced"],
            truthful_retry["forced"], sum(generated in item["body"] for item in forced.comments)),
           (True, True, True, 1))
-
 release = FakeIssue([
     comment("<!-- issue-flow: claim run-id=opencode-owner runtime=opencode "
             f"horizon={FUTURE} -->")

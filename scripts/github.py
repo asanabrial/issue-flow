@@ -81,6 +81,8 @@ STATES = ["analysis", "ready", "in-progress", "review", "blocked", "done"]
 # Reading falls back to the prose forms for comments written before this script existed; writing
 # always emits both, so a human reading the timeline still sees a sentence.
 MARKER_RE = re.compile(r"<!--\s*issue-flow:\s*(?P<kind>[a-z-]+)\s+(?P<attrs>[^>]*?)\s*-->")
+MARKER_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@-]*$")
+FORCED_EVIDENCE_HEADING = "Forced takeover reason and evidence:"
 
 # The two marker vocabularies, named once.
 #
@@ -94,6 +96,7 @@ MARKER_RE = re.compile(r"<!--\s*issue-flow:\s*(?P<kind>[a-z-]+)\s+(?P<attrs>[^>]
 # CONTROL — a message addressed to a run-id that instructs it to stop.
 RELEASE_KINDS = frozenset({"standdown", "release", "unassign", "reclaim"})
 CONTROL_KINDS = frozenset({"standdown", "reclaim", "adjudication"})
+ACTIVITY_KINDS = frozenset({"claim", "reclaim", "heartbeat"})
 # Attributes that can carry the run-id a marker is ABOUT, rather than the one that wrote it.
 TARGET_ATTRS = ("run-id", "target", "from")
 
@@ -324,16 +327,18 @@ def repo_identity(cwd: Path) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 def marker(kind: str, **attrs) -> str:
-    body = " ".join(f"{k.replace('_', '-')}={v}" for k, v in attrs.items() if v)
+    values = {key.replace("_", "-"): str(value) for key, value in attrs.items() if value}
+    if not all(MARKER_VALUE_RE.fullmatch(value) for value in values.values()):
+        raise Stop({"ok": False, "reason": "invalid-marker-attribute"})
+    body = " ".join(f"{key}={value}" for key, value in values.items())
     return f"<!-- issue-flow: {kind} {body} -->"
 
 
 def escape_control_markers(body: str) -> str:
     """Preserve quoted evidence without letting it become control-plane input."""
     escaped = re.sub(r"<!--(?=\s*issue-flow:)", "&lt;!--", body or "")
-    if CLAIM_PROSE.match(escaped) and CLAIM_HORIZON_PROSE.search(escaped):
-        escaped = f"Quoted evidence:\n\n{escaped}"
-    return escaped
+    return (f"Quoted evidence:\n\n{escaped}" if STANDDOWN_PROSE.match(escaped) or (
+            CLAIM_PROSE.match(escaped) and CLAIM_HORIZON_PROSE.search(escaped)) else escaped)
 
 
 def parse_markers(body: str) -> list[dict[str, str]]:
@@ -353,8 +358,8 @@ def parse_markers(body: str) -> list[dict[str, str]]:
 # merely MENTIONS a run-id is not a control message, and treating one as a stand-down would have a
 # run abandon work nobody asked it to drop.
 STANDDOWN_PROSE = re.compile(
-    r"\b(stand(?:ing)?\s*down|standing down|backing off|back off|reclaiming from|"
-    r"adjudicat\w*|you lost|release the item)\b",
+    r"^\s*(?P<run>[\w.-]+) standing down: [\w.-]+ claimed at [^,\r\n]+, "
+    r"earlier than this run\. Nothing was created\.\s*$",
     re.IGNORECASE,
 )
 # Legacy claim detection, anchored on purpose.
@@ -465,12 +470,12 @@ def claim_is_live(claimed_at: str, run_id: str, released: dict[str, str]) -> boo
 
 
 def last_activity_by(comments: list[dict], run_id: str) -> str:
-    """Newest server timestamp explicitly authored by this run-id."""
+    """Newest server timestamp on an author marker that proves liveness."""
     stamps = [
         comment.get("createdAt", "")
         for comment in comments
-        if any(
-            mark.get("run-id") == run_id
+        if comment.get("viewerDidAuthor") is True and any(
+            mark.get("kind") in ACTIVITY_KINDS and mark.get("run-id") == run_id
             for mark in parse_markers(comment.get("body", ""))
         )
     ]
@@ -508,24 +513,11 @@ def ownership_deadline(horizon, activity):
 
 
 def stale_claims(claims, comments: list[dict], now: str) -> set[str]:
-    """Claims past both their declared horizon and bounded holder activity window.
-
-    This is the mechanical half of the portable safety procedure's reclaim rule. Without it a run
-    that died mid-build holds its issue forever: `claim` re-reads the timeline, finds that
-    never-released claim as the earliest live entry, and tells a live run it lost a race to a process
-    that no longer exists — reproducing the exact "abandoned work" incident this script was written
-    against.
-
-    Deliberately conservative. A horizon is a heuristic, not a lease: only a claim that BOTH
-    declared a horizon and has been silent past it counts as stale. A claim with no horizon is
-    left alone here, because judging "a few hours is long enough" belongs to a human or to the
-    explicit `reclaim` command, not to an automatic adjudication.
-    """
+    """Legacy claim-parser test helper; commands use `reduce_ownership`, including horizonless expiry."""
     moment = parse_stamp(now)
     if moment is None:
         return set()
     stale = set()
-    trusted = [comment for comment in comments if comment.get("viewerDidAuthor") is True]
     for _created_at, run_id, comment in claims:
         horizon = None
         for mark in parse_markers(comment.get("body", "")):
@@ -534,7 +526,7 @@ def stale_claims(claims, comments: list[dict], now: str) -> set[str]:
         # An unparseable or absent horizon is "unknown", never automatically expired.
         if horizon is None:
             continue
-        spoke_at = parse_stamp(last_activity_by(trusted, run_id))
+        spoke_at = parse_stamp(last_activity_by(comments, run_id))
         deadline = ownership_deadline(horizon, spoke_at)
         if deadline and deadline <= moment:
             stale.add(run_id)
@@ -586,6 +578,11 @@ def holder_uses_runtime(event: dict | None, runtime: str) -> bool:
 
 
 def valid_reclaim(event: dict, comments: list[dict]) -> bool:
+    if event["forced"]:
+        body = event["comment"].get("body", "")
+        marker_at = next((m.start() for m in MARKER_RE.finditer(body) if m.group("kind") == "reclaim"), 0)
+        if not 0 <= body.find(FORCED_EVIDENCE_HEADING) < marker_at:
+            return False
     prior = reduce_ownership(comments[:event["position"]], event["created_at"])
     target = prior["event"] or (prior["stale"][0] if prior["stale"] else None)
     return bool(target and target["run_id"] == event["from"]
@@ -897,6 +894,16 @@ def label_names(data: dict) -> list[str]:
     return [label["name"] for label in data.get("labels", [])]
 
 
+def require_runtime_projection(issue: int, runtime: str, cwd: Path, stale=()) -> None:
+    try:
+        data = issue_view(issue, "assignees,labels", cwd=cwd)
+    except ReadFailure as exc:
+        raise WriteFailure("projection may have landed but its readback failed") from exc
+    labels = set(label_names(data))
+    if not data.get("assignees") or f"dev:{runtime}" not in labels or labels.intersection(stale):
+        raise WriteFailure(f"ownership projection readback mismatched: assignees={bool(data.get('assignees'))}, labels={sorted(labels)}")
+
+
 # ---------------------------------------------------------------------------
 # verify_claim — the renewal
 # ---------------------------------------------------------------------------
@@ -972,8 +979,8 @@ def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
             for mark in marks
         )
         if not controlled and not marks:
-            # Legacy prose fallback: a control message must both name the run-id AND instruct.
-            controlled = run_id in body and bool(STANDDOWN_PROSE.search(body))
+            legacy = STANDDOWN_PROSE.fullmatch(body)
+            controlled = bool(legacy and legacy.group("run") == run_id)
         if controlled:
             raise Stop(
                 {
@@ -1119,13 +1126,12 @@ def cmd_claim(args, config, cwd) -> dict:
     """
     data = issue_view(args.issue, "comments,assignees,labels", cwd=cwd)
     existing_comments = data.get("comments", [])
+    prior_comment_count = len(existing_comments)
     before = reduce_ownership(existing_comments, utc_now_stamp())
     already_mine = next((event for event in before["live"] if event["run_id"] == args.run_id and (not parse_stamp(event["horizon"]) or parse_stamp(event["horizon"]) >= parse_stamp(utc_now_stamp()))), None)
-    stale_others = [event for event in before["stale"] if event["run_id"] != args.run_id]
-    projected = bool(data.get("assignees")) or any(
-        label.startswith("dev:") for label in label_names(data)
-    )
-    if (stale_others and not before["event"]) or (projected and not before["event"] and not before["stale"]):
+    projected = bool(data.get("assignees")) or any(label.startswith("dev:") for label in label_names(data))
+    if not any(event["run_id"] == args.run_id for event in before["live"] + before["stale"]) and (
+            before["stale"] or (projected and not before["event"])):
         raise Stop({"ok": False, "reason": "existing-ownership-requires-reclaim",
                     "action": "stop; use audited `reclaim` instead of creating a new claim epoch"})
 
@@ -1140,17 +1146,16 @@ def cmd_claim(args, config, cwd) -> dict:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", path],
                 cwd=cwd, writes=True)
 
-    ownership = reduce_ownership(
-        issue_view(args.issue, "comments", cwd=cwd).get("comments", []), utc_now_stamp()
-    )
-    if not ownership["event"]:
-        # The write succeeded but the timeline has not caught up. Say so as a WRITE failure: the
-        # comment exists, so "retry the read" is the right action and "retry the whole command"
-        # is not. The idempotence guard above makes even a full retry safe, but the caller should
-        # still be told which of the two happened.
+    for _attempt in range(1 if already_mine else 3):
+        comments = issue_view(args.issue, "comments", cwd=cwd).get("comments", [])
+        if already_mine or any(event["kind"] == "claim" and event["run_id"] == args.run_id
+                               and event["position"] >= prior_comment_count
+                               for event in ownership_events(comments)):
+            ownership = reduce_ownership(comments, utc_now_stamp())
+            break
+    else:
         raise WriteFailure(
-            "the claim comment was written but is not visible on the timeline yet — re-read; "
-            "re-running `claim` will reuse the existing comment rather than post a second one"
+            "claim may have landed but was not visible after three reads; do not rerun blindly"
         )
 
     winner = ownership["holder"]
@@ -1179,6 +1184,7 @@ def cmd_claim(args, config, cwd) -> dict:
 
     run(["gh", "issue", "edit", str(args.issue), "--add-assignee", "@me",
          "--add-label", f"dev:{args.runtime}"], cwd=cwd, writes=True)
+    require_runtime_projection(args.issue, args.runtime, cwd)
     return {
         "ok": True,
         "issue": args.issue,
@@ -1251,23 +1257,19 @@ def cmd_reclaim(args, config, cwd) -> dict:
         if forced:
             reason_file = getattr(args, "reason_file", None)
             if not reason_file:
-                raise Stop({"ok": False, "reason": "force-reason-required",
-                            "action": "pass --reason-file with non-empty UTF-8 reason and evidence"})
+                raise Stop({"ok": False, "reason": "force-reason-required"})
             try:
                 force_reason = Path(reason_file).read_text(encoding="utf-8").strip()
             except (OSError, UnicodeError) as exc:
-                raise Stop({"ok": False, "reason": "force-reason-invalid", "detail": str(exc),
-                            "action": "provide a readable UTF-8 --reason-file"}) from exc
+                raise Stop({"ok": False, "reason": "force-reason-invalid", "detail": str(exc)}) from exc
             if not force_reason:
-                raise Stop({"ok": False, "reason": "force-reason-required",
-                            "action": "--reason-file must contain non-empty reason and evidence"})
-            # Escaping preserves rendered evidence while preventing it from outranking our marker.
+                raise Stop({"ok": False, "reason": "force-reason-required"})
             force_reason = escape_control_markers(force_reason)
 
         horizon = args.horizon or (
             datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=4)
         ).strftime("%Y-%m-%dT%H:%MZ")
-        reason = (f"\n\nForced takeover reason and evidence:\n\n{force_reason}"
+        reason = (f"\n\n{FORCED_EVIDENCE_HEADING}\n\n{force_reason}"
                   if force_reason else "")
         with body_file(
             f"Reclaiming from `{holder}`; last activity {last_activity_by(comments, holder) or 'none'}, "
@@ -1287,10 +1289,12 @@ def cmd_reclaim(args, config, cwd) -> dict:
     ensure_label(f"dev:{args.runtime}", "bfd4f2", cwd)
     edit = ["gh", "issue", "edit", str(args.issue), "--add-assignee", "@me",
             "--add-label", f"dev:{args.runtime}"]
-    for label in label_names(data):
-        if label.startswith("dev:") and label != f"dev:{args.runtime}":
-            edit.extend(["--remove-label", label])
+    stale_labels = {label for label in label_names(data)
+                    if label.startswith("dev:") and label != f"dev:{args.runtime}"}
+    for label in stale_labels:
+        edit.extend(["--remove-label", label])
     run(edit, cwd=cwd, writes=True)
+    require_runtime_projection(args.issue, args.runtime, cwd, stale_labels)
 
     return {
         "ok": True,
@@ -1388,8 +1392,7 @@ def cmd_transition(args, config, cwd) -> dict:
 
 def cmd_comment(args, config, cwd) -> dict:
     if args.kind not in {None, "note", "blocker", "diagnosis"}:
-        raise Stop({"ok": False, "reason": "reserved-comment-kind",
-                    "action": "use note, blocker, or diagnosis; ownership markers have dedicated commands"})
+        raise Stop({"ok": False, "reason": "reserved-comment-kind"})
     body = escape_control_markers(Path(args.body_file).read_text(encoding="utf-8"))
     if args.run_id and args.kind:
         body = body.rstrip() + f"\n\n{marker(args.kind, run_id=args.run_id)}\n"
