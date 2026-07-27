@@ -162,12 +162,28 @@ check("an expired, silent claim is stale",
 check("a claim inside its horizon is not stale",
       m.stale_claims(DEAD_CLAIMS, DEAD, "2026-01-01T03:00Z"), set())
 
-check("a claim whose holder spoke past its horizon is not stale",
-      m.stale_claims(DEAD_CLAIMS,
-                     DEAD + [comment("<!-- issue-flow: heartbeat run-id=dead-run -->",
-                                     "2026-01-01T09:00:00Z")],
-                     "2026-01-05T00:00Z"),
-      set())
+TALKING = DEAD + [comment("<!-- issue-flow: heartbeat run-id=dead-run -->",
+                          "2026-01-01T09:00:00Z")]
+check("post-horizon activity grants one bounded renewal window",
+      m.stale_claims(DEAD_CLAIMS, TALKING, "2026-01-01T10:00Z"), set())
+check("post-horizon activity does not make ownership permanent",
+      m.reduce_ownership(TALKING, "2026-01-05T00:00Z")["holder"], None)
+ATTRIBUTED_ACTIVITY = [
+    comment(m.marker("claim", run_id="owner", horizon="2026-01-03T00:00Z")),
+    comment(m.marker("heartbeat", run_id="owner"), "2026-01-01T01:00:00Z"),
+    comment("another run mentions owner", "2026-01-01T02:00:00Z", trusted=False),
+    comment(m.marker("note", run_id="owner"), "2026-01-01T02:30:00Z"),
+    comment(m.marker("reclaim", run_id="other", **{"from": "owner"}),
+            "2026-01-01T03:00:00Z"),
+]
+check("only holder liveness markers extend activity",
+      m.last_activity_by(ATTRIBUTED_ACTIVITY, "owner"), "2026-01-01T01:00:00Z")
+REACQUIRED = [
+    comment(m.marker("heartbeat", run_id="owner"), "2026-01-01T01:00:00Z"),
+    comment(m.marker("claim", run_id="owner"), "2026-01-01T10:00:00Z"),
+]
+check("activity before a reacquisition cannot expire its new ownership window",
+      m.reduce_ownership(REACQUIRED, "2026-01-01T11:00:00Z")["holder"], "owner")
 
 NO_HORIZON = [comment("<!-- issue-flow: claim run-id=r1 -->")]
 check("a claim with no declared horizon expires after the legacy window",
@@ -494,6 +510,18 @@ def remote(remote):
                           ensure_label=lambda *_args: None, utc_now_stamp=lambda: NOW)
 
 
+same_second = FakeIssue([
+    comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE), NOW),
+    comment(m.marker("adjudication", run_id=ME), NOW),
+])
+same_second_stopped = False
+try:
+    with remote(same_second):
+        m.do_verify_claim(1, ME, "ready", Path("."))
+except m.Stop as exc:
+    same_second_stopped = exc.payload["reason"] == "control-message"
+check("same-second control uses timeline order", same_second_stopped, True)
+
 generic = FakeIssue()
 with m.body_file(f"progress\n\n{m.marker('claim', run_id='forged', runtime='opencode', horizon=FUTURE)}") as source:
     with patch.object(m, "run", generic.run):
@@ -607,6 +635,36 @@ with m.body_file("evidence") as unused_reason:
         rejected_unused_reason = exc.payload["reason"]
 check("reason files cannot be silently ignored without force", rejected_unused_reason,
       "force-required-for-reason")
+foreign_stale = FakeIssue([comment(
+    m.marker("claim", run_id=OTHER, runtime="codex", horizon="2026-01-01T01:00Z"))])
+foreign_route = None
+try:
+    with remote(foreign_stale):
+        m.cmd_claim(SimpleNamespace(issue=1, run_id=ME, runtime="claude-code",
+                                    horizon=FUTURE), {}, Path("."))
+except m.Stop as exc:
+    foreign_route = exc.payload["reason"]
+check("claim routes stale foreign ownership through reclaim",
+      (foreign_route, len(m.claim_comments(foreign_stale.comments))),
+      ("stale-foreign-requires-reclaim", 1))
+
+mixed_stale = FakeIssue([
+    comment(m.marker("claim", run_id=ME, runtime="claude-code",
+                     horizon="2026-01-01T01:00Z")),
+    comment(m.marker("claim", run_id=OTHER, runtime="codex",
+                     horizon="2026-01-01T01:00Z"), "2026-01-01T00:01:00Z"),
+], ["dev:claude-code", "dev:codex"])
+mixed_result = None
+try:
+    with remote(mixed_stale):
+        mixed_result = m.cmd_reclaim(SimpleNamespace(
+            issue=1, run_id=ME, runtime="claude-code", horizon=FUTURE, force=False),
+            {}, Path("."))
+except m.Stop:
+    pass
+check("mixed stale contenders reclaim a foreign target without self-deadlock",
+      (mixed_result and mixed_result["reclaimed_from"], mixed_stale.labels),
+      (OTHER, {"status:ready", "dev:claude-code"}))
 expired_self = FakeIssue([
     comment(f"<!-- issue-flow: claim run-id={ME} runtime=claude-code "
             "horizon=2026-01-01T01:00Z -->"),
@@ -718,6 +776,72 @@ check("unassign retry does not duplicate the release marker",
 check("unassign retry leaves no live owner", m.reduce_ownership(release.comments, NOW)["holder"], None)
 check("unassign retry converges projections", (release.assigned, release.labels),
       (False, {"status:ready"}))
+retry_runtime = None
+try:
+    with remote(release):
+        m.cmd_unassign(SimpleNamespace(issue=1, run_id="opencode-owner", runtime="codex",
+                                       held_by_other=False), {}, Path("."))
+except m.Stop as exc:
+    retry_runtime = exc.payload["reason"]
+check("unassign retries preserve landed runtime provenance",
+      retry_runtime, "unassign-metadata-mismatch")
+legacy_release = FakeIssue([
+    comment(m.marker("unassign", run_id="opencode-legacy"))
+])
+with remote(legacy_release):
+    legacy_retry = m.cmd_unassign(SimpleNamespace(
+        issue=1, run_id="opencode-legacy", runtime="opencode", held_by_other=False), {}, Path("."))
+check("legacy release retries retain run-id-prefix compatibility", legacy_retry["ok"], True)
+unscoped_legacy = FakeIssue([comment(m.marker("unassign", run_id="legacy"))], ["dev:opencode"])
+unscoped_legacy.assigned = True
+unscoped_reason = None
+try:
+    with remote(unscoped_legacy):
+        m.cmd_unassign(SimpleNamespace(issue=1, run_id="legacy", runtime="opencode",
+                                       held_by_other=False), {}, Path("."))
+except m.Stop as exc:
+    unscoped_reason = exc.payload["reason"]
+check("legacy release retries cannot borrow an unrelated runtime",
+      (unscoped_reason, unscoped_legacy.assigned, unscoped_legacy.labels),
+      ("unassign-metadata-mismatch", True, {"status:ready", "dev:opencode"}))
+
+projection_only = FakeIssue(labels=["dev:opencode"])
+projection_only.assigned = True
+held_bypass = None
+try:
+    with remote(projection_only):
+        m.cmd_unassign(SimpleNamespace(issue=1, run_id="missing", runtime="opencode",
+                                       held_by_other=True), {}, Path("."))
+except m.Stop as exc:
+    held_bypass = exc.payload["reason"]
+check("held-by-other cannot preserve projections without a live holder",
+      (held_bypass, projection_only.assigned), ("nothing-to-unassign", True))
+
+sole_holder = FakeIssue([
+    comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE))
+])
+sole_held = None
+try:
+    with remote(sole_holder):
+        m.cmd_unassign(SimpleNamespace(issue=1, run_id=ME, runtime="claude-code",
+                                       held_by_other=True), {}, Path("."))
+except m.Stop as exc:
+    sole_held = exc.payload["reason"]
+check("held-by-other refuses before releasing the sole holder",
+      (sole_held, len(sole_holder.comments)), ("held-by-other-without-other-holder", 1))
+
+wrong_runtime_release = FakeIssue([
+    comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE))
+])
+wrong_runtime = None
+try:
+    with remote(wrong_runtime_release):
+        m.cmd_unassign(SimpleNamespace(issue=1, run_id=ME, runtime="opencode",
+                                       held_by_other=False), {}, Path("."))
+except m.Stop as exc:
+    wrong_runtime = exc.payload["reason"]
+check("unassign cannot borrow mismatched runtime metadata",
+      (wrong_runtime, len(wrong_runtime_release.comments)), ("unassign-metadata-mismatch", 1))
 
 unassign_parser = m.build_parser()._subparsers._group_actions[0].choices["unassign"]
 check("unassign requires run-id at the CLI boundary",
