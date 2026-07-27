@@ -30,7 +30,7 @@ prose does (the block between the config markers in `SKILL.md`, overridden by `o
 so it never becomes a third source of truth. `python <skill>/scripts/github.py config` prints what it
 resolved — run it once if you are unsure what the board or worktree row currently says.
 
-**Exit codes carry the distinction `SKILL.md` calls *a failed read is not a failed answer*:**
+**Exit codes carry the [portable safety procedure's](../references/safety-incidents.md#portable-safety-procedure) distinction between a stop result and a failed read:**
 
 | Exit | Meaning | What you do |
 |---|---|---|
@@ -101,8 +101,8 @@ either: **an identity field cannot adjudicate a race between runs that share tha
 
 ### Control markers
 
-`SKILL.md` warns that "parsing prose for the same answer is fragile — any rewording breaks it", and
-adjudication used to depend on exactly that. So every control comment the script writes carries a
+Parsing prose for the same answer is fragile because any rewording breaks it, and adjudication used
+to depend on exactly that. So every control comment the script writes carries a
 machine-readable trailer alongside the sentence a human reads:
 
 ```
@@ -162,12 +162,12 @@ ones.
 | `create` | `SCRIPT create --identity <id> --title <t> --body-file <f> --priority <scale:value> --domain <name> --runtime <rt> --run-id <id> [--state ready\|blocked]` | creates every label **before** attaching it, then mirrors the initial board column — the case everyone forgets, because no `transition` ever follows a fresh issue to correct an empty `Status` |
 | `list_state` | `SCRIPT list-state --state <s>` | unassigned only, `--limit 200` (the default cap is 30 and silently truncates the queue), partitioned by `domain:<name>`. It returns the raw labels and **refuses to rank across partitions** — ordering inside one needs the domain's scale contract, and manufacturing a global rank is forbidden |
 | `claim` | `SCRIPT claim --issue <n> --run-id <id> --runtime <rt> --horizon <when>` | appends ownership before projecting assignee/label state, then accepts only the reducer's live winner. An expired self-claim gets a fresh event; same-runtime loss cleanup preserves the winner's shared label |
-| `reclaim` | `SCRIPT reclaim --issue <n> --run-id <id> --runtime <rt> [--horizon <when>] [--force]` | one trusted, validated event releases the named holder and establishes the new holder with a horizon before recoverable projections. Before `--force`, use `comment` to record its exceptional reason and evidence; the takeover is also marked forced |
+| `reclaim` | `SCRIPT reclaim --issue <n> --run-id <id> --runtime <rt> [--horizon <when>] [--force]` | requires a claim/reclaim event; projection-only recovery is unsupported and fails closed. One validated event releases the named holder and establishes the new holder with a horizon before recoverable projections. Before `--force`, use `comment` to record its exceptional reason and evidence; the takeover is also marked forced |
 | `verify_claim` | `SCRIPT verify-claim --issue <n> --run-id <id> --expect-state <s> [--allow-closed-by-pr <pr>]` | proves the requested run is the reducer's current live winner, uses that ownership event as its control-message watermark, and applies the open/state checks. `--allow-closed-by-pr` remains limited to the renewal before `close` |
 | `transition` | `SCRIPT transition --issue <n> --to <s> [--from <s>]` | mirrors the board **first**, swaps the label in **one** call, then reads **both** back and repairs a board that disagrees. Omitting `--from` removes whatever stale state labels it finds |
 | `comment` | `SCRIPT comment --issue <n> --body-file <f> [--run-id <id> --kind <k>]` | file-based body, always |
 | `heartbeat` | `SCRIPT heartbeat --issue <n> --run-id <id> --expect-state <s> --body-file <f>` | renewal first, post second; **refuses to post** when the renewal says stop |
-| branch + worktree | `SCRIPT start-branch --issue <n> --branch <b> --base <base> --run-id <id>` | renews first, fetches before fallback discovery, resumes local or remote-only branch heads without moving them, and creates from the fetched base only when the branch is absent everywhere |
+| branch + worktree | `SCRIPT start-branch --issue <n> --branch <b> --base <base> --run-id <id>` | requires a configured path containing `<run-id>`, renews first, fetches before fallback discovery, resumes branch heads without moving them, and rejects foreign/orphaned paths. A cross-run reclaim preserves the old checkout until its writer is proven stopped |
 | `publish_review` | `SCRIPT publish-review --issue <n> --branch <b> --base <base> --run-id <id> --pr-title <t> --pr-body-file <f> [--worktree <p>]` | pushes, **reuses** the single open PR or creates one, refuses on more than one, scans for closing keywords, and records the PR URL with its exact head and base SHAs |
 | `changelog-notes` | `SCRIPT changelog-notes --version <x.y.z> --file <changelog> [--out <f>]` | read-only. Extracts the version's entry for its tag and Release, anchored on the version **opening** the heading. Fails closed on a missing or empty entry — a tag is immutable, so notes invented at tag time are permanent |
 | `check closing keywords` | `SCRIPT check-closing-keywords --issue <n>` | run again before merging: the branch's commit messages can introduce one after the body is already clean |

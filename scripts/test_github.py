@@ -160,6 +160,12 @@ try:
 except m.Stop:
     check("a `..` component is refused", True, True)
 
+try:
+    m.worktree_path("R:/wt/<repo>/<branch>", "r", "b", "run", 1)
+    check("a worktree template without run-id is refused", False, True)
+except m.Stop:
+    check("a worktree template without run-id is refused", True, True)
+
 
 # --------------------------------------------------------------------------------------
 # Closing keywords. The defect: the check reported the SYMPTOM (a live close reference) as the
@@ -529,7 +535,7 @@ with patch.multiple(m, run=fake_git_run, do_verify_claim=lambda *_args: {},
                     repo_identity=lambda _cwd: ("owner", "repo")):
     with __import__("tempfile").TemporaryDirectory() as root:
         m.cmd_start_branch(SimpleNamespace(issue=6, run_id=ME, expect_state="in-progress",
-                                           worktree_root=f"{root}/<branch>", branch="fix/6",
+                                       worktree_root=f"{root}/<branch>-<run-id>", branch="fix/6",
                                            base="main"), {}, Path("."))
 remote_check = next(i for i, command in enumerate(git_commands)
                     if "refs/remotes/origin/fix/6" in command)

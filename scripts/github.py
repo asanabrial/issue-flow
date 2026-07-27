@@ -38,7 +38,7 @@ would drift, which is the exact failure this file exists to remove.
 OUTPUT CONTRACT
 ---------------
 Every subcommand prints exactly one JSON object on stdout and nothing else. Exit codes carry the
-distinction `SKILL.md` calls "a failed read is not a failed answer":
+portable safety procedure's distinction between a stop result and a failed read:
 
   0  the operation completed AND its read-back verified
   1  STOP — a check answered "stop" (lost race, stand-down, wrong state, closed issue).
@@ -73,8 +73,8 @@ STATES = ["analysis", "ready", "in-progress", "review", "blocked", "done"]
 
 # Machine-readable control markers.
 #
-# The prose flow adjudicates races and stand-downs by reading comment text, and SKILL.md itself
-# warns that "parsing prose for the same answer is fragile - any rewording breaks it". These
+# The prose flow adjudicates races and stand-downs by reading comment text, where any rewording can
+# break a parser that treats prose as a control contract. These
 # markers make the same facts exact. They are HTML comments, so they are invisible in rendered
 # markdown and cannot be reworded by a later run editing the surrounding sentence.
 #
@@ -499,7 +499,7 @@ def parse_stamp(value: str):
 def stale_claims(claims, comments: list[dict], now: str) -> set[str]:
     """Claims whose declared horizon has passed with no word from the holder since.
 
-    This is the mechanical half of SKILL.md's reclaim rule. Without it a run that died mid-build
+    This is the mechanical half of the portable safety procedure's reclaim rule. Without it a run that died mid-build
     holds its issue forever: `claim` re-reads the timeline, finds that never-released claim as the
     earliest live entry, and tells a live run it lost a race to a process that no longer exists —
     reproducing the exact "abandoned work" incident this script was written against.
@@ -892,7 +892,7 @@ def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
                     allow_closed_by_pr: int | None = None) -> dict:
     """One ownership read, four checks. A failed CHECK is a stop; a failed READ is nothing.
 
-    That distinction is the whole point: SKILL.md records a run that lost a claim race by five
+    That distinction is the whole point of safety incident I07: a run lost a claim race by five
     seconds, was told so 33 seconds later, and then worked another ~48 minutes because nothing in
     its heartbeat loop ever read the timeline again.
 
@@ -1076,7 +1076,7 @@ def cmd_list_state(args, config, cwd) -> dict:
     # Partition by domain, and order each partition OLDEST FIRST — that is the workflow's
     # tie-break, and it is the only ordering this script is entitled to apply. Ranking by priority
     # INSIDE a partition needs the domain's own scale contract, which this script does not know
-    # and must not invent: SKILL.md forbids manufacturing a global rank across scales. So every
+    # and must not invent: domain composition forbids manufacturing a global rank across scales. So every
     # label is returned raw alongside the age order, and the agent applies the contract it loaded.
     partitions: dict[str, list] = {}
     for item in data:
@@ -1371,6 +1371,10 @@ def worktree_path(template: str, repo: str, branch: str, run_id: str, issue: int
     `bindings/github.md` under *Branch, worktree and the linked issue*. It is deliberately NOT
     retold here: an incident narrated in three files goes stale in two of them.
     """
+    if "<run-id>" not in template:
+        raise Stop({"ok": False, "reason": "unsafe-worktree-template",
+                    "action": "worktree location must contain <run-id> to isolate live writers"})
+
     def flatten(value: str) -> str:
         cleaned = re.sub(r"[/\\]+", "-", str(value)).strip()
         if not cleaned or cleaned != cleaned.replace("..", ""):

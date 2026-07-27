@@ -7,7 +7,9 @@ protection only when the surviving executable or document owner changes.
 ## Portable safety procedure
 
 These requirements are tracker-neutral. The selected binding and its scripts own detailed queries,
-ordering, mutations, and readbacks; they may strengthen, but never weaken, this procedure.
+ordering, mutations, and readbacks; they may strengthen, but never weaken, this procedure. Whether
+exceptional evidence justifies a force is judgement and remains prose-owned; marking and converging
+the resulting takeover are mechanical binding responsibilities.
 
 - A claim MUST declare a horizon and report progress with heartbeats. A heartbeat renews authority by
   successfully reading before it writes; it records liveness but is not a silent lease extension.
@@ -22,7 +24,9 @@ ordering, mutations, and readbacks; they may strengthen, but never weaken, this 
   audit comment stating its exceptional reason and evidence; the binding also marks the takeover as
   forced. The reclaimer MUST comment the takeover, take ownership, and verify that ownership
   before repository writes. Retain and adopt prior branches, diffs, diagnoses, ruled-out hypotheses,
-  and evidence, then transition directly to the state those artifacts support.
+  and evidence, then transition directly to the state those artifacts support. A forced takeover does
+  not prove the displaced process stopped: do not reuse its checkout until it acknowledges or
+  independent evidence proves it ended; otherwise leave repository work blocked.
 - A displaced holder MUST stop on its next renewal. If the item remains open, acknowledge once, use
   the binding's safe release path to remove only that run's attribution while preserving projections
   needed by the winner, and write no second claim. Never change the new holder's workflow state.
