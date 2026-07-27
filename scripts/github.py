@@ -92,6 +92,8 @@ FORCED_EVIDENCE_SINCE = "2026-07-27T19:00:00Z"
 FORCED_EVIDENCE_HEADING = "Forced takeover reason and evidence:"
 COMMENT_KINDS = frozenset({"note", "blocker", "diagnosis"})
 ACTIVITY_KINDS = frozenset({"heartbeat", "branch", "published"})
+READBACK_ATTEMPTS = 7
+READBACK_DELAY_SECONDS = 0.5
 
 # The two marker vocabularies, named once.
 #
@@ -942,6 +944,113 @@ def label_names(data: dict) -> list[str]:
     return [label["name"] for label in data.get("labels", [])]
 
 
+def wait_for_issue(issue: int, fields: str, predicate, cwd: Path, failure: str,
+                   consecutive: int = 1, ambiguous_write: bool = False) -> dict:
+    """Bound eventual-consistency reads without repeating the preceding write."""
+    matches = 0
+    successful_read = False
+    last_read_failure = None
+    for attempt in range(READBACK_ATTEMPTS):
+        try:
+            data = issue_view(issue, fields, cwd=cwd)
+            successful_read = True
+        except ReadFailure as exc:
+            data = None
+            last_read_failure = exc
+        if data is not None and predicate(data):
+            matches += 1
+            if matches >= consecutive:
+                return data
+        else:
+            matches = 0
+        if attempt + 1 < READBACK_ATTEMPTS:
+            time.sleep(READBACK_DELAY_SECONDS)
+    if not successful_read and not ambiguous_write:
+        raise last_read_failure
+    raise WriteFailure(failure)
+
+
+def viewer_login(cwd: Path) -> str:
+    data = gh_json(["api", "user"], cwd=cwd) or {}
+    if not data.get("login"):
+        raise ReadFailure("gh api user returned no login")
+    return data["login"]
+
+
+def projection_state(data: dict) -> tuple[set[str], set[str]]:
+    assignees = {item["login"] for item in data.get("assignees", [])}
+    runtimes = {name for name in label_names(data) if name.startswith("dev:")}
+    return assignees, runtimes
+
+
+def ownership_identity(event: dict | None) -> tuple:
+    fields = ("created_at", "position", "run_id", "kind", "runtime", "horizon", "from", "forced")
+    return tuple((event or {}).get(key) for key in fields)
+
+
+def converge_ownership_projection(issue: int, event: dict | None, cwd: Path,
+                                  login: str | None = None, repair: bool = True) -> dict:
+    """Project only the reducer's holder, then prove the exact assignee/runtime sets landed."""
+    login = login or (viewer_login(cwd) if event else None)
+    expected_assignees = {login} if event and login else set()
+    expected_identity = ownership_identity(event)
+    try:
+        data = wait_for_issue(
+            issue, "assignees,labels,comments",
+            lambda item: ownership_identity(reduce_ownership(
+                item.get("comments", []), utc_now_stamp())["event"]) == expected_identity,
+            cwd, "ownership changed before projection; no projection write was attempted",
+            consecutive=2,
+        )
+    except WriteFailure:
+        latest = issue_view(issue, "assignees,labels,comments", cwd=cwd)
+        latest_event = reduce_ownership(latest.get("comments", []), utc_now_stamp())["event"]
+        if repair and ownership_identity(latest_event) != expected_identity:
+            converge_ownership_projection(issue, latest_event, cwd, login=login, repair=False)
+            raise Stop({"ok": False, "reason": "ownership-changed-projections-repaired"})
+        raise
+    runtime = event.get("runtime") if event else None
+    if event and not runtime:
+        legacy = {name[4:] for name in label_names(data) if name.startswith("dev:")
+                  and holder_uses_runtime(event, name[4:])}
+        if len(legacy) != 1:
+            raise Stop({"ok": False, "reason": "holder-runtime-missing"})
+        runtime = legacy.pop()
+    expected_runtimes = {f"dev:{runtime}"} if runtime else set()
+    current_assignees, current_runtimes = projection_state(data)
+    edit = ["gh", "issue", "edit", str(issue)]
+    for assignee in sorted(current_assignees - expected_assignees):
+        edit.extend(["--remove-assignee", assignee])
+    if expected_assignees - current_assignees:
+        edit.extend(["--add-assignee", "@me"])
+    for runtime in sorted(current_runtimes - expected_runtimes):
+        edit.extend(["--remove-label", runtime])
+    for runtime in sorted(expected_runtimes - current_runtimes):
+        ensure_label(runtime, "bfd4f2", cwd)
+        edit.extend(["--add-label", runtime])
+    if len(edit) > 4:
+        run(edit, cwd=cwd, writes=True)
+
+    def matches(readback: dict) -> bool:
+        ownership = reduce_ownership(readback.get("comments", []), utc_now_stamp())
+        return (ownership_identity(ownership["event"]) == expected_identity
+                and projection_state(readback) == (expected_assignees, expected_runtimes))
+
+    try:
+        return wait_for_issue(
+            issue, "assignees,labels,comments", matches, cwd,
+            "ownership projection write did not read back exactly", consecutive=2,
+            ambiguous_write=len(edit) > 4,
+        )
+    except WriteFailure:
+        latest = issue_view(issue, "assignees,labels,comments", cwd=cwd)
+        latest_event = reduce_ownership(latest.get("comments", []), utc_now_stamp())["event"]
+        if repair and ownership_identity(latest_event) != expected_identity:
+            converge_ownership_projection(issue, latest_event, cwd, login=login, repair=False)
+            raise Stop({"ok": False, "reason": "ownership-changed-projections-repaired"})
+        raise
+
+
 # ---------------------------------------------------------------------------
 # verify_claim — the renewal
 # ---------------------------------------------------------------------------
@@ -1166,7 +1275,8 @@ def cmd_claim(args, config, cwd) -> dict:
     now = utc_now_stamp()
     claim_marker = marker("claim", run_id=args.run_id, runtime=args.runtime,
                           horizon=require_horizon(args.horizon, now))
-    existing_comments = issue_view(args.issue, "comments", cwd=cwd).get("comments", [])
+    data = issue_view(args.issue, "assignees,labels,comments", cwd=cwd)
+    existing_comments = data.get("comments", [])
     before = reduce_ownership(existing_comments, now)
     foreign_stale = {event["run_id"] for event in before["stale"]
                      if event["run_id"] != args.run_id}
@@ -1183,9 +1293,11 @@ def cmd_claim(args, config, cwd) -> dict:
         raise Stop({"ok": False, "reason": "claim-metadata-mismatch"})
     already_mine = mine if (mine and mine["runtime"] == args.runtime
                             and mine["horizon"] == args.horizon) else None
+    login = viewer_login(cwd)
     ensure_label(f"dev:{args.runtime}", "bfd4f2", cwd)
 
     if not already_mine:
+        minimum_position = len(existing_comments)
         body = (
             f"Claimed by {args.run_id}, expect to report by {args.horizon}.\n\n"
             f"{claim_marker}\n"
@@ -1193,19 +1305,20 @@ def cmd_claim(args, config, cwd) -> dict:
         with body_file(body) as path:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", path],
                 cwd=cwd, writes=True)
-
-    ownership = reduce_ownership(
-        issue_view(args.issue, "comments", cwd=cwd).get("comments", []), utc_now_stamp()
-    )
-    if not ownership["event"]:
-        # The write succeeded but the timeline has not caught up. Say so as a WRITE failure: the
-        # comment exists, so "retry the read" is the right action and "retry the whole command"
-        # is not. The idempotence guard above makes even a full retry safe, but the caller should
-        # still be told which of the two happened.
-        raise WriteFailure(
-            "the claim comment was written but is not visible on the timeline yet — re-read; "
-            "re-running `claim` will reuse the existing comment rather than post a second one"
+        data = wait_for_issue(
+            args.issue, "assignees,labels,comments",
+            lambda item: any(event["run_id"] == args.run_id
+                             and event["position"] >= minimum_position
+                             and event["runtime"] == args.runtime
+                             and event["horizon"] == args.horizon
+                             for event in ownership_events(item.get("comments", []))),
+            cwd, "claim comment was not visible after bounded readback; do not repeat the write",
+            ambiguous_write=True,
         )
+
+    ownership = reduce_ownership(data.get("comments", []), utc_now_stamp())
+    if not ownership["event"]:
+        raise WriteFailure("claim became stale before adjudication; its event was written")
 
     winner = ownership["holder"]
     winner_at = ownership["event"]["created_at"]
@@ -1217,10 +1330,7 @@ def cmd_claim(args, config, cwd) -> dict:
         ) as path:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", path],
                 cwd=cwd, writes=True)
-        # The runtime label is shared by all its runs, so a same-runtime winner still needs it.
-        if not holder_uses_runtime(ownership["event"], args.runtime):
-            run(["gh", "issue", "edit", str(args.issue), "--remove-label", f"dev:{args.runtime}"],
-                cwd=cwd, check=False, writes=True)
+        converge_ownership_projection(args.issue, ownership["event"], cwd, login=login)
         raise Stop(
             {
                 "ok": False,
@@ -1231,8 +1341,7 @@ def cmd_claim(args, config, cwd) -> dict:
             }
         )
 
-    run(["gh", "issue", "edit", str(args.issue), "--add-assignee", "@me",
-         "--add-label", f"dev:{args.runtime}"], cwd=cwd, writes=True)
+    converge_ownership_projection(args.issue, ownership["event"], cwd, login=login)
     return {
         "ok": True,
         "issue": args.issue,
@@ -1259,7 +1368,7 @@ def cmd_reclaim(args, config, cwd) -> dict:
         require_horizon(args.horizon, now)
     if getattr(args, "reason_file", None) and not args.force:
         raise Stop({"ok": False, "reason": "force-required-for-reason"})
-    data = issue_view(args.issue, "state,labels,comments", cwd=cwd)
+    data = issue_view(args.issue, "state,assignees,labels,comments", cwd=cwd)
     if data.get("state") != "OPEN":
         raise Stop({"ok": False, "reason": "issue-not-open",
                     "action": "nothing to reclaim on a closed issue"})
@@ -1304,7 +1413,12 @@ def cmd_reclaim(args, config, cwd) -> dict:
             }
         )
 
+    login = viewer_login(cwd)
     if not reused:
+        horizon = args.horizon or (
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=4)
+        ).strftime("%Y-%m-%dT%H:%MZ")
+        minimum_position = len(comments)
         force_reason = None
         if args.force:
             reason_file = getattr(args, "reason_file", None)
@@ -1314,9 +1428,6 @@ def cmd_reclaim(args, config, cwd) -> dict:
             if not force_reason:
                 raise Stop({"ok": False, "reason": "force-reason-required"})
             force_reason = escape_control_input(force_reason)
-        horizon = args.horizon or (
-            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=4)
-        ).strftime("%Y-%m-%dT%H:%MZ")
         reason = (f"\n\n{FORCED_EVIDENCE_HEADING}\n\n{force_reason}"
                   if force_reason else "")
         with body_file(
@@ -1328,19 +1439,27 @@ def cmd_reclaim(args, config, cwd) -> dict:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", note],
                 cwd=cwd, writes=True)
 
-        current = reduce_ownership(
-            issue_view(args.issue, "comments", cwd=cwd).get("comments", []), utc_now_stamp()
-        )["event"]
-        if not current or current["run_id"] != args.run_id:
-            raise WriteFailure("reclaim comment landed but did not establish the requested live holder")
+        def reclaim_landed(item: dict) -> bool:
+            return any(event.get("position", -1) >= minimum_position and all(
+                event.get(key) == value for key, value in (
+                    ("kind", "reclaim"), ("run_id", args.run_id), ("runtime", args.runtime),
+                    ("horizon", horizon), ("from", holder), ("forced", bool(args.force)),
+                )) for event in ownership_events(item.get("comments", [])))
 
-    ensure_label(f"dev:{args.runtime}", "bfd4f2", cwd)
-    edit = ["gh", "issue", "edit", str(args.issue), "--add-assignee", "@me",
-            "--add-label", f"dev:{args.runtime}"]
-    for label in label_names(data):
-        if label.startswith("dev:") and label != f"dev:{args.runtime}":
-            edit.extend(["--remove-label", label])
-    run(edit, cwd=cwd, writes=True)
+        data = wait_for_issue(
+            args.issue, "assignees,labels,comments",
+            reclaim_landed,
+            cwd, "reclaim comment was not visible after bounded readback; do not repeat the write",
+            ambiguous_write=True,
+        )
+        current = reduce_ownership(data.get("comments", []), utc_now_stamp())["event"]
+        if not current:
+            raise WriteFailure("reclaim comment landed but no live holder was established")
+        if current["run_id"] != args.run_id:
+            converge_ownership_projection(args.issue, current, cwd, login=login)
+            raise Stop({"ok": False, "reason": "lost-reclaim-race", "winner": current["run_id"]})
+
+    converge_ownership_projection(args.issue, current, cwd, login=login)
 
     return {
         "ok": True,
@@ -2029,7 +2148,7 @@ def cmd_changelog_notes(args, config, cwd) -> dict:
 
 def cmd_unassign(args, config, cwd) -> dict:
     """Release in the timeline first, then remove only projections no live holder needs."""
-    data = issue_view(args.issue, "labels,comments", cwd=cwd)
+    data = issue_view(args.issue, "assignees,labels,comments", cwd=cwd)
     ownership = reduce_ownership(data.get("comments", []), utc_now_stamp())
     events = ownership["live"] + ownership["stale"]
     mine = next((event for event in events if event["run_id"] == args.run_id), None)
@@ -2047,6 +2166,7 @@ def cmd_unassign(args, config, cwd) -> dict:
     other_live = any(event["run_id"] != args.run_id for event in ownership["live"])
     if args.held_by_other and not other_live:
         raise Stop({"ok": False, "reason": "held-by-other-without-other-holder"})
+    login = viewer_login(cwd) if ownership["event"] else None
     after = None
     if mine:
         if ((mine["runtime"] and mine["runtime"] != args.runtime)
@@ -2058,28 +2178,19 @@ def cmd_unassign(args, config, cwd) -> dict:
         ) as note:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", note],
                 cwd=cwd, writes=True)
-        for _attempt in range(3):
-            try:
-                after = issue_view(args.issue, "labels,comments", cwd=cwd)
-            except ReadFailure:
-                continue
-            if any(index > mine["position"] and comment.get("viewerDidAuthor") is True
-                   and marker("unassign", run_id=args.run_id, runtime=args.runtime)
-                   in comment.get("body", "")
-                   for index, comment in enumerate(after.get("comments", []))):
-                break
-        else:
-            raise WriteFailure("release comment may have landed but was not visible after three reads")
+        after = wait_for_issue(
+            args.issue, "assignees,labels,comments",
+            lambda item: any(index > mine["position"] and comment.get("viewerDidAuthor") is True
+                             and marker("unassign", run_id=args.run_id, runtime=args.runtime)
+                             in comment.get("body", "")
+                             for index, comment in enumerate(item.get("comments", []))),
+            cwd, "release comment was not visible after bounded readback; do not repeat the write",
+            ambiguous_write=True,
+        )
 
-    after = after or issue_view(args.issue, "labels,comments", cwd=cwd)
+    after = after or data
     ownership = reduce_ownership(after.get("comments", []), utc_now_stamp())
-    edit = ["gh", "issue", "edit", str(args.issue)]
-    if not holder_uses_runtime(ownership["event"], args.runtime):
-        edit.extend(["--remove-label", f"dev:{args.runtime}"])
-    if not ownership["holder"]:
-        edit.extend(["--remove-assignee", "@me"])
-    if len(edit) > 4:
-        run(edit, cwd=cwd, writes=True)
+    converge_ownership_projection(args.issue, ownership["event"], cwd, login=login)
     if args.held_by_other and not ownership["holder"]:
         raise Stop({"ok": False, "reason": "held-by-other-holder-disappeared"})
     return {

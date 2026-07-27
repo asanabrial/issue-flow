@@ -473,8 +473,9 @@ class FakeIssue:
     def __init__(self, comments=None, labels=None):
         self.comments = list(comments or [])
         self.labels = {"status:ready", *(labels or [])}
-        self.assigned = False
+        self.assignees = set()
         self.fail_edits = 0
+        self.ignore_edits = False
         self.delayed_reads = 0
         self.stale_reads = 0
         self.tick = 0
@@ -484,8 +485,17 @@ class FakeIssue:
             self.stale_reads -= 1
             comments = self.comments[:-1]
         return {"state": "OPEN", "comments": comments,
-                "labels": [{"name": name} for name in sorted(self.labels)]}
+                "labels": [{"name": name} for name in sorted(self.labels)],
+                "assignees": [{"login": login} for login in sorted(self.assignees)]}
+    @property
+    def assigned(self):
+        return bool(self.assignees)
+    @assigned.setter
+    def assigned(self, value):
+        self.assignees = {"me"} if value else set()
     def run(self, argv, cwd=None, check=True, writes=False):
+        if argv == ["gh", "api", "user"]:
+            return SimpleNamespace(returncode=0, stdout='{"login":"me"}', stderr="")
         if argv[:3] == ["gh", "issue", "comment"]:
             self.tick += 1
             body = Path(argv[argv.index("--body-file") + 1]).read_text(encoding="utf-8")
@@ -495,19 +505,34 @@ class FakeIssue:
             if self.fail_edits:
                 self.fail_edits -= 1
                 raise m.WriteFailure("injected projection failure")
+            if self.ignore_edits:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
             for flag, value in zip(argv, argv[1:]):
                 if flag == "--add-label":
                     self.labels.add(value)
                 elif flag == "--remove-label":
                     self.labels.discard(value)
                 elif flag == "--add-assignee":
-                    self.assigned = True
+                    self.assignees.add("me" if value == "@me" else value)
                 elif flag == "--remove-assignee":
-                    self.assigned = False
+                    self.assignees.discard("me" if value == "@me" else value)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 def remote(remote):
     return patch.multiple(m, issue_view=remote.view, run=remote.run,
-                          ensure_label=lambda *_args: None, utc_now_stamp=lambda: NOW)
+                          ensure_label=lambda *_args: None, utc_now_stamp=lambda: NOW,
+                          READBACK_DELAY_SECONDS=0)
+
+read_failure_types = []
+with patch.object(m, "issue_view", side_effect=m.ReadFailure("offline")), \
+        patch.object(m.time, "sleep"):
+    for ambiguous in (False, True):
+        try:
+            m.wait_for_issue(1, "comments", lambda _data: True, Path("."), "not visible",
+                             ambiguous_write=ambiguous)
+        except (m.ReadFailure, m.WriteFailure) as exc:
+            read_failure_types.append(type(exc))
+check("polling preserves read failures unless a preceding write is ambiguous",
+      read_failure_types, [m.ReadFailure, m.WriteFailure])
 
 
 same_second = FakeIssue([
@@ -635,6 +660,46 @@ with m.body_file("evidence") as unused_reason:
         rejected_unused_reason = exc.payload["reason"]
 check("reason files cannot be silently ignored without force", rejected_unused_reason,
       "force-required-for-reason")
+lagged_claim = FakeIssue()
+lagged_claim.delayed_reads = 6
+with remote(lagged_claim):
+    lagged_result = m.cmd_claim(SimpleNamespace(
+        issue=1, run_id=ME, runtime="claude-code", horizon=FUTURE), {}, Path("."))
+check("bounded visibility polling sees one claim acquisition",
+      (bool(lagged_result), len(m.claim_comments(lagged_claim.comments))), (True, 1))
+
+short_claim = FakeIssue()
+short_failure = None
+try:
+    with remote(short_claim):
+        with patch.object(m, "utc_now_stamp", side_effect=[NOW] + ["2026-01-02T00:00:02Z"] * 20):
+            m.cmd_claim(SimpleNamespace(issue=2, run_id=ME, runtime="claude-code",
+                                        horizon="2026-01-02T00:00:01Z"), {}, Path("."))
+except m.WriteFailure as exc:
+    short_failure = str(exc)
+check("a claim expiring during readback fails as an ambiguous write, not an internal error",
+      (bool(short_failure), len(m.claim_comments(short_claim.comments))), (True, 1))
+
+dirty_projection = FakeIssue(labels=["dev:codex"])
+dirty_projection.assignees = {"stale-user"}
+with remote(dirty_projection):
+    m.cmd_claim(SimpleNamespace(issue=1, run_id=ME, runtime="claude-code",
+                                horizon=FUTURE), {}, Path("."))
+check("claim converges exact ownership projections",
+      (dirty_projection.assignees, dirty_projection.labels),
+      ({"me"}, {"status:ready", "dev:claude-code"}))
+
+ignored_projection = FakeIssue()
+ignored_projection.ignore_edits = True
+projection_failed = False
+try:
+    with remote(ignored_projection):
+        m.cmd_claim(SimpleNamespace(issue=1, run_id=ME, runtime="claude-code",
+                                    horizon=FUTURE), {}, Path("."))
+except m.WriteFailure:
+    projection_failed = True
+check("claim refuses success when projection readback disagrees", projection_failed, True)
+
 foreign_stale = FakeIssue([comment(
     m.marker("claim", run_id=OTHER, runtime="codex", horizon="2026-01-01T01:00Z"))])
 foreign_route = None
@@ -683,8 +748,8 @@ check("expired self-claim appends a fresh ownership event", len(m.claim_comments
 check("verification uses the renewed event watermark",
       verified["claim_watermark"], renewed["claimed_at"])
 winner = FakeIssue([
-    comment("<!-- issue-flow: claim run-id=opencode-winner runtime=opencode "
-            f"horizon={FUTURE} -->")
+    comment("<!-- issue-flow: claim run-id=opencode-winner "
+             f"horizon={FUTURE} -->")
 ], {"dev:opencode"})
 with remote(winner):
     try:
@@ -694,6 +759,34 @@ with remote(winner):
         check("same-runtime loser sees the authoritative winner",
               stop.payload["winner"], "opencode-winner")
 check("same-runtime loser cleanup preserves the winner label", "dev:opencode" in winner.labels, True)
+check("a losing claim repairs the authoritative winner's projections",
+      (winner.assignees, winner.labels), ({"me"}, {"status:ready", "dev:opencode"}))
+
+class HolderSwitch(FakeIssue):
+    def __init__(self):
+        super().__init__([comment(m.marker(
+            "claim", run_id="opencode-old", runtime="opencode", horizon=FUTURE))])
+        self.views = 0
+    def view(self, issue, fields, cwd=None):
+        self.views += 1
+        if self.views == 2:
+            self.comments.append(comment(
+                f"{m.FORCED_EVIDENCE_HEADING}\n\nmanual takeover\n\n"
+                f"{m.marker('reclaim', run_id='codex-new', runtime='codex', horizon=FUTURE, forced='true', evidence='required', **{'from': 'opencode-old'})}",
+                "2026-01-02T00:00:02Z"))
+        return super().view(issue, fields, cwd=cwd)
+
+switched = HolderSwitch()
+switched_reason = None
+try:
+    with remote(switched):
+        first = m.reduce_ownership(switched.comments, NOW)["event"]
+        m.converge_ownership_projection(1, first, Path("."), login="me")
+except m.Stop as exc:
+    switched_reason = exc.payload["reason"]
+check("a holder change before projection repairs the new winner",
+      (switched_reason, switched.assignees, switched.labels),
+      ("ownership-changed-projections-repaired", {"me"}, {"status:ready", "dev:codex"}))
 claim_retry = FakeIssue([
     comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE))
 ])
@@ -721,6 +814,7 @@ dead = comment("<!-- issue-flow: claim run-id=dead-run runtime=codex "
                "horizon=2026-01-01T01:00Z -->")
 takeover = FakeIssue([dead], {"dev:codex"})
 takeover.fail_edits = 1
+takeover.delayed_reads = 6
 reclaim_args = SimpleNamespace(issue=1, run_id="opencode-new", runtime="opencode",
                                horizon=FUTURE, force=False)
 with remote(takeover):
@@ -739,7 +833,8 @@ with remote(takeover):
     except m.Stop as exc:
         reclaim_mismatch = exc.payload["reason"]
 check("reclaim retry reuses one ownership event", reclaimed["reused_existing_reclaim"], True)
-check("reclaim retry converges runtime labels", takeover.labels, {"status:ready", "dev:opencode"})
+check("reclaim retry converges exact projections", (takeover.assignees, takeover.labels),
+      ({"me"}, {"status:ready", "dev:opencode"}))
 check("reclaim retries cannot change persisted metadata", reclaim_mismatch,
       "reclaim-metadata-mismatch")
 legacy_reclaim = FakeIssue([
@@ -755,12 +850,33 @@ with remote(legacy_reclaim):
         legacy_reclaim_mismatch = exc.payload["reason"]
 check("metadata-less reclaim retries cannot change inferred runtime",
       legacy_reclaim_mismatch, "reclaim-metadata-mismatch")
+
+class ReclaimRace(FakeIssue):
+    def run(self, argv, cwd=None, check=True, writes=False):
+        if argv[:3] == ["gh", "issue", "comment"] and not any(
+                "run-id=codex-winner" in item["body"] for item in self.comments):
+            self.comments.append(comment(m.marker(
+                "reclaim", run_id="codex-winner", runtime="codex", horizon=FUTURE,
+                **{"from": "dead-run"}), "2026-01-02T00:00:01Z"))
+        return super().run(argv, cwd=cwd, check=check, writes=writes)
+
+reclaim_race = ReclaimRace([dead], {"dev:stale"})
+race_reason = None
+try:
+    with remote(reclaim_race):
+        m.cmd_reclaim(SimpleNamespace(issue=1, run_id="opencode-loser", runtime="opencode",
+                                      horizon=FUTURE, force=False), {}, Path("."))
+except m.Stop as exc:
+    race_reason = exc.payload["reason"]
+check("a reclaim loser repairs the authoritative winner's projections",
+      (race_reason, reclaim_race.assignees, reclaim_race.labels),
+      ("lost-reclaim-race", {"me"}, {"status:ready", "dev:codex"}))
 release = FakeIssue([
     comment("<!-- issue-flow: claim run-id=opencode-owner runtime=opencode "
             f"horizon={FUTURE} -->")
 ], {"dev:opencode"})
 release.assigned = True
-release.delayed_reads = 3
+release.delayed_reads = 6
 unassign_args = SimpleNamespace(issue=1, run_id="opencode-owner", runtime="opencode",
                                 held_by_other=False)
 with remote(release):
@@ -770,7 +886,7 @@ with remote(release):
     except m.WriteFailure:
         ambiguous = True
     m.cmd_unassign(unassign_args, {}, Path("."))
-check("stale release readback is an ambiguous write failure", ambiguous, True)
+check("bounded visibility lag does not make release ambiguous", ambiguous, False)
 check("unassign retry does not duplicate the release marker",
       sum("issue-flow: unassign" in item["body"] for item in release.comments), 1)
 check("unassign retry leaves no live owner", m.reduce_ownership(release.comments, NOW)["holder"], None)
@@ -829,6 +945,19 @@ except m.Stop as exc:
     sole_held = exc.payload["reason"]
 check("held-by-other refuses before releasing the sole holder",
       (sole_held, len(sole_holder.comments)), ("held-by-other-without-other-holder", 1))
+
+legacy_other = FakeIssue([
+    comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE)),
+    comment(m.marker("claim", run_id="codex-other", horizon=FUTURE),
+            "2026-01-02T00:00:01Z"),
+], ["dev:claude-code", "dev:codex"])
+legacy_other.assigned = True
+with remote(legacy_other):
+    legacy_handoff = m.cmd_unassign(SimpleNamespace(
+        issue=1, run_id=ME, runtime="claude-code", held_by_other=True), {}, Path("."))
+check("unassign infers an unambiguous legacy holder runtime before projection",
+      (legacy_handoff["assignee_kept"], legacy_other.assignees, legacy_other.labels),
+      (True, {"me"}, {"status:ready", "dev:codex"}))
 
 wrong_runtime_release = FakeIssue([
     comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE))
