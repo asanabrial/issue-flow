@@ -64,6 +64,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -81,6 +82,15 @@ STATES = ["analysis", "ready", "in-progress", "review", "blocked", "done"]
 # Reading falls back to the prose forms for comments written before this script existed; writing
 # always emits both, so a human reading the timeline still sees a sentence.
 MARKER_RE = re.compile(r"<!--\s*issue-flow:\s*(?P<kind>[a-z-]+)\s+(?P<attrs>[^>]*?)\s*-->")
+MARKER_KEY_RE = re.compile(r"[a-z][a-z-]*")
+HORIZON_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z")
+# The last shipped evidence-free forced event was issue #7 at 11:59:58Z. After this activation
+# boundary, stale clients cannot mint a new "legacy" event by merely omitting the protocol attr.
+FORCED_EVIDENCE_SINCE = "2026-07-27T19:00:00Z"
+# This heading is persisted protocol syntax, not presentation copy; change it only with a parser
+# migration that keeps already-written v2 forced events valid.
+FORCED_EVIDENCE_HEADING = "Forced takeover reason and evidence:"
+COMMENT_KINDS = frozenset({"note", "blocker", "diagnosis"})
 
 # The two marker vocabularies, named once.
 #
@@ -324,18 +334,39 @@ def repo_identity(cwd: Path) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 def marker(kind: str, **attrs) -> str:
-    body = " ".join(f"{k.replace('_', '-')}={v}" for k, v in attrs.items() if v)
+    raw_values = {key.replace("_", "-"): str(value) for key, value in attrs.items() if value}
+    if not re.fullmatch(r"[a-z-]+", kind) or not all(
+            MARKER_KEY_RE.fullmatch(key) for key in raw_values):
+        raise Stop({"ok": False, "reason": "invalid-marker-attribute"})
+    values = {"encoding": "pct", **{
+        key: urllib.parse.quote(value, safe="-._~:/+@") for key, value in raw_values.items()
+    }}
+    body = " ".join(f"{key}={value}" for key, value in values.items())
     return f"<!-- issue-flow: {kind} {body} -->"
+
+
+def escape_control_input(body: str) -> str:
+    """Keep quoted tracker evidence inert; callers add a non-control marker to disable prose."""
+    escaped = re.sub(r"<!--(?=\s*issue-flow:)", "&lt;!--", body or "")
+    if CLAIM_PROSE.match(escaped) and CLAIM_HORIZON_PROSE.search(escaped):
+        return f"Quoted evidence:\n\n{escaped}"
+    return escaped
+
+
+def read_control_input(path: str, reason: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise Stop({"ok": False, "reason": reason}) from exc
 
 
 def parse_markers(body: str) -> list[dict[str, str]]:
     found = []
     for match in MARKER_RE.finditer(body or ""):
-        attrs = dict(
-            pair.split("=", 1)
-            for pair in match.group("attrs").split()
-            if "=" in pair
-        )
+        attrs = dict(pair.split("=", 1) for pair in match.group("attrs").split() if "=" in pair)
+        if attrs.get("encoding") == "pct":
+            attrs = {key: urllib.parse.unquote(value) if key != "encoding" else value
+                     for key, value in attrs.items()}
         attrs["kind"] = match.group("kind")
         found.append(attrs)
     return found
@@ -385,7 +416,7 @@ def claim_comments(comments: list[dict]) -> list[tuple[str, str, dict]]:
                 run_id = match.group("run")
         if run_id:
             claims.append((comment.get("createdAt", ""), run_id, comment))
-    claims.sort(key=lambda item: item[0])
+    claims.sort(key=lambda item: stamp_order(item[0]))
     return claims
 
 
@@ -396,23 +427,35 @@ def ownership_events(comments: list[dict]) -> list[dict]:
     for position, comment in enumerate(comments):
         if comment.get("viewerDidAuthor") is not True:
             continue
-        event = next((mark for mark in parse_markers(comment.get("body", ""))
-                      if mark.get("kind") in {"claim", "reclaim"} and mark.get("run-id")), None)
+        parsed = parse_markers(comment.get("body", ""))
+        selected = next(((index, mark) for index, mark in enumerate(parsed)
+                         if mark.get("kind") in {"claim", "reclaim"} and mark.get("run-id")), None)
+        marker_index, event = selected if selected else (None, None)
         if not event and id(comment) in claims:
             event = {"kind": "claim", "run-id": claims[id(comment)]}
         if event:
+            created_at = comment.get("createdAt", "")
+            created = parse_stamp(created_at)
+            evidence_cutover = parse_stamp(FORCED_EVIDENCE_SINCE)
+            forced = event.get("forced") == "true"
             events.append({
-                "created_at": comment.get("createdAt", ""),
+                "created_at": created_at,
                 "position": position,
                 "run_id": event["run-id"],
                 "runtime": event.get("runtime"),
                 "horizon": event.get("horizon"),
                 "kind": event["kind"],
                 "from": event.get("from"),
-                "forced": event.get("forced") == "true",
+                "forced": forced,
+                "evidence_required": forced and (
+                    event.get("evidence") == "required" or created is None
+                    or (evidence_cutover is not None and created >= evidence_cutover)
+                    or comment.get("includesCreatedEdit") is not False
+                ),
+                "marker_index": marker_index,
                 "comment": comment,
             })
-    return sorted(events, key=lambda item: (item["created_at"], item["position"]))
+    return sorted(events, key=lambda item: (stamp_order(item["created_at"]), item["position"]))
 
 
 def released_at(comments: list[dict]) -> dict[str, str]:
@@ -496,6 +539,19 @@ def parse_stamp(value: str):
     return None
 
 
+def stamp_order(value: str) -> datetime.datetime:
+    return parse_stamp(value) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
+def require_horizon(value: str, after: str | None = None) -> str:
+    stamp = parse_stamp(value)
+    floor = parse_stamp(after) if after else None
+    if (not HORIZON_RE.fullmatch(value or "") or stamp is None
+            or (floor is not None and stamp <= floor)):
+        raise Stop({"ok": False, "reason": "invalid-horizon"})
+    return value
+
+
 def stale_claims(claims, comments: list[dict], now: str) -> set[str]:
     """Claims whose declared horizon has passed with no word from the holder since.
 
@@ -538,27 +594,37 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
               if event["kind"] != "reclaim" or valid_reclaim(event, comments)]
     takeovers = [index for index, event in enumerate(events) if event["kind"] == "reclaim"]
     candidates = events[takeovers[-1]:] if takeovers else events
-    valid_reclaims = {event["position"] for event in events if event["kind"] == "reclaim"}
+    valid_reclaims = {(event["position"], event["marker_index"])
+                      for event in events if event["kind"] == "reclaim"}
     release_positions = {
         mark[attr]: position for position, comment in enumerate(comments)
         if comment.get("viewerDidAuthor") is True
-        for mark in parse_markers(comment.get("body", ""))
-        if mark.get("kind") != "reclaim" or position in valid_reclaims
+        for marker_index, mark in enumerate(parse_markers(comment.get("body", "")))
+        if mark.get("kind") != "reclaim" or (position, marker_index) in valid_reclaims
         for attr in RELEASE_ATTRS_BY_KIND.get(mark.get("kind"), ()) if mark.get(attr)}
     latest_by_run = {}
     for event in candidates:
         if event["position"] > release_positions.get(event["run_id"], -1):
+            previous = latest_by_run.get(event["run_id"])
+            if previous and all(previous[field] == event[field]
+                                for field in ("kind", "runtime", "horizon", "from", "forced")):
+                # A hidden first write may be retried. Identical acquisitions keep their earliest
+                # server timestamp so a duplicate cannot lose a race that its first write won.
+                continue
             latest_by_run[event["run_id"]] = event
 
     moment = parse_stamp(now)
     trusted = [comment for comment in comments if comment.get("viewerDidAuthor") is True]
     live, stale = [], []
-    for event in sorted(latest_by_run.values(), key=lambda item: (item["created_at"], item["position"])):
+    for event in sorted(latest_by_run.values(),
+                        key=lambda item: (stamp_order(item["created_at"]), item["position"])):
         horizon = parse_stamp(event["horizon"])
+        acquired_at = parse_stamp(event["created_at"])
         spoke_at = parse_stamp(last_activity_by(trusted, event["run_id"])) or parse_stamp(event["created_at"])
         deadline = horizon or (spoke_at + datetime.timedelta(hours=4) if spoke_at else None)
         expired_silent = bool(moment and deadline and deadline < moment
-                              and (not horizon or spoke_at is None or spoke_at < horizon))
+                              and (not horizon or spoke_at is None or spoke_at < horizon
+                                   or (acquired_at and horizon <= acquired_at)))
         (stale if expired_silent else live).append(event)
 
     winner = live[0] if live else None
@@ -573,6 +639,15 @@ def holder_uses_runtime(event: dict | None, runtime: str) -> bool:
 
 
 def valid_reclaim(event: dict, comments: list[dict]) -> bool:
+    if event["forced"] and event["evidence_required"]:
+        body = event["comment"].get("body", "")
+        matches = list(MARKER_RE.finditer(body))
+        marker_index = event["marker_index"]
+        marker_at = matches[marker_index].start() if marker_index is not None else -1
+        heading_at = body.find(FORCED_EVIDENCE_HEADING)
+        evidence = body[heading_at + len(FORCED_EVIDENCE_HEADING):marker_at].strip()
+        if marker_at < 0 or heading_at < 0 or not evidence or MARKER_RE.search(evidence):
+            return False
     prior = reduce_ownership(comments[:event["position"]], event["created_at"])
     target = prior["event"] or (prior["stale"][0] if prior["stale"] else None)
     return bool(target and target["run_id"] == event["from"]
@@ -582,7 +657,7 @@ def valid_reclaim(event: dict, comments: list[dict]) -> bool:
 def utc_now_stamp() -> str:
     import datetime
 
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ---------------------------------------------------------------------------
@@ -1104,15 +1179,27 @@ def cmd_claim(args, config, cwd) -> dict:
     `--add-assignee @me` twice leaves exactly one assignee and the re-read shows a clean issue
     assigned to you while another run is already building it.
     """
-    ensure_label(f"dev:{args.runtime}", "bfd4f2", cwd)
+    now = utc_now_stamp()
+    claim_marker = marker("claim", run_id=args.run_id, runtime=args.runtime,
+                          horizon=require_horizon(args.horizon, now))
     existing_comments = issue_view(args.issue, "comments", cwd=cwd).get("comments", [])
-    before = reduce_ownership(existing_comments, utc_now_stamp())
-    already_mine = next((event for event in before["live"] if event["run_id"] == args.run_id and (not parse_stamp(event["horizon"]) or parse_stamp(event["horizon"]) >= parse_stamp(utc_now_stamp()))), None)
+    before = reduce_ownership(existing_comments, now)
+    mine = next((event for event in before["live"] if event["run_id"] == args.run_id
+                 and (not parse_stamp(event["horizon"])
+                      or parse_stamp(event["horizon"]) >= parse_stamp(now))), None)
+    if mine and (not mine["runtime"] or not mine["horizon"]):
+        raise Stop({"ok": False, "reason": "legacy-claim-metadata-missing"})
+    if mine and ((mine["runtime"] and mine["runtime"] != args.runtime)
+                 or (mine["horizon"] and mine["horizon"] != args.horizon)):
+        raise Stop({"ok": False, "reason": "claim-metadata-mismatch"})
+    already_mine = mine if (mine and mine["runtime"] == args.runtime
+                            and mine["horizon"] == args.horizon) else None
+    ensure_label(f"dev:{args.runtime}", "bfd4f2", cwd)
 
     if not already_mine:
         body = (
             f"Claimed by {args.run_id}, expect to report by {args.horizon}.\n\n"
-            f"{marker('claim', run_id=args.run_id, runtime=args.runtime, horizon=args.horizon)}\n"
+            f"{claim_marker}\n"
         )
         with body_file(body) as path:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", path],
@@ -1166,7 +1253,7 @@ def cmd_claim(args, config, cwd) -> dict:
             event["run_id"] for event in before["stale"] if event["run_id"] != args.run_id
         }),
         "claimed_at": winner_at,
-        "horizon": ownership["event"]["horizon"] or args.horizon,
+        "horizon": ownership["event"]["horizon"],
         "next": "transition to in-progress before any repository write",
     }
 
@@ -1178,18 +1265,27 @@ def cmd_verify_claim(args, config, cwd) -> dict:
 
 def cmd_reclaim(args, config, cwd) -> dict:
     """Atomically in timeline terms displace a holder and establish the new live owner."""
+    now = utc_now_stamp()
+    if args.horizon:
+        require_horizon(args.horizon, now)
+    if getattr(args, "reason_file", None) and not args.force:
+        raise Stop({"ok": False, "reason": "force-required-for-reason"})
     data = issue_view(args.issue, "state,labels,comments", cwd=cwd)
     if data.get("state") != "OPEN":
         raise Stop({"ok": False, "reason": "issue-not-open",
                     "action": "nothing to reclaim on a closed issue"})
 
     comments = data.get("comments", [])
-    before = reduce_ownership(comments, utc_now_stamp())
+    before = reduce_ownership(comments, now)
     current = before["event"]
     reused = bool(current and current["run_id"] == args.run_id and current["kind"] == "reclaim")
     if reused:
         holder = current["from"]
         held_at = current["created_at"]
+        if ((not current["runtime"] or current["runtime"] != args.runtime)
+                or (args.horizon and current["horizon"] != args.horizon)
+                or current["forced"] != bool(args.force)):
+            raise Stop({"ok": False, "reason": "reclaim-metadata-mismatch"})
     elif current:
         held_at, holder = current["created_at"], current["run_id"]
     elif before["stale"]:
@@ -1217,14 +1313,25 @@ def cmd_reclaim(args, config, cwd) -> dict:
         )
 
     if not reused:
+        force_reason = None
+        if args.force:
+            reason_file = getattr(args, "reason_file", None)
+            if not reason_file:
+                raise Stop({"ok": False, "reason": "force-reason-required"})
+            force_reason = read_control_input(reason_file, "force-reason-invalid").strip()
+            if not force_reason:
+                raise Stop({"ok": False, "reason": "force-reason-required"})
+            force_reason = escape_control_input(force_reason)
         horizon = args.horizon or (
             datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=4)
         ).strftime("%Y-%m-%dT%H:%MZ")
+        reason = (f"\n\n{FORCED_EVIDENCE_HEADING}\n\n{force_reason}"
+                  if force_reason else "")
         with body_file(
             f"Reclaiming from `{holder}`; last activity {last_activity_by(comments, holder) or 'none'}, "
             f"claimed at {held_at}.\n\nTaken over by `{args.run_id}`; expect to report by {horizon}. "
-            f"Nothing the previous run left will be discarded.\n\n"
-            f"{marker('reclaim', run_id=args.run_id, runtime=args.runtime, horizon=horizon, forced='true' if args.force else None, **{'from': holder})}\n"
+            f"Nothing the previous run left will be discarded.{reason}\n\n"
+            f"{marker('reclaim', run_id=args.run_id, runtime=args.runtime, horizon=horizon, forced='true' if args.force else None, evidence='required' if args.force else None, **{'from': holder})}\n"
         ) as note:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", note],
                 cwd=cwd, writes=True)
@@ -1248,7 +1355,7 @@ def cmd_reclaim(args, config, cwd) -> dict:
         "issue": args.issue,
         "reclaimed_from": holder,
         "run_id": args.run_id,
-        "forced": bool(args.force),
+        "forced": current["forced"],
         "reused_existing_reclaim": reused,
         "next": "read what the dead run left on the issue — the work may be further along than the label",
     }
@@ -1338,9 +1445,12 @@ def cmd_transition(args, config, cwd) -> dict:
 
 
 def cmd_comment(args, config, cwd) -> dict:
-    body = Path(args.body_file).read_text(encoding="utf-8")
-    if args.run_id and args.kind:
-        body = body.rstrip() + f"\n\n{marker(args.kind, run_id=args.run_id)}\n"
+    if args.kind not in COMMENT_KINDS | {None}:
+        raise Stop({"ok": False, "reason": "reserved-comment-kind"})
+    if bool(args.run_id) != bool(args.kind):
+        raise Stop({"ok": False, "reason": "comment-marker-incomplete"})
+    body = escape_control_input(read_control_input(args.body_file, "comment-body-invalid"))
+    body = body.rstrip() + f"\n\n{marker(args.kind or 'note', run_id=args.run_id)}\n"
     with body_file(body) as path:
         run(["gh", "issue", "comment", str(args.issue), "--body-file", path], cwd=cwd, writes=True)
     return {"ok": True, "issue": args.issue, "kind": args.kind or "note"}
@@ -1350,7 +1460,7 @@ def cmd_heartbeat(args, config, cwd) -> dict:
     """Read before you write. A heartbeat that only writes is deaf to the one channel that can
     revoke the claim — which is exactly how a stand-down sat unread for 48 minutes."""
     verdict = do_verify_claim(args.issue, args.run_id, args.expect_state, cwd)
-    body = Path(args.body_file).read_text(encoding="utf-8")
+    body = escape_control_input(read_control_input(args.body_file, "heartbeat-body-invalid"))
     body = body.rstrip() + f"\n\n{marker('heartbeat', run_id=args.run_id)}\n"
     with body_file(body) as path:
         run(["gh", "issue", "comment", str(args.issue), "--body-file", path], cwd=cwd, writes=True)
@@ -1471,6 +1581,8 @@ def cmd_start_branch(args, config, cwd) -> dict:
     # A claim binds only what the tracker can see, so renew it before the first thing it cannot.
     # Nothing has been created yet, so standing down here costs one comment.
     do_verify_claim(args.issue, args.run_id, args.expect_state, cwd)
+    # Invalid protocol values must fail before `gh issue develop` can create remote state.
+    marker("branch", run_id=args.run_id, branch=args.branch, base=args.base)
 
     template = args.worktree_root or cfg(config, "worktree location")
     if not template or template.lower() == "unset":
@@ -2086,6 +2198,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--horizon", help="new ownership horizon; defaults to four hours from now")
     p.add_argument("--force", action="store_true",
                    help="reclaim a holder whose horizon has NOT passed — needs a defensible reason")
+    p.add_argument("--reason-file", help="evidence required when --force creates a new event")
 
     p = sub.add_parser("transition", help="mirror the board, swap the label, read BOTH back")
     p.add_argument("--issue", type=int, required=True)
@@ -2096,7 +2209,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--issue", type=int, required=True)
     p.add_argument("--body-file", required=True)
     p.add_argument("--run-id")
-    p.add_argument("--kind", help="marker kind, e.g. note, blocker, diagnosis")
+    p.add_argument("--kind", choices=sorted(COMMENT_KINDS))
 
     p = sub.add_parser("heartbeat", help="verify the claim, then post progress — never the reverse")
     p.add_argument("--issue", type=int, required=True)
