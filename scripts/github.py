@@ -328,6 +328,11 @@ def marker(kind: str, **attrs) -> str:
     return f"<!-- issue-flow: {kind} {body} -->"
 
 
+def escape_control_markers(body: str) -> str:
+    """Preserve quoted evidence without letting it become control-plane input."""
+    return re.sub(r"<!--(?=\s*issue-flow:)", "&lt;!--", body or "")
+
+
 def parse_markers(body: str) -> list[dict[str, str]]:
     found = []
     for match in MARKER_RE.finditer(body or ""):
@@ -1111,10 +1116,19 @@ def cmd_claim(args, config, cwd) -> dict:
     `--add-assignee @me` twice leaves exactly one assignee and the re-read shows a clean issue
     assigned to you while another run is already building it.
     """
-    ensure_label(f"dev:{args.runtime}", "bfd4f2", cwd)
-    existing_comments = issue_view(args.issue, "comments", cwd=cwd).get("comments", [])
+    data = issue_view(args.issue, "comments,assignees,labels", cwd=cwd)
+    existing_comments = data.get("comments", [])
     before = reduce_ownership(existing_comments, utc_now_stamp())
     already_mine = next((event for event in before["live"] if event["run_id"] == args.run_id and (not parse_stamp(event["horizon"]) or parse_stamp(event["horizon"]) >= parse_stamp(utc_now_stamp()))), None)
+    stale_others = [event for event in before["stale"] if event["run_id"] != args.run_id]
+    projected = bool(data.get("assignees")) or any(
+        label.startswith("dev:") for label in label_names(data)
+    )
+    if stale_others or (projected and not before["event"] and not before["stale"]):
+        raise Stop({"ok": False, "reason": "existing-ownership-requires-reclaim",
+                    "action": "stop; use audited `reclaim` instead of creating a new claim epoch"})
+
+    ensure_label(f"dev:{args.runtime}", "bfd4f2", cwd)
 
     if not already_mine:
         body = (
@@ -1247,7 +1261,7 @@ def cmd_reclaim(args, config, cwd) -> dict:
                 raise Stop({"ok": False, "reason": "force-reason-required",
                             "action": "--reason-file must contain non-empty reason and evidence"})
             # Escaping preserves rendered evidence while preventing it from outranking our marker.
-            force_reason = force_reason.replace("<!--", "&lt;!--")
+            force_reason = escape_control_markers(force_reason)
 
         horizon = args.horizon or (
             datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=4)
@@ -1372,7 +1386,7 @@ def cmd_transition(args, config, cwd) -> dict:
 
 
 def cmd_comment(args, config, cwd) -> dict:
-    body = Path(args.body_file).read_text(encoding="utf-8")
+    body = escape_control_markers(Path(args.body_file).read_text(encoding="utf-8"))
     if args.run_id and args.kind:
         body = body.rstrip() + f"\n\n{marker(args.kind, run_id=args.run_id)}\n"
     with body_file(body) as path:
@@ -1384,7 +1398,7 @@ def cmd_heartbeat(args, config, cwd) -> dict:
     """Read before you write. A heartbeat that only writes is deaf to the one channel that can
     revoke the claim — which is exactly how a stand-down sat unread for 48 minutes."""
     verdict = do_verify_claim(args.issue, args.run_id, args.expect_state, cwd)
-    body = Path(args.body_file).read_text(encoding="utf-8")
+    body = escape_control_markers(Path(args.body_file).read_text(encoding="utf-8"))
     body = body.rstrip() + f"\n\n{marker('heartbeat', run_id=args.run_id)}\n"
     with body_file(body) as path:
         run(["gh", "issue", "comment", str(args.issue), "--body-file", path], cwd=cwd, writes=True)
