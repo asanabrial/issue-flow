@@ -948,12 +948,11 @@ def wait_for_issue(issue: int, fields: str, predicate, cwd: Path, failure: str,
                    consecutive: int = 1, ambiguous_write: bool = False) -> dict:
     """Bound eventual-consistency reads without repeating the preceding write."""
     matches = 0
-    successful_read = False
     last_read_failure = None
     for attempt in range(READBACK_ATTEMPTS):
         try:
             data = issue_view(issue, fields, cwd=cwd)
-            successful_read = True
+            last_read_failure = None
         except ReadFailure as exc:
             data = None
             last_read_failure = exc
@@ -965,9 +964,11 @@ def wait_for_issue(issue: int, fields: str, predicate, cwd: Path, failure: str,
             matches = 0
         if attempt + 1 < READBACK_ATTEMPTS:
             time.sleep(READBACK_DELAY_SECONDS)
-    if not successful_read and not ambiguous_write:
+    if ambiguous_write:
+        raise WriteFailure(failure)
+    if last_read_failure:
         raise last_read_failure
-    raise WriteFailure(failure)
+    raise Stop({"ok": False, "reason": failure})
 
 
 def viewer_login(cwd: Path) -> str:
@@ -992,7 +993,6 @@ def converge_ownership_projection(issue: int, event: dict | None, cwd: Path,
                                   login: str | None = None, repair: bool = True) -> dict:
     """Project only the reducer's holder, then prove the exact assignee/runtime sets landed."""
     login = login or (viewer_login(cwd) if event else None)
-    expected_assignees = {login} if event and login else set()
     expected_identity = ownership_identity(event)
     try:
         data = wait_for_issue(
@@ -1002,7 +1002,7 @@ def converge_ownership_projection(issue: int, event: dict | None, cwd: Path,
             cwd, "ownership changed before projection; no projection write was attempted",
             consecutive=2,
         )
-    except WriteFailure:
+    except Stop:
         latest = issue_view(issue, "assignees,labels,comments", cwd=cwd)
         latest_event = reduce_ownership(latest.get("comments", []), utc_now_stamp())["event"]
         if repair and ownership_identity(latest_event) != expected_identity:
@@ -1013,9 +1013,10 @@ def converge_ownership_projection(issue: int, event: dict | None, cwd: Path,
     if event and not runtime:
         legacy = {name[4:] for name in label_names(data) if name.startswith("dev:")
                   and holder_uses_runtime(event, name[4:])}
-        if len(legacy) != 1:
-            raise Stop({"ok": False, "reason": "holder-runtime-missing"})
-        runtime = legacy.pop()
+        runtime = legacy.pop() if len(legacy) == 1 else None
+    unresolved_runtime = bool(event and not runtime)
+    # Unknown legacy provenance must not leave the previous holder projected as authoritative.
+    expected_assignees = {login} if event and login and runtime else set()
     expected_runtimes = {f"dev:{runtime}"} if runtime else set()
     current_assignees, current_runtimes = projection_state(data)
     edit = ["gh", "issue", "edit", str(issue)]
@@ -1037,18 +1038,26 @@ def converge_ownership_projection(issue: int, event: dict | None, cwd: Path,
                 and projection_state(readback) == (expected_assignees, expected_runtimes))
 
     try:
-        return wait_for_issue(
+        result = wait_for_issue(
             issue, "assignees,labels,comments", matches, cwd,
             "ownership projection write did not read back exactly", consecutive=2,
             ambiguous_write=len(edit) > 4,
         )
-    except WriteFailure:
-        latest = issue_view(issue, "assignees,labels,comments", cwd=cwd)
+    except (Stop, WriteFailure) as failure:
+        try:
+            latest = issue_view(issue, "assignees,labels,comments", cwd=cwd)
+        except ReadFailure:
+            if isinstance(failure, WriteFailure):
+                raise failure
+            raise
         latest_event = reduce_ownership(latest.get("comments", []), utc_now_stamp())["event"]
         if repair and ownership_identity(latest_event) != expected_identity:
             converge_ownership_projection(issue, latest_event, cwd, login=login, repair=False)
             raise Stop({"ok": False, "reason": "ownership-changed-projections-repaired"})
         raise
+    if unresolved_runtime:
+        raise Stop({"ok": False, "reason": "holder-runtime-missing"})
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2166,6 +2175,11 @@ def cmd_unassign(args, config, cwd) -> dict:
     other_live = any(event["run_id"] != args.run_id for event in ownership["live"])
     if args.held_by_other and not other_live:
         raise Stop({"ok": False, "reason": "held-by-other-without-other-holder"})
+    successor = next((event for event in ownership["live"] if event["run_id"] != args.run_id), None)
+    if mine is ownership["event"] and successor and not successor.get("runtime"):
+        legacy = {name[4:] for name in projected if holder_uses_runtime(successor, name[4:])}
+        if len(legacy) != 1:
+            raise Stop({"ok": False, "reason": "holder-runtime-missing"})
     login = viewer_login(cwd) if ownership["event"] else None
     after = None
     if mine:

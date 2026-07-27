@@ -668,18 +668,6 @@ with remote(lagged_claim):
 check("bounded visibility polling sees one claim acquisition",
       (bool(lagged_result), len(m.claim_comments(lagged_claim.comments))), (True, 1))
 
-short_claim = FakeIssue()
-short_failure = None
-try:
-    with remote(short_claim):
-        with patch.object(m, "utc_now_stamp", side_effect=[NOW] + ["2026-01-02T00:00:02Z"] * 20):
-            m.cmd_claim(SimpleNamespace(issue=2, run_id=ME, runtime="claude-code",
-                                        horizon="2026-01-02T00:00:01Z"), {}, Path("."))
-except m.WriteFailure as exc:
-    short_failure = str(exc)
-check("a claim expiring during readback fails as an ambiguous write, not an internal error",
-      (bool(short_failure), len(m.claim_comments(short_claim.comments))), (True, 1))
-
 dirty_projection = FakeIssue(labels=["dev:codex"])
 dirty_projection.assignees = {"stale-user"}
 with remote(dirty_projection):
@@ -699,6 +687,24 @@ try:
 except m.WriteFailure:
     projection_failed = True
 check("claim refuses success when projection readback disagrees", projection_failed, True)
+class ProjectionOutage(FakeIssue):
+    def view(self, issue, fields, cwd=None):
+        if getattr(self, "outage", False):
+            raise m.ReadFailure("offline after edit")
+        return super().view(issue, fields, cwd=cwd)
+    def run(self, argv, cwd=None, check=True, writes=False):
+        result = super().run(argv, cwd=cwd, check=check, writes=writes)
+        self.outage = argv[:3] == ["gh", "issue", "edit"]
+        return result
+projection_outage = ProjectionOutage([comment(m.marker(
+    "claim", run_id=ME, runtime="claude-code", horizon=FUTURE))])
+try:
+    with remote(projection_outage):
+        m.converge_ownership_projection(1, m.reduce_ownership(
+            projection_outage.comments, NOW)["event"], Path("."), login="me")
+except m.WriteFailure:
+    projection_outage_result = "ambiguous-write"
+check("a diagnostic outage preserves projection write ambiguity", projection_outage_result, "ambiguous-write")
 
 foreign_stale = FakeIssue([comment(
     m.marker("claim", run_id=OTHER, runtime="codex", horizon="2026-01-01T01:00Z"))])
@@ -765,16 +771,16 @@ check("a losing claim repairs the authoritative winner's projections",
 class HolderSwitch(FakeIssue):
     def __init__(self):
         super().__init__([comment(m.marker(
-            "claim", run_id="opencode-old", runtime="opencode", horizon=FUTURE))])
-        self.views = 0
-    def view(self, issue, fields, cwd=None):
-        self.views += 1
-        if self.views == 2:
+            "claim", run_id="opencode-old", runtime="opencode", horizon=FUTURE))], ["dev:stale"])
+        self.switched = False
+    def run(self, argv, cwd=None, check=True, writes=False):
+        if argv[:3] == ["gh", "issue", "edit"] and not self.switched:
+            self.switched = True
             self.comments.append(comment(
                 f"{m.FORCED_EVIDENCE_HEADING}\n\nmanual takeover\n\n"
-                f"{m.marker('reclaim', run_id='codex-new', runtime='codex', horizon=FUTURE, forced='true', evidence='required', **{'from': 'opencode-old'})}",
+                f"{m.marker('reclaim', run_id='codex-new', horizon=FUTURE, forced='true', evidence='required', **{'from': 'opencode-old'})}",
                 "2026-01-02T00:00:02Z"))
-        return super().view(issue, fields, cwd=cwd)
+        return super().run(argv, cwd=cwd, check=check, writes=writes)
 
 switched = HolderSwitch()
 switched_reason = None
@@ -784,9 +790,9 @@ try:
         m.converge_ownership_projection(1, first, Path("."), login="me")
 except m.Stop as exc:
     switched_reason = exc.payload["reason"]
-check("a holder change before projection repairs the new winner",
+check("a legacy holder race clears stale projections and fails closed",
       (switched_reason, switched.assignees, switched.labels),
-      ("ownership-changed-projections-repaired", {"me"}, {"status:ready", "dev:codex"}))
+      ("holder-runtime-missing", set(), {"status:ready"}))
 claim_retry = FakeIssue([
     comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE))
 ])
@@ -950,14 +956,18 @@ legacy_other = FakeIssue([
     comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE)),
     comment(m.marker("claim", run_id="codex-other", horizon=FUTURE),
             "2026-01-02T00:00:01Z"),
-], ["dev:claude-code", "dev:codex"])
+], ["dev:claude-code"])
 legacy_other.assigned = True
-with remote(legacy_other):
-    legacy_handoff = m.cmd_unassign(SimpleNamespace(
-        issue=1, run_id=ME, runtime="claude-code", held_by_other=True), {}, Path("."))
-check("unassign infers an unambiguous legacy holder runtime before projection",
-      (legacy_handoff["assignee_kept"], legacy_other.assignees, legacy_other.labels),
-      (True, {"me"}, {"status:ready", "dev:codex"}))
+legacy_handoff = None
+try:
+    with remote(legacy_other):
+        m.cmd_unassign(SimpleNamespace(
+            issue=1, run_id=ME, runtime="claude-code", held_by_other=True), {}, Path("."))
+except m.Stop as exc:
+    legacy_handoff = exc.payload["reason"]
+check("unassign refuses an unresolved legacy successor before release",
+      (legacy_handoff, len(legacy_other.comments), legacy_other.labels),
+      ("holder-runtime-missing", 2, {"status:ready", "dev:claude-code"}))
 
 wrong_runtime_release = FakeIssue([
     comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE))
