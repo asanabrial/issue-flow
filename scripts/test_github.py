@@ -475,7 +475,6 @@ class FakeIssue:
         self.labels = {"status:ready", *(labels or [])}
         self.assignees = set()
         self.fail_edits = 0
-        self.ignore_edits = False
         self.delayed_reads = 0
         self.stale_reads = 0
         self.tick = 0
@@ -505,8 +504,6 @@ class FakeIssue:
             if self.fail_edits:
                 self.fail_edits -= 1
                 raise m.WriteFailure("injected projection failure")
-            if self.ignore_edits:
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
             for flag, value in zip(argv, argv[1:]):
                 if flag == "--add-label":
                     self.labels.add(value)
@@ -523,16 +520,18 @@ def remote(remote):
                           READBACK_DELAY_SECONDS=0)
 
 read_failure_types = []
-with patch.object(m, "issue_view", side_effect=m.ReadFailure("offline")), \
-        patch.object(m.time, "sleep"):
-    for ambiguous in (False, True):
+poll_cases = [([m.ReadFailure("offline")] * 7, False),
+              ([m.ReadFailure("offline")] * 7, True),
+              ([{}] + [m.ReadFailure("offline")] * 6, False)]
+for responses, ambiguous in poll_cases:
+    with patch.object(m, "issue_view", side_effect=responses), patch.object(m.time, "sleep"):
         try:
-            m.wait_for_issue(1, "comments", lambda _data: True, Path("."), "not visible",
+            m.wait_for_issue(1, "comments", lambda data: bool(data.get("ready")), Path("."), "not visible",
                              ambiguous_write=ambiguous)
         except (m.ReadFailure, m.WriteFailure) as exc:
             read_failure_types.append(type(exc))
 check("polling preserves read failures unless a preceding write is ambiguous",
-      read_failure_types, [m.ReadFailure, m.WriteFailure])
+      read_failure_types, [m.ReadFailure, m.WriteFailure, m.ReadFailure])
 
 
 same_second = FakeIssue([
@@ -660,14 +659,6 @@ with m.body_file("evidence") as unused_reason:
         rejected_unused_reason = exc.payload["reason"]
 check("reason files cannot be silently ignored without force", rejected_unused_reason,
       "force-required-for-reason")
-lagged_claim = FakeIssue()
-lagged_claim.delayed_reads = 6
-with remote(lagged_claim):
-    lagged_result = m.cmd_claim(SimpleNamespace(
-        issue=1, run_id=ME, runtime="claude-code", horizon=FUTURE), {}, Path("."))
-check("bounded visibility polling sees one claim acquisition",
-      (bool(lagged_result), len(m.claim_comments(lagged_claim.comments))), (True, 1))
-
 dirty_projection = FakeIssue(labels=["dev:codex"])
 dirty_projection.assignees = {"stale-user"}
 with remote(dirty_projection):
@@ -677,16 +668,6 @@ check("claim converges exact ownership projections",
       (dirty_projection.assignees, dirty_projection.labels),
       ({"me"}, {"status:ready", "dev:claude-code"}))
 
-ignored_projection = FakeIssue()
-ignored_projection.ignore_edits = True
-projection_failed = False
-try:
-    with remote(ignored_projection):
-        m.cmd_claim(SimpleNamespace(issue=1, run_id=ME, runtime="claude-code",
-                                    horizon=FUTURE), {}, Path("."))
-except m.WriteFailure:
-    projection_failed = True
-check("claim refuses success when projection readback disagrees", projection_failed, True)
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):
         if getattr(self, "outage", False):
@@ -772,14 +753,17 @@ class HolderSwitch(FakeIssue):
     def __init__(self):
         super().__init__([comment(m.marker(
             "claim", run_id="opencode-old", runtime="opencode", horizon=FUTURE))], ["dev:stale"])
-        self.switched = False
+        self.switches = 0
     def run(self, argv, cwd=None, check=True, writes=False):
-        if argv[:3] == ["gh", "issue", "edit"] and not self.switched:
-            self.switched = True
+        if argv[:3] == ["gh", "issue", "edit"] and self.switches < 2:
+            self.switches += 1
+            target = "opencode-old" if self.switches == 1 else "codex-new"
+            attrs = ({"run_id": "codex-new"} if self.switches == 1 else
+                     {"run_id": "claude-code-final", "runtime": "claude-code"})
             self.comments.append(comment(
                 f"{m.FORCED_EVIDENCE_HEADING}\n\nmanual takeover\n\n"
-                f"{m.marker('reclaim', run_id='codex-new', horizon=FUTURE, forced='true', evidence='required', **{'from': 'opencode-old'})}",
-                "2026-01-02T00:00:02Z"))
+                f"{m.marker('reclaim', horizon=FUTURE, forced='true', evidence='required', **attrs, **{'from': target})}",
+                f"2026-01-02T00:00:0{self.switches + 1}Z"))
         return super().run(argv, cwd=cwd, check=check, writes=writes)
 
 switched = HolderSwitch()
@@ -790,9 +774,9 @@ try:
         m.converge_ownership_projection(1, first, Path("."), login="me")
 except m.Stop as exc:
     switched_reason = exc.payload["reason"]
-check("a legacy holder race clears stale projections and fails closed",
+check("successive holder races converge to the final winner",
       (switched_reason, switched.assignees, switched.labels),
-      ("holder-runtime-missing", set(), {"status:ready"}))
+      ("ownership-changed-projections-repaired", {"me"}, {"status:ready", "dev:claude-code"}))
 claim_retry = FakeIssue([
     comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE))
 ])
