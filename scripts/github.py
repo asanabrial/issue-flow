@@ -2626,7 +2626,8 @@ def cmd_unassign(args, config, cwd) -> dict:
         target_epoch = existing.get("target-op")
         control_position = first_operation_markers(comments)[operation_id][0]
         target = next((event for event in ownership_events(comments)
-                       if event["position"] < control_position
+                       if (event["kind"] != "reclaim" or valid_reclaim(event, comments))
+                       and event["position"] < control_position
                        and ownership_epoch(event) == target_epoch
                        and event["run_id"] == args.run_id
                        and event.get("runtime") in {None, args.runtime}), None)
