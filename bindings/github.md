@@ -103,7 +103,8 @@ either: **an identity field cannot adjudicate a race between runs that share tha
 
 `SKILL.md` warns that "parsing prose for the same answer is fragile — any rewording breaks it", and
 adjudication used to depend on exactly that. So every control comment the script writes carries a
-machine-readable trailer alongside the sentence a human reads:
+machine-readable trailer alongside the sentence a human reads. These first-generation examples are
+retained as historical syntax; current ownership writers also include runtime and operation fields:
 
 ```
 <!-- issue-flow: claim run-id=claude-code-60fabae1 horizon=2026-07-25T23:00Z -->
@@ -156,7 +157,7 @@ ones.
 `<n>` is the issue number throughout. `SCRIPT` abbreviates
 `python <skill>/scripts/github.py --repo-dir <repo>`.
 
-Every ownership write uses a fresh lowercase 32-hex `--operation-id`, reused unchanged on retry. For `reclaim` and `unassign`, first omit `--target-operation`: the command performs no write and returns the exact target; repeat with both IDs to authorize only that epoch. Identical hidden-write retries reduce to one event, while conflicts are inert. Broad legacy ownership markers remain readable only before the `2026-07-28T00:35:03Z` activation cutoff.
+Every ownership write uses a fresh lowercase 32-hex `--operation-id`, reused unchanged on retry. For `reclaim` and `unassign`, first omit `--target-operation`: the command succeeds without writing and returns the exact target; repeat with both IDs to authorize only that epoch. Identical hidden-write retries reduce to one event, while a conflicting later copy cannot erase the first. Unedited legacy markers remain readable until the issue's first operation-scoped marker; later legacy writes on that issue are inert, avoiding a deployment-time cutoff gap.
 
 | Operation | Command | What it guarantees beyond the obvious |
 |---|---|---|

@@ -89,9 +89,6 @@ OPERATION_ID_RE = re.compile(r"[0-9a-f]{32}")
 # The last shipped evidence-free forced event was issue #7 at 11:59:58Z. After this activation
 # boundary, stale clients cannot mint a new "legacy" event by merely omitting the protocol attr.
 FORCED_EVIDENCE_SINCE = "2026-07-27T19:00:00Z"
-# PR #21 established the reducer contract at this exact server time. Ownership syntax written by
-# older transports after that boundary is inert so it cannot bypass exact-epoch controls.
-OPERATION_EPOCH_SINCE = "2026-07-28T00:35:03Z"
 # This heading is persisted protocol syntax, not presentation copy; change it only with a parser
 # migration that keeps already-written v2 forced events valid.
 FORCED_EVIDENCE_HEADING = "Forced takeover reason and evidence:"
@@ -405,23 +402,26 @@ OPERATION_FIELDS = {
 def operation_marker(comments: list[dict], operation_id: str, kind: str,
                      expected: dict | None = None) -> dict | None:
     """Read one semantic operation across any number of identical transport comments."""
-    marks = [mark for comment in comments if comment.get("viewerDidAuthor") is True
+    marks = [mark for comment in comments if (comment.get("viewerDidAuthor") is True
+                                               and comment.get("includesCreatedEdit") is False)
              for mark in parse_markers(comment.get("body", ""))
              if mark.get("kind") == kind and mark.get("op-id") == operation_id]
     if not marks:
         return None
     fields = OPERATION_FIELDS[kind]
     if len({tuple(mark.get(field) for field in fields) for mark in marks}) != 1:
-        raise Stop({"ok": False, "reason": f"{kind}-operation-conflict"})
+        raise Stop({"ok": False, "reason": f"{kind}-operation-conflict", "markers": marks})
     if expected and any(marks[0].get(key) != value for key, value in expected.items()):
-        raise Stop({"ok": False, "reason": f"{kind}-metadata-mismatch"})
+        raise Stop({"ok": False, "reason": f"{kind}-metadata-mismatch",
+                    "persisted": marks[0]})
     return marks[0]
 
 
 def reject_operation_kind_conflict(comments: list[dict], operation_id: str,
                                    allowed: set[str]) -> None:
     kinds = {mark["kind"] for comment in comments for mark in parse_markers(comment.get("body", ""))
-             if mark.get("op-id") == operation_id and comment.get("viewerDidAuthor") is True}
+             if mark.get("op-id") == operation_id and comment.get("viewerDidAuthor") is True
+             and comment.get("includesCreatedEdit") is False}
     if kinds - allowed:
         raise Stop({"ok": False, "reason": "operation-id-kind-conflict", "kinds": sorted(kinds)})
 
@@ -436,8 +436,21 @@ def ownership_epoch(event: dict) -> str:
 
 
 def legacy_operation_allowed(comment: dict) -> bool:
-    created = parse_stamp(comment.get("createdAt", ""))
-    return bool(created and created < parse_stamp(OPERATION_EPOCH_SINCE))
+    return comment.get("includesCreatedEdit") is False
+
+
+def operation_activation_position(comments: list[dict]) -> int:
+    return min((position for position, comment in enumerate(comments)
+                if comment.get("viewerDidAuthor") is True and legacy_operation_allowed(comment)
+                for mark in parse_markers(comment.get("body", ""))
+                if mark.get("kind") in OPERATION_FIELDS
+                and OPERATION_ID_RE.fullmatch(mark.get("op-id", ""))), default=len(comments))
+
+
+def reject_legacy_writer(comments: list[dict]) -> None:
+    if operation_activation_position(comments) < len(comments):
+        raise Stop({"ok": False, "reason": "legacy-writer-disabled",
+                    "action": "upgrade the caller and retry with a fresh operation ID"})
 
 
 def forced_evidence_digest(comment: dict, marker_index: int | None) -> str | None:
@@ -514,7 +527,7 @@ def ownership_events(comments: list[dict]) -> list[dict]:
     claims = {id(comment): run_id for _at, run_id, comment in claim_comments(comments)}
     events = []
     for position, comment in enumerate(comments):
-        if comment.get("viewerDidAuthor") is not True:
+        if comment.get("viewerDidAuthor") is not True or not legacy_operation_allowed(comment):
             continue
         parsed = parse_markers(comment.get("body", ""))
         selected = next(((index, mark) for index, mark in enumerate(parsed)
@@ -551,20 +564,22 @@ def ownership_events(comments: list[dict]) -> list[dict]:
                 "comment": comment,
             })
     ordered = sorted(events, key=lambda item: (stamp_order(item["created_at"]), item["position"]))
-    first, conflicts = {}, set()
+    activation = operation_activation_position(comments)
+    ordered = [event for event in ordered
+               if event["operation_id"] or event["position"] < activation]
+    first, unique = {}, []
     fields = ("kind", "run_id", "runtime", "horizon", "from", "from_operation",
               "evidence_hash", "evidence_body_hash", "forced")
     for event in ordered:
         operation_id = event["operation_id"]
         if not operation_id:
+            unique.append(event)
             continue
         signature = tuple(event.get(field) for field in fields)
-        if operation_id in first and first[operation_id][0] != signature:
-            conflicts.add(operation_id)
-        else:
-            first.setdefault(operation_id, (signature, event))
-    return [event for event in ordered if not event["operation_id"] or (
-        event["operation_id"] not in conflicts and first[event["operation_id"]][1] is event)]
+        if operation_id not in first:
+            first[operation_id] = signature
+            unique.append(event)
+    return unique
 
 
 def released_at(comments: list[dict]) -> dict[str, str]:
@@ -688,8 +703,9 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
                       for event in events if event["kind"] == "reclaim"}
     controls, conflicts = {}, set()
     legacy_release_positions, epoch_release_positions = {}, {}
+    activation = operation_activation_position(comments)
     for position, comment in enumerate(comments):
-        if comment.get("viewerDidAuthor") is not True:
+        if comment.get("viewerDidAuthor") is not True or not legacy_operation_allowed(comment):
             continue
         for marker_index, mark in enumerate(parse_markers(comment.get("body", ""))):
             kind = mark.get("kind")
@@ -718,7 +734,7 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
             if operation_scoped:
                 # A malformed operation-scoped control must not downgrade into a broad legacy release.
                 continue
-            if not legacy_operation_allowed(comment):
+            if position >= activation:
                 continue
             for attr in RELEASE_ATTRS_BY_KIND.get(kind, ()):
                 target = mark.get(attr)
@@ -728,22 +744,21 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
     for operation_id, (_signature, target, position) in controls.items():
         if operation_id not in conflicts:
             epoch_release_positions[target] = max(position, epoch_release_positions.get(target, -1))
-    events = [event for event in events if event.get("operation_id") not in conflicts]
     takeovers = [index for index, event in enumerate(events) if event["kind"] == "reclaim"]
     candidates = events[takeovers[-1]:] if takeovers else events
     latest_by_run = {}
     for event in candidates:
-        released = max(legacy_release_positions.get(event["run_id"], -1),
-                       epoch_release_positions.get(ownership_epoch(event), -1))
-        if event["position"] > released:
-            previous = latest_by_run.get(event["run_id"])
-            if (previous and previous.get("operation_id") == event.get("operation_id")
-                    and all(previous[field] == event[field]
-                            for field in ("kind", "runtime", "horizon", "from", "forced"))):
-                # A hidden first write may be retried. Identical acquisitions keep their earliest
-                # server timestamp so a duplicate cannot lose a race that its first write won.
-                continue
-            latest_by_run[event["run_id"]] = event
+        previous = latest_by_run.get(event["run_id"])
+        if (previous and previous.get("operation_id") == event.get("operation_id")
+                and all(previous[field] == event[field]
+                        for field in ("kind", "runtime", "horizon", "from", "forced"))):
+            # A hidden first write may be retried. Identical acquisitions keep their earliest
+            # server timestamp so a duplicate cannot lose a race that its first write won.
+            continue
+        latest_by_run[event["run_id"]] = event
+    latest_by_run = {run_id: event for run_id, event in latest_by_run.items()
+                     if event["position"] > max(legacy_release_positions.get(run_id, -1),
+                                                epoch_release_positions.get(ownership_epoch(event), -1))}
 
     moment = parse_stamp(now)
     trusted = [comment for comment in comments if comment.get("viewerDidAuthor") is True]
@@ -780,8 +795,7 @@ def valid_reclaim(event: dict, comments: list[dict]) -> bool:
         if (event.get("operation_id") or event["comment"].get("includesCreatedEdit") is not False) and (
                 not event.get("evidence_hash") or bound != event["evidence_hash"]):
             return False
-    if not event.get("from_operation") and (event.get("operation_id")
-                                             or not legacy_operation_allowed(event["comment"])):
+    if event.get("operation_id") and not event.get("from_operation"):
         return False
     prior = reduce_ownership(comments[:event["position"]], event["created_at"])
     if event.get("from_operation"):
@@ -1464,6 +1478,7 @@ def _cmd_claim_legacy(args, config, cwd) -> dict:
                           horizon=require_horizon(args.horizon, now))
     data = issue_view(args.issue, "assignees,labels,comments", cwd=cwd)
     existing_comments = data.get("comments", [])
+    reject_legacy_writer(existing_comments)
     before = reduce_ownership(existing_comments, now)
     foreign_stale = {event["run_id"] for event in before["stale"]
                      if event["run_id"] != args.run_id}
@@ -1549,7 +1564,7 @@ def cmd_claim(args, config, cwd) -> dict:
         return _cmd_claim_legacy(args, config, cwd)
     operation_id = require_operation_id(args.operation_id)
     now = utc_now_stamp()
-    require_horizon(args.horizon, now)
+    require_horizon(args.horizon)
     data = issue_view(args.issue, "assignees,labels,comments", cwd=cwd)
     comments = data.get("comments", [])
     reject_operation_kind_conflict(comments, operation_id, {"claim", "standdown"})
@@ -1557,6 +1572,7 @@ def cmd_claim(args, config, cwd) -> dict:
     existing = operation_marker(comments, operation_id, "claim", expected)
     before = reduce_ownership(comments, now)
     if not existing:
+        require_horizon(args.horizon, now)
         foreign_stale = {event["run_id"] for event in before["stale"]
                          if event["run_id"] != args.run_id}
         if not before["holder"] and foreign_stale:
@@ -1588,6 +1604,9 @@ def cmd_claim(args, config, cwd) -> dict:
         converge_ownership_projection(args.issue, ownership["event"], cwd)
         raise Stop({"ok": False, "reason": "claim-operation-no-longer-current",
                     "winner": ownership["holder"]})
+    if existing and active in ownership["stale"]:
+        raise Stop({"ok": False, "reason": "claim-operation-expired",
+                    "operation_id": operation_id, "claimed_at": active["created_at"]})
     if not ownership["event"]:
         raise WriteFailure("claim became stale before adjudication; its event was written")
     if ownership["holder"] != args.run_id:
@@ -1631,6 +1650,7 @@ def _cmd_reclaim_legacy(args, config, cwd) -> dict:
                     "action": "nothing to reclaim on a closed issue"})
 
     comments = data.get("comments", [])
+    reject_legacy_writer(comments)
     before = reduce_ownership(comments, now)
     current = before["event"]
     reused = bool(current and current["run_id"] == args.run_id and current["kind"] == "reclaim")
@@ -1735,7 +1755,7 @@ def cmd_reclaim(args, config, cwd) -> dict:
         return _cmd_reclaim_legacy(args, config, cwd)
     operation_id = require_operation_id(args.operation_id)
     now = utc_now_stamp()
-    require_horizon(args.horizon, now)
+    require_horizon(args.horizon)
     if getattr(args, "reason_file", None) and not args.force:
         raise Stop({"ok": False, "reason": "force-required-for-reason"})
     data = issue_view(args.issue, "state,assignees,labels,comments", cwd=cwd)
@@ -1769,6 +1789,7 @@ def cmd_reclaim(args, config, cwd) -> dict:
                 "run_id": args.run_id, "forced": current["forced"],
                 "reused_existing_reclaim": True}
 
+    require_horizon(args.horizon, now)
     before = reduce_ownership(comments, now)
     target = before["event"] or next(
         (event for event in before["stale"] if event["run_id"] != args.run_id), None)
@@ -1781,8 +1802,9 @@ def cmd_reclaim(args, config, cwd) -> dict:
         raise Stop({"ok": False, "reason": "holder-not-stale", "holder": target["run_id"]})
     target_epoch = ownership_epoch(target)
     if requested_target is None:
-        raise Stop({"ok": False, "reason": "target-operation-required",
-                    "target_operation": target_epoch, "holder": target["run_id"]})
+        return {"ok": True, "issue": args.issue, "write_performed": False,
+                "target_operation": target_epoch, "holder": target["run_id"],
+                "next": "repeat reclaim with --target-operation and the same operation ID"}
     if requested_target != target_epoch:
         raise Stop({"ok": False, "reason": "target-operation-mismatch",
                     "expected": target_epoch, "provided": requested_target})
@@ -2501,6 +2523,7 @@ def cmd_changelog_notes(args, config, cwd) -> dict:
 def _cmd_unassign_legacy(args, config, cwd) -> dict:
     """Release in the timeline first, then remove only projections no live holder needs."""
     data = issue_view(args.issue, "assignees,labels,comments", cwd=cwd)
+    reject_legacy_writer(data.get("comments", []))
     ownership = reduce_ownership(data.get("comments", []), utc_now_stamp())
     events = ownership["live"] + ownership["stale"]
     mine = next((event for event in events if event["run_id"] == args.run_id), None)
@@ -2594,8 +2617,9 @@ def cmd_unassign(args, config, cwd) -> dict:
         raise Stop({"ok": False, "reason": "unassign-metadata-mismatch"})
     target_epoch = ownership_epoch(mine)
     if requested_target is None:
-        raise Stop({"ok": False, "reason": "target-operation-required",
-                    "target_operation": target_epoch})
+        return {"ok": True, "issue": args.issue, "write_performed": False,
+                "target_operation": target_epoch,
+                "next": "repeat unassign with --target-operation and the same operation ID"}
     if requested_target != target_epoch:
         raise Stop({"ok": False, "reason": "target-operation-mismatch",
                     "expected": target_epoch, "provided": requested_target})
@@ -2852,7 +2876,7 @@ def main(argv: list[str] | None = None) -> int:
         result = COMMANDS[args.command](args, load_config(), cwd)
     except Stop as stop:
         print(json.dumps(stop.payload, indent=2))
-        return 1
+        return 2 if stop.payload.get("reason") in {"invalid-operation-id", "invalid-horizon"} else 1
     except ReadFailure as failure:
         # The control surface answered NOTHING. "Nothing" is not a stand-down and not clearance.
         print(json.dumps({

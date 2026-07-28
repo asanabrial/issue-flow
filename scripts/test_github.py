@@ -667,7 +667,7 @@ check("reason files cannot be silently ignored without force", rejected_unused_r
 duplicate_epoch = [comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE, op_id=OP_A), stamp) for stamp in (NOW, "2026-01-02T00:00:01Z")]
 check("duplicate operation comments reduce to one acquisition event", len(m.ownership_events(duplicate_epoch)), 1)
 conflicting_epoch = duplicate_epoch + [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_A), "2026-01-02T00:00:02Z")]
-check("conflicting copies invalidate an operation", m.reduce_ownership(conflicting_epoch, NOW)["holder"], None)
+check("a conflicting copy cannot erase the first operation", m.reduce_ownership(conflicting_epoch, NOW)["holder"], ME)
 acquisitions = [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=op), f"2026-01-02T00:00:0{i}Z") for i, op in enumerate((OP_A, OP_B))]
 delayed_release = acquisitions + [comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C, target_op=OP_A), "2026-01-02T00:00:02Z")]
 check("a delayed release cannot cancel a later reacquisition", m.reduce_ownership(delayed_release, NOW)["event"]["operation_id"], OP_B)
@@ -684,7 +684,7 @@ legacy_timeline = [comment("untrusted", trusted=False), legacy_claim, comment(m.
 check("unrelated deletion cannot change a legacy epoch ID", [m.reduce_ownership(items, NOW)["holder"] for items in (legacy_timeline, legacy_timeline[1:])], [None, None])
 
 conflicting_release = acquisitions[:1] + [comment(m.marker("standdown", run_id=ME, op_id=OP_A, target_op=target)) for target in (OP_A, OP_B)]
-check("conflicting release copies invalidate their acquisition", m.reduce_ownership(conflicting_release, NOW)["holder"], None)
+check("conflicting releases cannot erase their acquisition", m.reduce_ownership(conflicting_release, NOW)["holder"], ME)
 forged_target = [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_A)), comment(m.marker("claim", run_id=OTHER, runtime="codex", horizon=FUTURE, op_id=OP_B), "2026-01-02T00:00:01Z"), comment(m.marker("standdown", run_id=OTHER, op_id=OP_B, target_op=OP_A), "2026-01-02T00:00:02Z")]
 check("a scoped control cannot release another run's acquisition", m.reduce_ownership(forged_target, NOW)["holder"], ME)
 check("empty operation syntax cannot downgrade to legacy", [m.reduce_ownership(items, NOW)["holder"] for items in ([comment(f"<!-- issue-flow: claim run-id={ME} runtime=opencode horizon={FUTURE} op-id= -->")], acquisitions[:1] + [comment(f"<!-- issue-flow: unassign run-id={ME} op-id= target-op= -->")])], [None, ME])
@@ -720,25 +720,26 @@ with remote(writer_claim):
         claim_mismatch_reason = exc.payload["reason"]
 check("claim retries cannot alter operation metadata", claim_mismatch_reason,
       "claim-metadata-mismatch")
+late_claim = FakeIssue([comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE, op_id=OP_A), NOW), comment(m.marker("heartbeat", run_id=ME), "2026-01-03T00:01:00Z")], ["dev:claude-code"])
+with remote(late_claim), patch.object(m, "utc_now_stamp", lambda: "2026-01-03T00:02:00Z"):
+    late_retry = m.cmd_claim(claim_args, {}, Path("."))
+check("a post-horizon retry still inspects its landed live operation", late_retry["reused_existing_claim"], True)
 
 writer_reclaim = FakeIssue([comment(m.marker(
     "claim", run_id="dead", runtime="codex", horizon="2026-01-01T01:00Z"))], ["dev:codex"])
 reclaim_args = SimpleNamespace(issue=1, run_id=ME, runtime="claude-code", horizon=FUTURE,
                                operation_id=OP_C, target_operation=None, force=False)
 with remote(writer_reclaim):
-    try:
-        m.cmd_reclaim(reclaim_args, {}, Path("."))
-    except m.Stop as exc:
-        reclaim_target = exc.payload.get("target_operation")
+    reclaim_discovery = m.cmd_reclaim(reclaim_args, {}, Path("."))
     reclaim_discovery_comments = len(writer_reclaim.comments)
-    reclaim_args.target_operation = reclaim_target
+    reclaim_args.target_operation = reclaim_discovery["target_operation"]
     reclaimed = m.cmd_reclaim(reclaim_args, {}, Path("."))
     reclaimed_retry = m.cmd_reclaim(reclaim_args, {}, Path("."))
 check("reclaim discovers then persists its exact target operation",
-      (reclaim_discovery_comments, reclaimed["ok"], reclaimed_retry["reused_existing_reclaim"],
+      (reclaim_discovery["write_performed"], reclaim_discovery_comments, reclaimed["ok"], reclaimed_retry["reused_existing_reclaim"],
        len(m.ownership_events(writer_reclaim.comments)),
        m.reduce_ownership(writer_reclaim.comments, NOW)["event"]["operation_id"]),
-      (1, True, True, 2, OP_C))
+      (False, 1, True, True, 2, OP_C))
 
 writer_release = FakeIssue([comment(m.marker(
     "claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_A))], ["dev:opencode"])
@@ -746,11 +747,8 @@ writer_release.assigned = True
 release_args = SimpleNamespace(issue=1, run_id=ME, runtime="opencode", operation_id=OP_C,
                                target_operation=None, held_by_other=False)
 with remote(writer_release):
-    try:
-        m.cmd_unassign(release_args, {}, Path("."))
-    except m.Stop as exc:
-        release_target = exc.payload.get("target_operation")
-    release_args.target_operation = release_target
+    release_discovery = m.cmd_unassign(release_args, {}, Path("."))
+    release_args.target_operation = release_discovery["target_operation"]
     m.cmd_unassign(release_args, {}, Path("."))
     writer_release.comments.append(comment(m.marker(
         "claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_B),
@@ -773,10 +771,7 @@ rebind_release = FakeIssue([comment(m.marker(
 rebind_args = SimpleNamespace(issue=1, run_id=ME, runtime="opencode", operation_id=OP_C,
                               target_operation=None, held_by_other=False)
 with remote(rebind_release):
-    try:
-        m.cmd_unassign(rebind_args, {}, Path("."))
-    except m.Stop as exc:
-        rebind_args.target_operation = exc.payload["target_operation"]
+    rebind_args.target_operation = m.cmd_unassign(rebind_args, {}, Path("."))["target_operation"]
     rebind_release.comments = [comment(m.marker(
         "claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_B))]
     try:
@@ -786,8 +781,17 @@ with remote(rebind_release):
 check("an unlanded operation cannot rebind to a later epoch",
       (rebind_reason, m.reduce_ownership(rebind_release.comments, NOW)["event"]["operation_id"]),
       ("target-operation-mismatch", OP_B))
-post_cutover = "2026-07-28T00:35:04Z"
-check("legacy ownership writes are inert after activation", [m.reduce_ownership(items, NOW)["holder"] for items in ([comment("Claimed by old, expect to report by later.", post_cutover)], [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE)), comment(m.marker("unassign", run_id=ME, runtime="opencode"), post_cutover)])], [None, ME])
+activated = [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE)), comment(m.marker("claim", run_id=OTHER, runtime="codex", horizon=FUTURE, op_id=OP_A), "2026-01-02T00:00:01Z"), comment(m.marker("unassign", run_id=ME, runtime="opencode"), "2026-01-02T00:00:02Z")]
+check("activation preserves prior legacy history but blocks later legacy writes", m.reduce_ownership(activated, NOW)["holder"], ME)
+edited_legacy = comment(m.marker("claim", run_id="injected", runtime="opencode", horizon=FUTURE)); edited_legacy["includesCreatedEdit"] = True
+check("edited comments cannot inject legacy ownership", m.reduce_ownership([edited_legacy], NOW)["holder"], None)
+resurrection = acquisitions + [comment(m.marker("heartbeat", run_id=ME), "2026-01-02T00:00:02Z"), comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C, target_op=OP_B), "2026-01-02T00:00:03Z")]
+check("releasing a renewal cannot resurrect its predecessor", m.reduce_ownership(resurrection, NOW)["holder"], None)
+legacy_after_activation = FakeIssue(acquisitions[:1])
+with remote(legacy_after_activation):
+    try: m.cmd_claim(SimpleNamespace(issue=1, run_id=OTHER, runtime="codex", horizon=FUTURE), {}, Path("."))
+    except m.Stop as exc: legacy_writer_reason = exc.payload["reason"]
+check("direct legacy writers stop before writing on activated issues", (legacy_writer_reason, len(legacy_after_activation.comments)), ("legacy-writer-disabled", 1))
 
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):
