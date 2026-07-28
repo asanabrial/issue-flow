@@ -2632,7 +2632,7 @@ def cmd_unassign(args, config, cwd) -> dict:
                        and event["run_id"] == args.run_id
                        and event.get("runtime") in {None, args.runtime}), None)
         if not target:
-            raise Stop({"ok": False, "reason": "invalid-unassign-target"})
+            raise Stop({"ok": False, "reason": "invalid-unassign-target", "action": "re-read ownership and use a fresh operation ID"})
         if any(ownership_epoch(event) == target_epoch
                for event in ownership["live"] + ownership["stale"]):
             raise WriteFailure("unassign is visible but its target epoch remains authoritative")
