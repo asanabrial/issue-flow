@@ -12,7 +12,7 @@
 .EXAMPLE
     .\install.ps1 status
     .\install.ps1 install -DryRun
-    .\install.ps1 sync -From .\downloaded-SKILL.md
+    .\install.ps1 sync -From .\bundle-or-SKILL.md
     .\install.ps1 config -Set 'Tracker=linear'
 #>
 
@@ -35,6 +35,7 @@ $ErrorActionPreference = 'Stop'
 $SkillName = 'issue-flow'
 $SkillFile = 'SKILL.md'
 $ConfigFile = 'operator.local.md'
+$BundleFile = 'bundle.manifest'
 $StartMark = '<!-- issue-flow:config:start -->'
 $EndMark   = '<!-- issue-flow:config:end -->'
 
@@ -223,30 +224,92 @@ function Invoke-Sync {
     param([string]$Source)
 
     $installed = Join-Path $Canonical $SkillFile
-    if (-not (Test-Path -LiteralPath $Source))    { throw "$Source not found." }
+    if (-not (Test-Path -LiteralPath $Source)) { throw "$Source not found." }
+    $sourceDir = if (Test-Path -LiteralPath $Source -PathType Container) {
+        (Resolve-Path -LiteralPath $Source).Path
+    } else { Split-Path (Resolve-Path -LiteralPath $Source).Path -Parent }
+    $manifest = Join-Path $sourceDir $BundleFile
+    $incoming = Join-Path $sourceDir $SkillFile
+    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+        throw "$manifest not found - sync needs the complete bundle, not one downloaded file."
+    }
+    if (-not (Test-Path -LiteralPath $incoming -PathType Leaf)) { throw "$incoming not found in bundle." }
     if (-not (Test-Path -LiteralPath $installed)) { throw "$installed not found - nothing to sync." }
+    $requiredManifest = Join-Path $Canonical $BundleFile
+    if (-not (Test-Path -LiteralPath $requiredManifest -PathType Leaf)) {
+        throw "installed $BundleFile missing; use a full Git upgrade first."
+    }
 
-    $newText = Get-Content -LiteralPath $Source -Raw -Encoding UTF8
-    $mine    = Split-Config -Text (Get-Content -LiteralPath $installed -Raw -Encoding UTF8) -Origin 'the installed skill'
+    $lines = @(Get-Content -LiteralPath $manifest -Encoding UTF8)
+    if ($lines.Count -lt 2 -or $lines[0] -notmatch '^issue-flow-bundle-v1 (\S+)$') {
+        throw "invalid $BundleFile header."
+    }
+    $bundleVersion = $Matches[1]
+    $newText = Get-Content -LiteralPath $incoming -Raw -Encoding UTF8
+    if ($newText -notmatch '(?m)^  version: "([^"]+)"$' -or $Matches[1] -ne $bundleVersion) {
+        throw 'bundle and SKILL.md versions differ.'
+    }
+    $files = @($lines | Select-Object -Skip 1 | Where-Object { $_ -and -not $_.StartsWith('#') })
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($rel in $files) {
+        if ([IO.Path]::IsPathRooted($rel) -or $rel.Contains('\') -or
+                ($rel -split '/') -contains '..' -or -not $seen.Add($rel)) {
+            throw "unsafe or duplicate bundle path: $rel"
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $sourceDir $rel) -PathType Leaf)) {
+            throw "bundle file missing: $rel"
+        }
+    }
+    Get-Content -LiteralPath $requiredManifest -Encoding UTF8 | Select-Object -Skip 1 |
+        Where-Object { $_ -and -not $_.StartsWith('#') } | ForEach-Object {
+            if (-not $seen.Contains($_)) { throw "incoming bundle omits required file: $_" }
+        }
 
-    if (Test-HasConfig $newText) {
-        # The incoming version ships its own block; ours replaces it verbatim.
-        $theirs = Split-Config -Text $newText -Origin 'the incoming skill'
-        $merged = $theirs.Before + $mine.Block + $theirs.After
-    } else {
-        # A template with no block at all: append ours so the settings survive.
-        $merged = $newText.TrimEnd() + "`n`n" + $mine.Block + "`n"
+    $mine = Split-Config -Text (Get-Content -LiteralPath $installed -Raw -Encoding UTF8) -Origin 'the installed skill'
+    $theirs = Split-Config -Text $newText -Origin 'the incoming skill'
+    $stage = Join-Path ([IO.Path]::GetTempPath()) ("issue-flow-sync-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $stage | Out-Null
+    foreach ($rel in $files) {
+        $target = Join-Path $stage $rel; New-Item -ItemType Directory -Path (Split-Path $target -Parent) -Force | Out-Null
+        if ($rel -eq $SkillFile) { Write-Utf8NoBom -Path $target -Text ($theirs.Before + $mine.Block + $theirs.After) }
+        else { Copy-Item -LiteralPath (Join-Path $sourceDir $rel) -Destination $target }
     }
 
     if ($DryRun) {
-        Write-Host "would   sync $installed from $Source, preserving $($mine.Block.Length) chars of config"
+        Write-Host "would   sync bundle v$bundleVersion from $sourceDir, preserving $($mine.Block.Length) config chars"
+        Remove-Item -LiteralPath $stage -Recurse -Force
         return
     }
 
-    $saved = Backup-File $installed
-    Write-Utf8NoBom -Path $installed -Text $merged
-    Write-Host "backup  $saved"
-    Write-Host "synced  $installed  (config preserved: $($mine.Block.Length) chars)"
+    $backup = Join-Path $Canonical ('.backups\bundle-' + (Get-Date -Format 'yyyyMMdd-HHmmss') +
+                                    "-$PID-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $created = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    try {
+        foreach ($rel in $files) {
+            $dest = Join-Path $Canonical $rel
+            if ((Test-Path -LiteralPath $dest) -and -not (Test-Path -LiteralPath $dest -PathType Leaf)) {
+                throw "bundle target is not a file: $dest"
+            }
+            if (Test-Path -LiteralPath $dest -PathType Leaf) {
+                $saved = Join-Path $backup $rel; New-Item -ItemType Directory -Path (Split-Path $saved -Parent) -Force | Out-Null
+                Copy-Item -LiteralPath $dest -Destination $saved
+            } else { [void]$created.Add($rel) }
+        }
+        foreach ($rel in $files) {
+            $dest = Join-Path $Canonical $rel; New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
+            $temp = "$dest.issue-flow-sync-$PID"; Copy-Item -LiteralPath (Join-Path $stage $rel) -Destination $temp
+            Move-Item -LiteralPath $temp -Destination $dest -Force
+        }
+    } catch {
+        foreach ($rel in $files) {
+            $dest = Join-Path $Canonical $rel; $saved = Join-Path $backup $rel
+            if (Test-Path -LiteralPath $saved -PathType Leaf) { Copy-Item -LiteralPath $saved -Destination $dest -Force }
+            elseif ($created.Contains($rel)) { Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue }
+        }
+        throw
+    } finally { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host "backup  $backup"
+    Write-Host "synced  bundle v$bundleVersion from $sourceDir  (config preserved: $($mine.Block.Length) chars)"
 }
 
 function Invoke-Config {
@@ -339,7 +402,7 @@ switch ($Command) {
     'status'    { Invoke-Status }
     'config'    { Invoke-Config -Assignment $Set }
     'sync'      {
-        if (-not $From) { throw "sync needs -From <path to the newer SKILL.md>" }
+        if (-not $From) { throw "sync needs -From <bundle directory or SKILL.md>" }
         Invoke-Sync -Source $From
     }
 }

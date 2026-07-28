@@ -172,6 +172,7 @@ bindings/linear.md
 bindings/trello.md
 scripts/github.py                 the GitHub binding's reversible operations, executable
 examples/domain-test-coverage.md  a worked domain rule book
+bundle.manifest                   the single runtime-file and version boundary
 install.sh / install.ps1          self-acquiring installers (pipe them or run them)
 ```
 
@@ -212,14 +213,18 @@ added to the skill is settable immediately without touching either script. It ba
 up first, refuses a name that matches no row or more than one, and refuses a value containing `|`,
 which would split the cell and corrupt the table.
 
-`sync` upgrades the versioned skill while leaving `operator.local.md` untouched:
+`sync` upgrades the complete versioned runtime bundle while leaving `operator.local.md` untouched.
+Pass either a bundle directory or its `SKILL.md`; a standalone downloaded file is rejected because
+it cannot prove that the referenced policy and executable files have matching versions.
+Pre-manifest installations must first use the self-acquiring installer or a full Git upgrade.
 
 ```sh
-./install.sh sync --from ./newer-SKILL.md
+./install.sh sync --from ./newer-issue-flow/
 ```
 
-It backs the skill up first. Never force-add `operator.local.md`: its values are permissions,
-including whether an agent may publish or merge without asking.
+The manifest is validated and every source file is staged before writes. Sync keeps one bundle
+backup and restores it if any replacement fails. Never force-add `operator.local.md`: its values are
+permissions, including whether an agent may publish or merge without asking.
 
 ## Status
 

@@ -10,7 +10,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.sh | sh
 #   ./install.sh status
 #   ./install.sh install [--dry-run]
-#   ./install.sh sync --from <path/to/newer/SKILL.md> [--dry-run]
+#   ./install.sh sync --from <bundle-directory-or-SKILL.md> [--dry-run]
 #   ./install.sh uninstall [--dry-run]
 #   ./install.sh config [--set '<Setting>=<value>'] [--dry-run]
 
@@ -19,6 +19,7 @@ set -eu
 SKILL_NAME='issue-flow'
 SKILL_FILE='SKILL.md'
 CONFIG_FILE='operator.local.md'
+BUNDLE_FILE='bundle.manifest'
 START='<!-- issue-flow:config:start -->'
 END='<!-- issue-flow:config:end -->'
 
@@ -183,46 +184,71 @@ cmd_uninstall() {
     done
 }
 
+rollback_sync() {
+    [ "${SYNC_ACTIVE:-0}" -eq 1 ] || return 0
+    while IFS= read -r rel; do
+        dest="$CANONICAL/$rel"; saved="$SYNC_BACKUP/$rel"
+        if [ -f "$saved" ]; then
+            mkdir -p -- "$(dirname -- "$dest")" && cp -p -- "$saved" "$dest" || true
+        elif grep -Fx -- "$rel" "$SYNC_CREATED" >/dev/null 2>&1; then rm -f -- "$dest" || true
+        fi
+    done < "$SYNC_FILES"
+    SYNC_ACTIVE=0
+}
+
 cmd_sync() {
     installed="$CANONICAL/$SKILL_FILE"
-    [ -f "$FROM" ] || die "$FROM not found."
+    if [ -d "$FROM" ]; then source_dir=$FROM; else [ -f "$FROM" ] || die "$FROM not found."; source_dir=$(dirname -- "$FROM"); fi
+    manifest="$source_dir/$BUNDLE_FILE"; incoming="$source_dir/$SKILL_FILE"
+    [ -f "$manifest" ] || die "$manifest not found - sync needs the complete bundle, not one downloaded file."
+    [ -f "$incoming" ] || die "$incoming not found in bundle."
     [ -f "$installed" ] || die "$installed not found - nothing to sync."
+    [ -f "$CANONICAL/$BUNDLE_FILE" ] || die "installed $BUNDLE_FILE missing; use a full Git upgrade first."
+    has_config "$installed" || die "config markers missing in $installed; refusing to lose operator values."
+    has_config "$incoming" || die "config markers missing in incoming SKILL.md."
 
-    # Refusing beats guessing: a sync that cannot locate the block would silently drop the operator's
-    # settings, and they would find out the next time an agent asked for a confirmation it should not
-    # have needed.
-    if ! has_config "$installed"; then
-        printf 'error: config markers not found in the installed skill.\n' >&2
-        printf '       expected %s ... %s\n' "$START" "$END" >&2
-        printf '       refusing to sync - resolve by hand so no settings are lost.\n' >&2
-        exit 1
-    fi
+    SYNC_TMP=$(mktemp -d); SYNC_FILES="$SYNC_TMP/files"; SYNC_CREATED="$SYNC_TMP/created"
+    trap 'rollback_sync; rm -rf -- "$SYNC_TMP"' EXIT
+    trap 'exit 1' HUP INT TERM
+    awk 'NR > 1 && NF && substr($0,1,1) != "#" { print }' "$manifest" > "$SYNC_FILES"
+    : > "$SYNC_CREATED"; seen="$SYNC_TMP/seen"; : > "$seen"
+    header=$(sed -n '1p' "$manifest"); bundle_version=${header#issue-flow-bundle-v1 }
+    [ "$bundle_version" != "$header" ] || die "invalid $BUNDLE_FILE header."
+    skill_version=$(sed -n 's/^  version: "\([^"]*\)"/\1/p' "$incoming")
+    [ -n "$skill_version" ] && [ "$skill_version" = "$bundle_version" ] || die "bundle and SKILL.md versions differ."
+    while IFS= read -r rel; do
+        case "$rel" in ''|/*|*:*|*\\*|.|..|../*|*/../*|*/..) die "unsafe bundle path: $rel" ;; esac
+        grep -Fxi -- "$rel" "$seen" >/dev/null 2>&1 && die "duplicate bundle path: $rel"
+        printf '%s\n' "$rel" >> "$seen"; [ -f "$source_dir/$rel" ] || die "bundle file missing: $rel"
+    done < "$SYNC_FILES"
+    awk 'NR > 1 && NF && substr($0,1,1) != "#" { print }' "$CANONICAL/$BUNDLE_FILE" |
+    while IFS= read -r required; do
+        grep -Fxi -- "$required" "$SYNC_FILES" >/dev/null 2>&1 || die "incoming bundle omits required file: $required"
+    done
 
-    tmpdir=$(mktemp -d)
-    trap 'rm -rf -- "$tmpdir"' EXIT
-    block="$tmpdir/block"
-    merged="$tmpdir/merged"
-
-    extract_block "$installed" > "$block"
-
-    if has_config "$FROM"; then
-        # The incoming version ships its own block; ours replaces it verbatim.
-        splice_block "$FROM" "$block" > "$merged"
-    else
-        # A template with no block at all: append ours so the settings survive.
-        { cat -- "$FROM"; printf '\n'; cat -- "$block"; } > "$merged"
-    fi
-
+    stage="$SYNC_TMP/stage"; mkdir -p -- "$stage"; block="$SYNC_TMP/config"; extract_block "$installed" > "$block"
+    while IFS= read -r rel; do
+        staged="$stage/$rel"; mkdir -p -- "$(dirname -- "$staged")"
+        if [ "$rel" = "$SKILL_FILE" ]; then splice_block "$incoming" "$block" > "$staged"
+        else cp -p -- "$source_dir/$rel" "$staged"; fi
+    done < "$SYNC_FILES"
     chars=$(wc -c < "$block" | tr -d ' ')
-    if [ "$DRY_RUN" -eq 1 ]; then
-        printf 'would   sync %s from %s, preserving %s chars of config\n' "$installed" "$FROM" "$chars"
-        return 0
-    fi
+    if [ "$DRY_RUN" -eq 1 ]; then printf 'would   sync bundle v%s from %s, preserving %s config chars\n' "$bundle_version" "$source_dir" "$chars"; rm -rf -- "$SYNC_TMP"; return 0; fi
 
-    saved=$(backup_file "$installed")
-    cat -- "$merged" > "$installed"
-    printf 'backup  %s\n' "$saved"
-    printf 'synced  %s  (config preserved: %s chars)\n' "$installed" "$chars"
+    SYNC_BACKUP="$CANONICAL/.backups/bundle-$(date +%Y%m%d-%H%M%S)-$$"; mkdir -p -- "$SYNC_BACKUP"
+    while IFS= read -r rel; do
+        dest="$CANONICAL/$rel"; [ ! -e "$dest" ] || [ -f "$dest" ] || die "bundle target is not a file: $dest"
+        if [ -f "$dest" ]; then mkdir -p -- "$SYNC_BACKUP/$(dirname -- "$rel")"; cp -p -- "$dest" "$SYNC_BACKUP/$rel"
+        else printf '%s\n' "$rel" >> "$SYNC_CREATED"; fi
+    done < "$SYNC_FILES"
+    SYNC_ACTIVE=1
+    while IFS= read -r rel; do
+        dest="$CANONICAL/$rel"; mkdir -p -- "$(dirname -- "$dest")"
+        temp="$dest.issue-flow-sync.$$"; cp -p -- "$stage/$rel" "$temp"; mv -f -- "$temp" "$dest"
+    done < "$SYNC_FILES"
+    SYNC_ACTIVE=0
+    printf 'backup  %s\n' "$SYNC_BACKUP"
+    printf 'synced  bundle v%s from %s  (config preserved: %s chars)\n' "$bundle_version" "$source_dir" "$chars"
 }
 
 cmd_config() {
@@ -328,6 +354,6 @@ case "$COMMAND" in
     uninstall) cmd_uninstall ;;
     status)    cmd_status ;;
     config)    cmd_config ;;
-    sync)      [ -n "$FROM" ] || die 'sync needs --from <path to the newer SKILL.md>'; cmd_sync ;;
+    sync)      [ -n "$FROM" ] || die 'sync needs --from <bundle directory or SKILL.md>'; cmd_sync ;;
     *)         die "unknown command: $COMMAND" ;;
 esac
