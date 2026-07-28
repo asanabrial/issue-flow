@@ -416,15 +416,18 @@ def require_operation_id(value: str | None) -> str:
 def operation_marker(comments: list[dict], operation_id: str, kind: str,
                      expected: dict | None = None) -> dict | None:
     """Resolve identical transport copies without permitting metadata repair or rebinding."""
+    first = first_operation_markers(comments).get(operation_id)
+    if first and not first[3]:
+        raise Stop({"ok": False, "reason": f"{kind}-operation-conflict"})
     matches = [(comment, mark) for comment in comments
-               if comment.get("viewerDidAuthor") is True
+               if (comment.get("viewerDidAuthor") is True
+                   and comment.get("includesCreatedEdit") is False)
                for mark in parse_markers(comment.get("body", ""))
                if mark.get("kind") == kind and mark.get("op-id") == operation_id]
     if not matches:
         return None
     fields = OPERATION_FIELDS[kind]
-    if (matches[0][0].get("includesCreatedEdit") is not False
-            or len({tuple(mark.get(field) for field in fields) for _, mark in matches}) != 1):
+    if len({tuple(mark.get(field) for field in fields) for _, mark in matches}) != 1:
         raise Stop({"ok": False, "reason": f"{kind}-operation-conflict"})
     persisted = matches[0][1]
     if expected and any(persisted.get(key) != value for key, value in expected.items()):
@@ -435,7 +438,12 @@ def operation_marker(comments: list[dict], operation_id: str, kind: str,
 
 def reject_operation_kind_conflict(comments: list[dict], operation_id: str,
                                    allowed: set[str]) -> None:
-    kinds = {mark["kind"] for comment in comments if comment.get("viewerDidAuthor") is True
+    first = first_operation_markers(comments).get(operation_id)
+    if first and not first[3]:
+        raise Stop({"ok": False, "reason": "operation-id-kind-conflict"})
+    kinds = {mark["kind"] for comment in comments
+             if (comment.get("viewerDidAuthor") is True
+                 and comment.get("includesCreatedEdit") is False)
              for mark in parse_markers(comment.get("body", ""))
              if mark.get("op-id") == operation_id}
     if kinds - allowed:
@@ -724,7 +732,8 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
                         not target or target["run_id"] != mark.get("run-id")
                         or (kind == "standdown" and operation_id != target_epoch)
                         or (kind == "unassign" and (not mark.get("runtime")
-                                                    or target.get("runtime") != mark["runtime"]))))):
+                                                    or (target.get("runtime")
+                                                        and target["runtime"] != mark["runtime"])))))):
                     conflicts.add(operation_id)
                 else:
                     controls[operation_id] = (target_epoch, position)
@@ -819,7 +828,8 @@ def valid_reclaim(event: dict, comments: list[dict]) -> bool:
     else:
         target = prior["event"] or next(
             (candidate for candidate in prior["stale"] if candidate["run_id"] == event["from"]), None)
-    return bool(target and (event.get("operation_id") or not target.get("operation_id"))
+    return bool(target and (prior["holder"] is None or target is prior["event"])
+                and (event.get("operation_id") or not target.get("operation_id"))
                 and target["run_id"] == event["from"]
                 and (prior["holder"] is None or event["forced"]))
 
@@ -2613,7 +2623,16 @@ def cmd_unassign(args, config, cwd) -> dict:
     existing = operation_marker(comments, operation_id, "unassign", expected)
     ownership = reduce_ownership(comments, utc_now_stamp())
     if existing:
-        if any(ownership_epoch(event) == existing["target-op"]
+        target_epoch = existing.get("target-op")
+        control_position = first_operation_markers(comments)[operation_id][0]
+        target = next((event for event in ownership_events(comments)
+                       if event["position"] < control_position
+                       and ownership_epoch(event) == target_epoch
+                       and event["run_id"] == args.run_id
+                       and event.get("runtime") in {None, args.runtime}), None)
+        if not target:
+            raise Stop({"ok": False, "reason": "invalid-unassign-target"})
+        if any(ownership_epoch(event) == target_epoch
                for event in ownership["live"] + ownership["stale"]):
             raise WriteFailure("unassign is visible but its target epoch remains authoritative")
         converge_ownership_projection(args.issue, ownership["event"], cwd)

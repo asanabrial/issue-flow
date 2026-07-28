@@ -798,6 +798,19 @@ with remote(rebind):
     try: m.cmd_unassign(rebind_args, {}, Path("."))
     except m.Stop as exc: rebind_reason = exc.payload["reason"]
 check("an unlanded operation cannot rebind to a later epoch", rebind_reason, "target-operation-mismatch")
+runtime_less = FakeIssue([comment(m.marker("claim", run_id=ME, horizon=FUTURE))], ["dev:opencode"]); runtime_less.assigned = True
+runtime_less_args = SimpleNamespace(issue=1, run_id=ME, runtime="opencode", operation_id=OP_C, target_operation=None, held_by_other=False)
+with remote(runtime_less): runtime_less_args.target_operation = m.cmd_unassign(runtime_less_args, {}, Path("."))["target_operation"]; runtime_less_result = m.cmd_unassign(runtime_less_args, {}, Path("."))
+check("modern unassign releases runtime-less legacy ownership", (runtime_less_result["ok"], m.reduce_ownership(runtime_less.comments, NOW)["holder"]), (True, None))
+malformed_release = FakeIssue(acquisitions[:1] + [comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C))])
+with remote(malformed_release):
+    try: m.cmd_unassign(SimpleNamespace(issue=1, run_id=ME, runtime="opencode", operation_id=OP_C, target_operation=None, held_by_other=False), {}, Path("."))
+    except m.Stop as exc: malformed_release_reason = exc.payload["reason"]
+check("persisted unassign requires a preceding exact target", malformed_release_reason, "invalid-unassign-target")
+edited_late = comment(m.marker("claim", run_id=ME, runtime="codex", horizon=FUTURE, op_id=OP_A) + m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_A, target_op=OP_A)); edited_late["includesCreatedEdit"] = True
+check("edited late copies cannot poison operation retry", (m.operation_marker(acquisitions[:1] + [edited_late], OP_A, "claim")["runtime"], m.reject_operation_kind_conflict(acquisitions[:1] + [edited_late], OP_A, {"claim", "standdown"})), ("opencode", None))
+forced_stale_hash = m.forced_reclaim_hash(OP_C, evidence_digest, "taker", "codex", FUTURE, ME, OP_A); forced_stale = [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon="2026-01-01T01:00Z", op_id=OP_A)), comment(m.marker("claim", run_id=OTHER, runtime="codex", horizon=FUTURE, op_id=OP_B), "2026-01-02T00:00:01Z"), comment(f"{m.FORCED_EVIDENCE_HEADING}\n\nreason\n\n{m.marker('reclaim', run_id='taker', runtime='codex', horizon=FUTURE, op_id=OP_C, from_op=OP_A, evidence_hash=forced_stale_hash, forced='true', evidence='required', **{'from': ME})}", "2026-01-02T00:00:02Z")]
+check("forced reclaim cannot skip a different live holder", m.reduce_ownership(forced_stale, NOW)["holder"], OTHER)
 
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):
