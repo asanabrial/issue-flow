@@ -378,15 +378,14 @@ def parse_markers(body: str) -> list[dict[str, str]]:
 
 
 def valid_acquisition_marker(mark: dict) -> bool:
-    if "op-id" not in mark:
+    if not any(key in mark for key in ("op-id", "from-op", "target-op", "evidence-hash")):
         return True
-    return bool(OPERATION_ID_RE.fullmatch(mark["op-id"]) and mark.get("runtime")
-                and HORIZON_RE.fullmatch(mark.get("horizon", ""))
+    return bool(OPERATION_ID_RE.fullmatch(mark.get("op-id", "")) and mark.get("runtime")
+                and HORIZON_RE.fullmatch(mark.get("horizon", "")) and parse_stamp(mark["horizon"])
                 and (mark["kind"] == "claim" or (mark.get("from") and mark.get("from-op"))))
 
 
 OPERATION_FIELDS = {
-    "claim": ("run-id", "runtime", "horizon"),
     "reclaim": ("run-id", "runtime", "horizon", "from", "from-op", "forced", "evidence-hash"),
     "standdown": ("run-id", "target-op"),
     "unassign": ("run-id", "runtime", "target-op"),
@@ -665,7 +664,8 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
                 if (not target_epoch or (kind in {"standdown", "unassign"} and (
                         not target or target["run_id"] != mark.get("run-id")
                         or (kind == "standdown" and operation_id != target_epoch)
-                        or (kind == "unassign" and not holder_uses_runtime(target, mark.get("runtime")))))):
+                        or (kind == "unassign" and (not mark.get("runtime")
+                                                    or target.get("runtime") != mark["runtime"]))))):
                     conflicts.add(operation_id)
                 elif operation_id in controls and controls[operation_id][0] != signature:
                     conflicts.add(operation_id)
