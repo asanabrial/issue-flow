@@ -37,6 +37,7 @@ $SkillFile = 'SKILL.md'
 $ConfigFile = 'operator.local.md'
 $StartMark = '<!-- issue-flow:config:start -->'
 $EndMark   = '<!-- issue-flow:config:end -->'
+$Repo = 'https://github.com/asanabrial/issue-flow.git'
 
 # The skill's real home is wherever this script sits.
 $Canonical = $PSScriptRoot
@@ -48,13 +49,17 @@ function Invoke-Git {
     return ($output -join "`n").Trim()
 }
 
+$RuntimeDirs = @(
+    (Join-Path $HOME '.claude\skills'),
+    (Join-Path $HOME '.codex\skills')
+)
+
 # Piped (`irm | iex`) there is no script location at all; run from elsewhere, no skill next to it.
 # Either way the installer acquires itself - clone on first contact, upgrade after - and hands over
 # to the on-disk copy, so everything of substance always executes from files you can read. All file
 # shuffling uses Copy-Item and git itself, never PowerShell redirection, which on Windows
 # PowerShell 5.1 re-encodes text (UTF-16, BOMs) and corrupts what it touches.
 if (-not $Canonical -or -not (Test-Path (Join-Path $Canonical 'SKILL.md'))) {
-    $Repo = 'https://github.com/asanabrial/issue-flow.git'
     $Dest = Join-Path $HOME '.agents\skills\issue-flow'
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
         throw 'git is required - install it (winget install Git.Git) and re-run.'
@@ -68,11 +73,22 @@ if (-not $Canonical -or -not (Test-Path (Join-Path $Canonical 'SKILL.md'))) {
         if ($LASTEXITCODE -ne 0) { throw "git clone failed ($LASTEXITCODE)." }
     } else {
         Write-Host "upgrading $Dest"
-        [void](Invoke-Git -Path $Dest -Arguments @('fetch', '-q', 'origin'))
+        if ($From) { throw '-From is retired; sync from canonical origin/main.' }
+        foreach ($base in $RuntimeDirs) {
+            $link = Join-Path $base $SkillName
+            if ((Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue) -and
+                (Resolve-Path -LiteralPath $link).Path -ne (Resolve-Path -LiteralPath $Dest).Path) { throw "runtime path $link does not target canonical skill." }
+        }
+        if ((Invoke-Git -Path $Dest -Arguments @('remote', 'get-url', 'origin')) -ne $Repo) { throw 'origin is not the canonical issue-flow repository.' }
         if ((Invoke-Git -Path $Dest -Arguments @('symbolic-ref', '--quiet', '--short', 'HEAD')) -ne 'main' -or
             (Invoke-Git -Path $Dest -Arguments @('status', '--porcelain', '--untracked-files=no'))) { throw 'upgrade requires clean main.' }
-        if (Invoke-Git -Path $Dest -Arguments @('ls-tree', '-r', '--name-only', 'origin/main', '--', $ConfigFile)) { throw 'target tracks local operator policy.' }
-        [void](Invoke-Git -Path $Dest -Arguments @('merge', '--ff-only', '-q', 'origin/main'))
+        [void](Invoke-Git -Path $Dest -Arguments @('fetch', '-q', '--no-tags', 'origin', 'refs/heads/main:refs/remotes/origin/main'))
+        $target = Invoke-Git -Path $Dest -Arguments @('rev-parse', 'refs/remotes/origin/main')
+        $targetPaths = (Invoke-Git -Path $Dest -Arguments @('ls-tree', '-r', '--name-only', $target)) -split "`n"; if ($ConfigFile -in $targetPaths) { throw 'target tracks local operator policy.' }
+        $ignore = Invoke-Git -Path $Dest -Arguments @('show', "${target}:.gitignore")
+        if ($ConfigFile -notin ($ignore -split "`n")) { throw 'target does not ignore local operator policy.' }
+        if ($DryRun) { Write-Host "would   upgrade Git tree to $target"; return }
+        [void](Invoke-Git -Path $Dest -Arguments @('merge', '--ff-only', '--no-overwrite-ignore', '-q', $target))
     }
     $forward = @{ Command = $Command }
     if ($From) { $forward.From = $From }
@@ -81,14 +97,6 @@ if (-not $Canonical -or -not (Test-Path (Join-Path $Canonical 'SKILL.md'))) {
     & (Join-Path $Dest 'install.ps1') @forward
     return
 }
-
-# Per-runtime skill directories that must point at the canonical one. `.agents/skills/` is
-# the cross-runtime convention; Claude Code does NOT read it (anthropics/claude-code#31005),
-# so for that runtime the link is the mechanism rather than a convenience.
-$RuntimeDirs = @(
-    (Join-Path $HOME '.claude\skills'),
-    (Join-Path $HOME '.codex\skills')
-)
 
 # --- config block ---------------------------------------------------------------------
 
@@ -144,8 +152,8 @@ function Write-Utf8NoBom {
 
 function Get-LinkKind {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return 'absent' }
-    $item = Get-Item -LiteralPath $Path -Force
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return 'absent' }
     if ($item.LinkType) { return $item.LinkType.ToLower() }   # SymbolicLink | Junction
     return 'directory'
 }
@@ -236,64 +244,40 @@ function Invoke-Uninstall {
 function Invoke-Sync {
     param([string]$Source)
 
+    if ($Source) { throw '-From is retired; sync from canonical origin/main.' }
     [void](Invoke-Git -Path $Canonical -Arguments @('rev-parse', '--git-dir'))
     $branch = Invoke-Git -Path $Canonical -Arguments @('symbolic-ref', '--quiet', '--short', 'HEAD')
     if ($branch -ne 'main') { throw "sync requires main; current branch is $branch." }
     foreach ($base in $RuntimeDirs) {
         $link = Join-Path $base $SkillName
-        if ((Get-LinkKind $link) -eq 'directory') { throw "runtime copy $link would stay stale; remove it and reinstall a link before sync." }
+        if ((Get-LinkKind $link) -eq 'absent') { continue }
+        if ((Resolve-Path -LiteralPath $link).Path -ne (Resolve-Path -LiteralPath $Canonical).Path) { throw "runtime path $link does not target canonical skill." }
     }
     if (Invoke-Git -Path $Canonical -Arguments @('status', '--porcelain', '--untracked-files=no')) {
         throw 'tracked files are dirty; preserve or revert them before sync.'
     }
 
     $destinationOrigin = Invoke-Git -Path $Canonical -Arguments @('remote', 'get-url', 'origin')
-    if ($Source) {
-        if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
-            throw '-From accepts only a clean Git checkout, never a loose SKILL.md.'
-        }
-        if (Invoke-Git -Path $Source -Arguments @('status', '--porcelain', '--untracked-files=no')) {
-            throw 'source checkout is dirty.'
-        }
-        $sourceOrigin = Invoke-Git -Path $Source -Arguments @('remote', 'get-url', 'origin')
-        if ($sourceOrigin -ne $destinationOrigin) { throw 'source and destination origins differ.' }
-        [void](Invoke-Git -Path $Canonical -Arguments @('fetch', '-q', '--no-tags', $Source, 'HEAD'))
-    } else {
-        [void](Invoke-Git -Path $Canonical -Arguments @('fetch', '-q', '--no-tags', 'origin', 'main'))
-    }
-    $target = Invoke-Git -Path $Canonical -Arguments @('rev-parse', 'FETCH_HEAD^{commit}')
+    if ($destinationOrigin -ne $Repo) { throw 'origin is not the canonical issue-flow repository.' }
+    [void](Invoke-Git -Path $Canonical -Arguments @('fetch', '-q', '--no-tags', 'origin', 'refs/heads/main:refs/remotes/origin/main'))
+    $target = Invoke-Git -Path $Canonical -Arguments @('rev-parse', 'refs/remotes/origin/main')
     $old = Invoke-Git -Path $Canonical -Arguments @('rev-parse', 'HEAD')
     & git -C $Canonical merge-base --is-ancestor $old $target
     if ($LASTEXITCODE -ne 0) { throw 'target would discard or diverge from local commits.' }
-    if (Invoke-Git -Path $Canonical -Arguments @('ls-tree', '-r', '--name-only', $target, '--', $ConfigFile)) {
+    $targetPaths = (Invoke-Git -Path $Canonical -Arguments @('ls-tree', '-r', '--name-only', $target)) -split "`n"
+    if ($ConfigFile -in $targetPaths) {
         throw "$ConfigFile is tracked by the target; refusing to overwrite local policy."
     }
-    $targetPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    (Invoke-Git -Path $Canonical -Arguments @('ls-tree', '-r', '--name-only', $target)) -split "`n" |
-        Where-Object { $_ } | ForEach-Object { [void]$targetPaths.Add($_) }
-    $locals = @((Invoke-Git -Path $Canonical -Arguments @('ls-files', '--others', '--exclude-standard')) -split "`n")
-    $locals += @((Invoke-Git -Path $Canonical -Arguments @('ls-files', '--others', '--ignored', '--exclude-standard')) -split "`n")
-    if ($locals | Where-Object { $local = $_; $local -and ($targetPaths | Where-Object {
-            $_ -eq $local -or $_.StartsWith("$local/") -or $local.StartsWith("$_/") }) }) {
-        throw 'target collides with an untracked or ignored local file.'
-    }
-    $config = Join-Path $Canonical $ConfigFile
-    $localHash = if (Test-Path -LiteralPath $config -PathType Leaf) {
-        Invoke-Git -Path $Canonical -Arguments @('hash-object', '--no-filters', $config)
-    } else { 'absent' }
+    $ignore = Invoke-Git -Path $Canonical -Arguments @('show', "${target}:.gitignore")
+    if ($ConfigFile -notin ($ignore -split "`n")) { throw 'target does not ignore local operator policy.' }
     if ($DryRun) { Write-Host "would   sync Git tree $old -> $target"; return }
 
-    # Destination tracked state is clean and local collisions were refused, so hard reset is a
-    # complete Git-tree transaction. Git serializes it with index locks and retains reflog recovery.
-    [void](Invoke-Git -Path $Canonical -Arguments @('reset', '--hard', '-q', $target))
+    # Git owns case folding, unusual paths, ignored-file refusal, HEAD comparison, and the index lock.
+    [void](Invoke-Git -Path $Canonical -Arguments @('merge', '--ff-only', '--no-overwrite-ignore', '-q', $target))
     if ((Invoke-Git -Path $Canonical -Arguments @('rev-parse', 'HEAD')) -ne $target) {
         throw 'Git tree did not reach target commit.'
     }
-    $afterHash = if (Test-Path -LiteralPath $config -PathType Leaf) {
-        Invoke-Git -Path $Canonical -Arguments @('hash-object', '--no-filters', $config)
-    } else { 'absent' }
-    if ($afterHash -ne $localHash) { throw "$ConfigFile changed; restore with git reset --hard $old." }
-    Write-Host "synced  Git tree $old -> $target  (rollback: git reset --hard $old)"
+    Write-Host "synced  Git tree at $target  (previous HEAD remains in git reflog)"
 }
 
 function Invoke-Config {

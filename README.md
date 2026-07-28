@@ -212,18 +212,18 @@ added to the skill is settable immediately without touching either script. It ba
 up first, refuses a name that matches no row or more than one, and refuses a value containing `|`,
 which would split the cell and corrupt the table.
 
-`sync` makes the complete tracked installation match one verified Git commit while leaving ignored
-`operator.local.md` and non-colliding local files untouched. It fetches `origin/main` by default;
-`--from` accepts only a clean checkout with the same origin, never a loose `SKILL.md`:
+`sync` makes the complete tracked installation match verified canonical `origin/main` while leaving
+ignored `operator.local.md` and local files untouched. The retired `--from` form fails before
+mutation; arbitrary local checkouts cannot become upgrade authority:
 
 ```sh
 ./install.sh sync
 ```
 
-Sync requires a clean tracked `main`, refuses runtime copy fallbacks and local paths the target would
-overwrite, and reports old/new commits for reflog rollback. Pre-manifest installations first run the
-self-acquiring installer or a full Git upgrade. Never force-add `operator.local.md`: its values are
-permissions, including whether an agent may publish or merge without asking.
+Sync requires a clean tracked `main`, verified runtime links, the canonical origin, and a target that
+still ignores local policy. Git performs a no-overwrite fast-forward and retains the prior HEAD in
+the reflog. The self-acquiring installer applies the same preflight before upgrading legacy clones.
+Never force-add `operator.local.md`: its values include publish and merge permissions.
 
 ## Status
 

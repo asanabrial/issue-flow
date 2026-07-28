@@ -10,7 +10,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.sh | sh
 #   ./install.sh status
 #   ./install.sh install [--dry-run]
-#   ./install.sh sync [--from <clean-git-checkout>] [--dry-run]
+#   ./install.sh sync [--dry-run]
 #   ./install.sh uninstall [--dry-run]
 #   ./install.sh config [--set '<Setting>=<value>'] [--dry-run]
 
@@ -21,16 +21,17 @@ SKILL_FILE='SKILL.md'
 CONFIG_FILE='operator.local.md'
 START='<!-- issue-flow:config:start -->'
 END='<!-- issue-flow:config:end -->'
+REPO='https://github.com/asanabrial/issue-flow.git'
 
 # The skill's real home is wherever this script sits.
 CANONICAL=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || CANONICAL=''
 case ${0##*/} in sh|dash|bash|ksh|zsh) CANONICAL='' ;; esac
+RUNTIME_DIRS="$HOME/.claude/skills $HOME/.codex/skills"
 
 # Piped (`curl | sh`) or run from outside a checkout, there is no skill next to this script.
 # Then the installer acquires itself - clone on first contact, upgrade after - and hands over to
 # the on-disk copy, so everything of substance always executes from files you can read.
 if [ ! -f "$CANONICAL/SKILL.md" ] || [ ! -f "$CANONICAL/install.sh" ]; then
-    REPO='https://github.com/asanabrial/issue-flow.git'
     DEST="$HOME/.agents/skills/issue-flow"
     command -v git >/dev/null 2>&1 || {
         printf 'error: git is required - install it and re-run.
@@ -47,11 +48,21 @@ if [ ! -f "$CANONICAL/SKILL.md" ] || [ ! -f "$CANONICAL/install.sh" ]; then
     else
         printf 'upgrading %s
 ' "$DEST"
-        git -C "$DEST" fetch -q origin
+        for arg in "$@"; do case "$arg" in --from|--from=*) printf 'error: --from is retired; sync from canonical origin/main.\n' >&2; exit 1;; esac; done
+        for base in $RUNTIME_DIRS; do link="$base/$SKILL_NAME"; [ ! -e "$link" ] && [ ! -L "$link" ] && continue
+            resolved=$(CDPATH= cd -- "$link" 2>/dev/null && pwd -P) || { printf 'error: invalid runtime link %s.\n' "$link" >&2; exit 1; }
+            [ "$resolved" = "$DEST" ] || { printf 'error: runtime path %s does not target canonical skill.\n' "$link" >&2; exit 1; }; done
+        [ "$(git -C "$DEST" remote get-url origin)" = "$REPO" ] || { printf 'error: origin is not the canonical issue-flow repository.\n' >&2; exit 1; }
         [ "$(git -C "$DEST" symbolic-ref --quiet --short HEAD)" = main ] &&
             git -C "$DEST" diff --quiet -- && git -C "$DEST" diff --cached --quiet -- || { printf 'error: upgrade requires clean main.\n' >&2; exit 1; }
-        git -C "$DEST" ls-tree -r --name-only origin/main -- "$CONFIG_FILE" | grep . >/dev/null && { printf 'error: target tracks local operator policy.\n' >&2; exit 1; }
-        git -C "$DEST" merge --ff-only -q origin/main
+        git -C "$DEST" fetch -q --no-tags origin refs/heads/main:refs/remotes/origin/main
+        target=$(git -C "$DEST" rev-parse refs/remotes/origin/main)
+        paths=$(git -C "$DEST" ls-tree -r --name-only "$target") || exit 1
+        printf '%s\n' "$paths" | grep -iFx "$CONFIG_FILE" >/dev/null && { printf 'error: target tracks local operator policy.\n' >&2; exit 1; }
+        ignore=$(git -C "$DEST" show "${target}:.gitignore") || { printf 'error: target has no readable .gitignore.\n' >&2; exit 1; }
+        printf '%s\n' "$ignore" | grep -Fx "$CONFIG_FILE" >/dev/null || { printf 'error: target does not ignore local operator policy.\n' >&2; exit 1; }
+        for arg in "$@"; do [ "$arg" != --dry-run ] || { printf 'would   upgrade Git tree to %s\n' "$target"; exit 0; }; done
+        git -C "$DEST" merge --ff-only --no-overwrite-ignore -q "$target" || { printf 'error: Git refused the safe fast-forward; installation is unchanged.\n' >&2; exit 1; }
     fi
     exec sh "$DEST/install.sh" "$@"
 fi
@@ -59,8 +70,6 @@ fi
 # Per-runtime skill directories that must point at the canonical one. `.agents/skills/` is the
 # cross-runtime convention; Claude Code does NOT read it (anthropics/claude-code#31005), so for that
 # runtime the link is the mechanism rather than a convenience.
-RUNTIME_DIRS="$HOME/.claude/skills $HOME/.codex/skills"
-
 DRY_RUN=0
 FROM=''
 SET=''
@@ -187,47 +196,34 @@ cmd_uninstall() {
 }
 
 cmd_sync() {
+    [ -z "$FROM" ] || die '--from is retired; sync from canonical origin/main.'
     git -C "$CANONICAL" rev-parse --git-dir >/dev/null 2>&1 || die "$CANONICAL is not a Git checkout."
     branch=$(git -C "$CANONICAL" symbolic-ref --quiet --short HEAD) || die 'sync requires the main branch, not detached HEAD.'
     [ "$branch" = main ] || die "sync requires main; current branch is $branch."
     for base in $RUNTIME_DIRS; do
-        [ "$(link_kind "$base/$SKILL_NAME")" != directory ] || die "runtime copy $base/$SKILL_NAME would stay stale; remove it and reinstall a link before sync."
+        link="$base/$SKILL_NAME"; [ "$(link_kind "$link")" = absent ] && continue
+        resolved=$(CDPATH= cd -- "$link" 2>/dev/null && pwd -P) || die "invalid runtime link $link."
+        [ "$resolved" = "$CANONICAL" ] || die "runtime path $link does not target canonical skill."
     done
     git -C "$CANONICAL" diff --quiet -- && git -C "$CANONICAL" diff --cached --quiet -- ||
         die 'tracked files are dirty; preserve or revert them before sync.'
     destination_origin=$(git -C "$CANONICAL" remote get-url origin) || die 'origin is not configured.'
-    if [ -n "$FROM" ]; then
-        [ -d "$FROM" ] || die '--from accepts only a clean Git checkout, never a loose SKILL.md.'
-        git -C "$FROM" diff --quiet -- && git -C "$FROM" diff --cached --quiet -- || die 'source checkout is dirty.'
-        source_origin=$(git -C "$FROM" remote get-url origin) || die 'source origin is not configured.'
-        [ "$source_origin" = "$destination_origin" ] || die 'source and destination origins differ.'
-        git -C "$CANONICAL" fetch -q --no-tags "$FROM" HEAD
-    else
-        git -C "$CANONICAL" fetch -q --no-tags origin main
-    fi
-    target=$(git -C "$CANONICAL" rev-parse 'FETCH_HEAD^{commit}') || die 'fetched target is not a commit.'
+    [ "$destination_origin" = "$REPO" ] || die 'origin is not the canonical issue-flow repository.'
+    git -C "$CANONICAL" fetch -q --no-tags origin refs/heads/main:refs/remotes/origin/main
+    target=$(git -C "$CANONICAL" rev-parse refs/remotes/origin/main) || die 'fetched target is not a commit.'
     old=$(git -C "$CANONICAL" rev-parse HEAD)
     git -C "$CANONICAL" merge-base --is-ancestor "$old" "$target" || die 'target would discard or diverge from local commits.'
-    git -C "$CANONICAL" ls-tree -r --name-only "$target" -- "$CONFIG_FILE" | grep . >/dev/null &&
-        die "$CONFIG_FILE is tracked by the target; refusing to overwrite local policy."
-    locals=$(mktemp); target_paths=$(mktemp); trap 'rm -f -- "$locals" "$target_paths"' EXIT
-    git -C "$CANONICAL" ls-files --others --exclude-standard > "$locals"
-    git -C "$CANONICAL" ls-files --others --ignored --exclude-standard >> "$locals"
-    git -C "$CANONICAL" ls-tree -r --name-only "$target" > "$target_paths"
-    while IFS= read -r local; do
-        awk -v l="$local" '$0 == l || index($0, l "/") == 1 || index(l, $0 "/") == 1 { found=1; exit } END { exit !found }' "$target_paths" &&
-            die "target collides with local path: $local"
-    done < "$locals"
-    local_hash=absent; [ ! -f "$CANONICAL/$CONFIG_FILE" ] || local_hash=$(git hash-object --no-filters "$CANONICAL/$CONFIG_FILE")
+    paths=$(git -C "$CANONICAL" ls-tree -r --name-only "$target") || die 'cannot inspect target policy.'
+    printf '%s\n' "$paths" | grep -iFx "$CONFIG_FILE" >/dev/null && die "$CONFIG_FILE is tracked by the target; refusing to overwrite local policy."
+    ignore=$(git -C "$CANONICAL" show "${target}:.gitignore") || die 'target has no readable .gitignore.'
+    printf '%s\n' "$ignore" | grep -Fx "$CONFIG_FILE" >/dev/null || die 'target does not ignore local operator policy.'
     if [ "$DRY_RUN" -eq 1 ]; then printf 'would   sync Git tree %s -> %s\n' "$old" "$target"; return 0; fi
 
-    # The clean-tree and collision checks make this hard reset a complete tree transaction rather
-    # than a data-loss shortcut. Git serializes it with index locks and records the old HEAD in reflog.
-    git -C "$CANONICAL" reset --hard -q "$target"
+    # Fast-forward merge keeps HEAD comparison and checkout under Git's index lock; refusing ignored
+    # overwrites delegates case folding and unusual path handling to Git instead of shell text scans.
+    git -C "$CANONICAL" merge --ff-only --no-overwrite-ignore -q "$target" || die 'Git refused the safe fast-forward; installation is unchanged.'
     [ "$(git -C "$CANONICAL" rev-parse HEAD)" = "$target" ] || die 'Git tree did not reach target commit.'
-    after_hash=absent; [ ! -f "$CANONICAL/$CONFIG_FILE" ] || after_hash=$(git hash-object --no-filters "$CANONICAL/$CONFIG_FILE")
-    [ "$after_hash" = "$local_hash" ] || die "$CONFIG_FILE changed during sync; restore from reflog commit $old."
-    printf 'synced  Git tree %s -> %s  (rollback: git reset --hard %s)\n' "$old" "$target" "$old"
+    printf 'synced  Git tree at %s  (previous HEAD remains in git reflog)\n' "$target"
 }
 
 cmd_config() {
