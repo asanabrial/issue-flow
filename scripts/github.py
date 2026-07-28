@@ -386,10 +386,25 @@ def valid_acquisition_marker(mark: dict) -> bool:
 
 
 OPERATION_FIELDS = {
+    "claim": ("run-id", "runtime", "horizon"),
     "reclaim": ("run-id", "runtime", "horizon", "from", "from-op", "forced", "evidence-hash"),
     "standdown": ("run-id", "target-op"),
     "unassign": ("run-id", "runtime", "target-op"),
 }
+
+
+def first_operation_markers(comments: list[dict]) -> dict[str, tuple[int, int, dict, bool]]:
+    """Reserve each operation ID at its first trusted marker; later corrections cannot rewrite it."""
+    first = {}
+    for position, comment in enumerate(comments):
+        if comment.get("viewerDidAuthor") is not True:
+            continue
+        for marker_index, mark in enumerate(parse_markers(comment.get("body", ""))):
+            operation_id = mark.get("op-id", "")
+            if mark.get("kind") in OPERATION_FIELDS and OPERATION_ID_RE.fullmatch(operation_id):
+                first.setdefault(operation_id, (position, marker_index, mark,
+                                                  comment.get("includesCreatedEdit") is False))
+    return first
 
 
 def ownership_epoch(event: dict) -> str:
@@ -472,6 +487,7 @@ def claim_comments(comments: list[dict]) -> list[tuple[str, str, dict]]:
 def ownership_events(comments: list[dict]) -> list[dict]:
     """Parse acquisition events once so every ownership command reads the same timeline."""
     claims = {id(comment): run_id for _at, run_id, comment in claim_comments(comments)}
+    first_operations = first_operation_markers(comments)
     events = []
     for position, comment in enumerate(comments):
         if comment.get("viewerDidAuthor") is not True:
@@ -481,7 +497,12 @@ def ownership_events(comments: list[dict]) -> list[dict]:
                          if mark.get("kind") in {"claim", "reclaim"} and mark.get("run-id")
                          and valid_acquisition_marker(mark)), None)
         marker_index, event = selected if selected else (None, None)
-        if not event and id(comment) in claims:
+        if event and event.get("op-id"):
+            first = first_operations[event["op-id"]]
+            if not first[3] or (position, marker_index) != first[:2]:
+                event = None
+        if (not event and id(comment) in claims
+                and not any(mark.get("kind") in {"claim", "reclaim"} for mark in parsed)):
             event = {"kind": "claim", "run-id": claims[id(comment)]}
         if event:
             created_at = comment.get("createdAt", "")
@@ -509,17 +530,7 @@ def ownership_events(comments: list[dict]) -> list[dict]:
                 "marker_index": marker_index,
                 "comment": comment,
             })
-    ordered = sorted(events, key=lambda item: (stamp_order(item["created_at"]), item["position"]))
-    seen, unique = set(), []
-    for event in ordered:
-        operation_id = event["operation_id"]
-        if not operation_id:
-            unique.append(event)
-            continue
-        if operation_id not in seen:
-            seen.add(operation_id)
-            unique.append(event)
-    return unique
+    return sorted(events, key=lambda item: (stamp_order(item["created_at"]), item["position"]))
 
 
 def released_at(comments: list[dict]) -> dict[str, str]:
@@ -637,36 +648,42 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
     """
     events = [event for event in ownership_events(comments)
               if event["kind"] != "reclaim" or valid_reclaim(event, comments)]
-    acquisition_ids = {event["operation_id"] for event in events if event.get("operation_id")}
+    first_operations = first_operation_markers(comments)
     event_by_epoch = {ownership_epoch(event): event for event in events}
     valid_reclaims = {(event["position"], event["marker_index"])
                       for event in events if event["kind"] == "reclaim"}
     controls, conflicts = {}, set()
-    legacy_release_positions, epoch_release_positions = {}, {}
+    legacy_release_positions, epoch_release_positions, epoch_release_history = {}, {}, {}
     for position, comment in enumerate(comments):
         if comment.get("viewerDidAuthor") is not True:
             continue
         for marker_index, mark in enumerate(parse_markers(comment.get("body", ""))):
             kind = mark.get("kind")
-            if kind == "reclaim" and (position, marker_index) not in valid_reclaims:
-                continue
             target_epoch = mark.get("from-op") if kind == "reclaim" else mark.get("target-op")
             operation_id = mark.get("op-id")
             operation_scoped = any(key in mark for key in ("op-id", "target-op", "from-op"))
             if (kind in RELEASE_ATTRS_BY_KIND and kind in OPERATION_FIELDS and operation_id
                     and OPERATION_ID_RE.fullmatch(operation_id)):
+                first = first_operations[operation_id]
+                companion = (kind == "standdown" and first[2].get("kind") == "claim"
+                             and first[3] and target_epoch == operation_id)
+                if (position, marker_index) != first[:2] and not companion:
+                    continue
                 if operation_id in controls or operation_id in conflicts:
                     continue
                 target = event_by_epoch.get(target_epoch)
-                if (not target_epoch or (kind in {"standdown", "unassign"} and (
+                if (not first[3] or (kind == "reclaim"
+                                     and (position, marker_index) not in valid_reclaims)
+                        or not target_epoch or (kind in {"standdown", "unassign"} and (
                         not target or target["run_id"] != mark.get("run-id")
                         or (kind == "standdown" and operation_id != target_epoch)
                         or (kind == "unassign" and (not mark.get("runtime")
-                                                    or target.get("runtime") != mark["runtime"]))))
-                        or (kind == "unassign" and operation_id in acquisition_ids)):
+                                                    or target.get("runtime") != mark["runtime"]))))):
                     conflicts.add(operation_id)
                 else:
                     controls[operation_id] = (target_epoch, position)
+                continue
+            if kind == "reclaim" and (position, marker_index) not in valid_reclaims:
                 continue
             if operation_scoped:
                 # A malformed operation-scoped control must not downgrade into a broad legacy release.
@@ -677,15 +694,20 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
                     legacy_release_positions[target] = max(
                         position, legacy_release_positions.get(target, -1))
     for target, position in controls.values():
+        epoch_release_history.setdefault(target, []).append(position)
         epoch_release_positions[target] = max(position, epoch_release_positions.get(target, -1))
     takeovers = [index for index, event in enumerate(events) if event["kind"] == "reclaim"]
     candidates = events[takeovers[-1]:] if takeovers else events
     latest_by_run = {}
     for event in candidates:
         previous = latest_by_run.get(event["run_id"])
-        release = max(legacy_release_positions.get(event["run_id"], -1),
-                      epoch_release_positions.get(ownership_epoch(previous), -1) if previous else -1)
-        released_between = bool(previous and previous["position"] < release < event["position"])
+        # Legacy reacquisition may repeat metadata, so a release between copies distinguishes it
+        # from a hidden transport retry. Exact releases after the new epoch must not affect it.
+        released_between = bool(previous and (
+            previous["position"] < legacy_release_positions.get(event["run_id"], -1)
+            < event["position"] or any(
+                previous["position"] < release < event["position"]
+                for release in epoch_release_history.get(ownership_epoch(previous), ()))))
         same = (previous and previous.get("operation_id") == event.get("operation_id")
                 and all(previous[field] == event[field]
                         for field in ("kind", "runtime", "horizon", "from", "forced")))
