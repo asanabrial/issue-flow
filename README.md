@@ -46,6 +46,7 @@ records which run did what even when every agent shares one login.
 Delivery aims for pull requests of at most 800 changed lines, but that is reviewability guidance, not
 a gate. A larger coherent change is preferable when splitting it would make intermediate states less
 safe or make the complete result harder to review; all normal review and verification still apply.
+Repository-specific limits win; the fallback contract lives in [repository delivery](references/repository-delivery.md#keep-review-units-coherent).
 
 ## Supported trackers
 

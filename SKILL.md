@@ -25,6 +25,7 @@ Load [domain composition](references/domain-composition.md) for handoff, priorit
 - Keep exactly one of `analysis`, `ready`, `in-progress`, `review`, `blocked`, or `done`. The binding's workflow state is authoritative; every configured projection is updated and read back, and `done` is explicit before tracker closure.
 - The selected binding MUST map `ensure_states`, `create`, `list_state`, `claim`, `reclaim`, `verify_claim`, `heartbeat`, `transition`, `comment`, `last_activity`, `label`, `unassign`, `publish_version`, and `close`. Run executable reversible operations instead of reconstructing them; bindings MUST declare unsupported capabilities and fail closed.
 - Issue acceptance criteria, routed domain rules, and repository rules define done. Never invent missing gates or reinterpret the issue silently.
+- Aim for no more than 800 changed lines per pull request, but treat size as reviewability guidance rather than a gate. A larger coherent change is valid when splitting would reduce safety or review quality; the developer records why before review and the independent reviewer assesses that rationale without relaxing any quality gate.
 
 ## Decision Gates
 
@@ -40,7 +41,7 @@ Load [domain composition](references/domain-composition.md) for handoff, priorit
 ## Execution Steps
 
 Before either role's first tracker write in an unfamiliar project, run the selected binding's `ensure_states`; then use that binding's executable operations and readbacks rather than reconstructing them.
-Load [domain composition](references/domain-composition.md) for routing, scale validation, queue partitioning, or autonomous fallback; [runtime notes](references/runtime-notes.md) for invocation, read-only enforcement, independent-context acquisition, or runtime limits; [safety incidents](references/safety-incidents.md) only when claim, reclaim, handoff, or failure rationale is needed; and [repository delivery](references/repository-delivery.md) only when repository rules do not fully define isolation or integration.
+Load [domain composition](references/domain-composition.md) for routing, scale validation, queue partitioning, or autonomous fallback; [runtime notes](references/runtime-notes.md) for invocation, read-only enforcement, independent-context acquisition, or runtime limits; [safety incidents](references/safety-incidents.md) only when claim, reclaim, handoff, or failure rationale is needed; and [repository delivery](references/repository-delivery.md) when repository rules do not fully define isolation, integration, or review-unit sizing.
 
 ### Analyst
 

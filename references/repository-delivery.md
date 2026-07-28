@@ -21,8 +21,9 @@ the operation implementation and exact tracker commands.
 Aim for no more than 800 changed lines in one pull request so an independent reviewer can inspect the
 complete delivery target without losing context. This is a recommendation, not a gate. Use a larger
 coherent pull request when splitting would create unsafe intermediate states, duplicate migrations,
-or otherwise reduce review quality. Record that rationale on the issue or review target; size never
-waives exact-SHA review, tests, CI, authority checks, or any stricter repository rule.
+or otherwise reduce review quality. Before review, the developer records that rationale on the issue
+or review target; the independent reviewer assesses scope coherence and the risk of splitting. Size
+never waives exact-SHA review, tests, CI, authority checks, or any stricter repository rule.
 
 ## Start from a fresh base
 
