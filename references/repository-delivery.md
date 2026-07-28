@@ -1,6 +1,7 @@
 # Repository delivery
 
-Use this fallback when a repository does not define a stricter isolation or integration policy. The
+Use this fallback when a repository does not define stricter isolation, integration, or review-unit
+sizing policy. The
 repository's instructions always win; this reference supplies a floor, not a competing convention.
 The runtime contract still owns role and state decisions, and the
 [abstract binding contract](../SKILL.md#hard-rules) selects
