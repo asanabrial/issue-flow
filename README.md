@@ -82,8 +82,9 @@ workflow already demands).
 
 ## Install
 
-One line. It clones the skill into `~/.agents/skills/issue-flow`, links it into each runtime it
-finds, and — run again later — **upgrades in place while preserving your configuration block**:
+The installer needs Git and Python 3, the same Python runtime used by the GitHub binding. One line
+acquires the current commit into quarantine, materializes its complete Git tree as a new immutable
+bundle, and points `~/.agents/skills/issue-flow` at that bundle:
 
 ```sh
 # macOS / Linux
@@ -95,23 +96,27 @@ curl -fsSL https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.
 irm https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.ps1 | iex
 ```
 
-**The piped script is the installer itself**, and the first thing it does with no skill beside it is
-clone the repository and hand over to its on-disk copy — so everything of substance executes from
-files on your machine, and the settings that remove confirmation steps only ever hold the values you
-put there yourself. Prefer to see everything before anything runs? Same result by hand:
+**The piped script is only a bootstrap.** It disables inherited Git configuration, fetches the
+canonical `main` into a temporary checkout, and hands over to the shared Python installer. The
+installer reads blobs directly from the fetched Git objects, rejects unsafe paths and broken local
+Markdown links, verifies every materialized byte against the commit tree, and activates only after
+the complete bundle is durable. Prefer to inspect the files first? The legacy clone layout is a
+supported one-time migration source:
 
 ```sh
 git clone https://github.com/asanabrial/issue-flow ~/.agents/skills/issue-flow
 ~/.agents/skills/issue-flow/install.sh install
 ```
 
-The skill lives in `~/.agents/skills/issue-flow/` and the installer links it into each runtime's
-skill directory (`~/.claude/skills/`, `~/.codex/skills/`). Run `status` to see what is linked, and
-`uninstall` to remove the links — the skill itself is never touched.
+The stable public path remains `~/.agents/skills/issue-flow/`. Its bundles, Git object store, local
+policy, activation receipt and retained rollback target live under `~/.agents/skills/.issue-flow/`.
+POSIX atomically replaces the public symlink; Windows atomically retargets its directory junction,
+which needs no elevation. Runtime paths under `~/.claude/skills/` and `~/.codex/skills/` point at the
+stable public path. Independent copies are refused because they would remain on stale policy.
 
-On Windows the installer tries a symlink, falls back to a directory junction (which needs no
-elevation) and only then to a copy. If it copies, it says so loudly: copies stop tracking the
-original.
+Run `status` to verify the active commit and tree, `rollback` to reactivate the retained previous
+bundle, and `recover` after an interrupted legacy migration or abandoned installer lock. `uninstall`
+removes only installer-owned runtime links; it never removes bundles, policy or rollback state.
 
 ## Use
 
@@ -164,9 +169,9 @@ its priorities, its evidence requirements and its identity scheme — and never 
 which is what keeps it portable.
 
 **How is my configuration kept across upgrades?**
-Portable defaults live between two markers inside `SKILL.md`. Operator values live separately in
-the ignored `operator.local.md`, so updating or publishing the skill cannot disclose permissions,
-machine paths or tracker identifiers.
+Portable defaults live between two markers inside `SKILL.md`. Operator values live in stable local
+state and are hard-linked into the active bundle as the ignored `operator.local.md`, so updating or
+publishing the skill cannot disclose permissions, machine paths or tracker identifiers.
 
 ## Layout
 
@@ -177,7 +182,8 @@ bindings/linear.md
 bindings/trello.md
 scripts/github.py                 the GitHub binding's reversible operations, executable
 examples/domain-test-coverage.md  a worked domain rule book
-install.sh / install.ps1          self-acquiring installers (pipe them or run them)
+install.sh / install.ps1          thin self-acquiring bootstrap adapters
+scripts/install_bundle.py         shared immutable-bundle transaction implementation
 ```
 
 **Why an operation is a script and not a paragraph.** The failures this workflow keeps recording are
@@ -196,9 +202,10 @@ write deaf, and it never collapses the two.
 
 ## Configuration
 
-Settings live in the ignored `operator.local.md` beside `SKILL.md` — tracker, delivery route, merge
-strategy, worktree location, and whether delivery is pre-authorised. The installer creates it from
-the marked defaults in `SKILL.md` on first use. A pull-request route publishes the branch
+Settings appear as the ignored `operator.local.md` beside `SKILL.md` and persist canonically under
+`~/.agents/skills/.issue-flow/` across bundle switches. They include tracker, delivery route, merge
+strategy, worktree location, and whether delivery is pre-authorised. The `config` command creates
+the file from the marked defaults in `SKILL.md` when needed. A pull-request route publishes the branch
 for independent review, waits for required CI on the latest head, and then merges using the selected
 strategy. When that delivery changes an app or project version, issue-flow creates an annotated,
 immutable tag on the delivered commit and pushes it to the remote before closing the work. GitHub
@@ -212,26 +219,32 @@ Edit it by hand, or from the installer:
 ./install.sh config --set "Worktree location=/wt/<repo>/<branch>"
 ```
 
-The installer matches a setting **by its name** and carries no list of its own, so a default row
-added to the skill is settable immediately without touching either script. It backs the local file
-up first, refuses a name that matches no row or more than one, and refuses a value containing `|`,
-which would split the cell and corrupt the table.
+The installer matches a setting **by its name** and carries no setting list of its own, so a default
+row added to the skill is settable immediately. It backs the stable local file up first, refuses a
+name that matches no row or more than one, and refuses a value containing `|`, which would split the
+cell and corrupt the table.
 
-`sync` upgrades the versioned skill while leaving `operator.local.md` untouched:
+`sync` fetches canonical `main`, validates the complete target tree, and atomically activates its
+bundle while leaving `operator.local.md` byte-identical:
 
 ```sh
-./install.sh sync --from ./newer-SKILL.md
+./install.sh sync
 ```
 
-It backs the skill up first. Never force-add `operator.local.md`: its values are permissions,
-including whether an agent may publish or merge without asking.
+Single-file `--from`/`-From` sync fails before mutation because it cannot prove that required
+references and assets come from the same contract. A failed fetch, validation or materialization
+leaves the active pointer unchanged. The previous complete bundle remains available through
+`rollback`; `recover` reconciles the journal if the one-time legacy directory move was interrupted.
+Never force-add `operator.local.md`: its values are permissions, including whether an agent may
+publish or merge without asking.
 
 ## Status
 
 The workflow, the state machine and the GitHub binding are the mature parts, exercised against a
 live board. **The Linear and Trello bindings are written against their official API documentation
 but have not yet been exercised against a live workspace** — expect the first real run to find
-something. `install.sh` has been tested under Git Bash; the logic is POSIX but it has not run on a
-native Linux or macOS shell.
+something. The installer acceptance suite runs the same migration, update, drift, rollback and
+policy-preservation cases through PowerShell 7, Windows PowerShell 5.1 and Git Bash. The POSIX adapter
+has not yet run on a native Linux or macOS shell.
 
 Licensed GPL-2.0. Issues and corrections welcome, preferably filed through the workflow itself.
