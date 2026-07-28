@@ -684,7 +684,9 @@ legacy_timeline = [comment("untrusted", trusted=False), legacy_claim, comment(m.
 check("unrelated deletion cannot change a legacy epoch ID", [m.reduce_ownership(items, NOW)["holder"] for items in (legacy_timeline, legacy_timeline[1:])], [None, None])
 
 conflicting_release = acquisitions[:1] + [comment(m.marker("standdown", run_id=ME, op_id=OP_A, target_op=target)) for target in (OP_A, OP_B)]
-check("conflicting releases cannot erase their acquisition", m.reduce_ownership(conflicting_release, NOW)["holder"], ME)
+check("a conflicting copy cannot undo the first release", m.reduce_ownership(conflicting_release, NOW)["holder"], None)
+stable_release = acquisitions[:1] + [comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C, target_op=OP_A), "2026-01-02T00:00:01Z"), comment(m.marker("claim", run_id=OTHER, runtime="codex", horizon=FUTURE, op_id=OP_B), "2026-01-02T00:00:02Z"), comment(m.marker("unassign", run_id=ME, runtime="codex", op_id=OP_C, target_op=OP_A), "2026-01-02T00:00:03Z")]
+check("a conflicting late control cannot resurrect ownership", m.reduce_ownership(stable_release, NOW)["holder"], OTHER)
 forged_target = [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_A)), comment(m.marker("claim", run_id=OTHER, runtime="codex", horizon=FUTURE, op_id=OP_B), "2026-01-02T00:00:01Z"), comment(m.marker("standdown", run_id=OTHER, op_id=OP_B, target_op=OP_A), "2026-01-02T00:00:02Z")]
 check("a scoped control cannot release another run's acquisition", m.reduce_ownership(forged_target, NOW)["holder"], ME)
 check("empty operation syntax cannot downgrade to legacy", [m.reduce_ownership(items, NOW)["holder"] for items in ([comment(f"<!-- issue-flow: claim run-id={ME} runtime=opencode horizon={FUTURE} op-id= -->")], acquisitions[:1] + [comment(f"<!-- issue-flow: unassign run-id={ME} op-id= target-op= -->")])], [None, ME])
@@ -699,14 +701,12 @@ check("forced evidence binds the exact takeover metadata", m.reduce_ownership(ed
 right_hash = m.forced_reclaim_hash(OP_C, evidence_digest, OTHER, "codex", FUTURE, ME, OP_B)
 check("forced evidence binds operation identity", [m.reduce_ownership(acquisitions + [comment(f"{m.FORCED_EVIDENCE_HEADING}\n\nreason\n\n{m.marker('reclaim', run_id=OTHER, runtime='codex', horizon=FUTURE, op_id=op, from_op=OP_B, evidence_hash=right_hash, forced='true', evidence='required', **{'from': ME})}", "2026-01-02T00:00:03Z")], NOW)["holder"] for op in (OP_C, "d" * 32)], [OTHER, ME])
 
-activated = [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE)), comment(m.marker("claim", run_id=OTHER, runtime="codex", horizon=FUTURE, op_id=OP_A), "2026-01-02T00:00:01Z"), comment(m.marker("unassign", run_id=ME, runtime="opencode"), "2026-01-02T00:00:02Z")]
-check("activation preserves prior legacy history but blocks later legacy writes", m.reduce_ownership(activated, NOW)["holder"], ME)
-malformed_activation = [activated[0], comment(m.marker("claim", run_id=OTHER, horizon=FUTURE, op_id=OP_A), "2026-01-02T00:00:01Z"), activated[2]]
-check("malformed operation syntax cannot activate an issue", m.reduce_ownership(malformed_activation, NOW)["holder"], None)
-edited_legacy = comment(m.marker("claim", run_id="injected", runtime="opencode", horizon=FUTURE)); edited_legacy["includesCreatedEdit"] = True
-check("edited comments cannot inject legacy ownership", m.reduce_ownership([edited_legacy], NOW)["holder"], None)
 resurrection = acquisitions + [comment(m.marker("heartbeat", run_id=ME), "2026-01-02T00:00:02Z"), comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C, target_op=OP_B), "2026-01-02T00:00:03Z")]
 check("releasing a renewal cannot resurrect its predecessor", m.reduce_ownership(resurrection, NOW)["holder"], None)
+legacy_reacquisition = [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE)), comment(m.marker("unassign", run_id=ME, runtime="opencode"), "2026-01-02T00:00:01Z"), comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE), "2026-01-02T00:00:02Z")]
+check("an intentional legacy reacquisition is not transport deduplication", m.reduce_ownership(legacy_reacquisition, NOW)["holder"], ME)
+legacy_exact = legacy_reacquisition[:1] + [comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C, target_op=m.ownership_epoch(m.ownership_events(legacy_reacquisition[:1])[0])), "2026-01-02T00:00:01Z"), legacy_reacquisition[2]]
+check("an exact release also permits a later legacy reacquisition", m.reduce_ownership(legacy_exact, NOW)["holder"], ME)
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):
         if getattr(self, "outage", False):

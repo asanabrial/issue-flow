@@ -103,8 +103,7 @@ either: **an identity field cannot adjudicate a race between runs that share tha
 
 `SKILL.md` warns that "parsing prose for the same answer is fragile — any rewording breaks it", and
 adjudication used to depend on exactly that. So every control comment the script writes carries a
-machine-readable trailer alongside the sentence a human reads. These first-generation examples are
-retained as historical syntax; current writers add runtime where available:
+machine-readable trailer alongside the sentence a human reads:
 
 ```
 <!-- issue-flow: claim run-id=claude-code-60fabae1 horizon=2026-07-25T23:00Z -->
@@ -157,7 +156,7 @@ ones.
 `<n>` is the issue number throughout. `SCRIPT` abbreviates
 `python <skill>/scripts/github.py --repo-dir <repo>`.
 
-The reducer preserves the first immutable copy of an operation and activates strict epoch semantics per issue at its first operation-scoped marker. Earlier unedited legacy history remains readable and later legacy writes reduce as inert. Current CLI commands still emit legacy markers, so normal issues do not activate until the operation-aware writer slice ships.
+The reducer preserves the first immutable copy of each operation and prevents released renewals from resurrecting superseded epochs, but current commands continue emitting the compatible legacy markers documented below.
 
 | Operation | Command | What it guarantees beyond the obvious |
 |---|---|---|

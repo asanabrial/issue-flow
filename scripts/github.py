@@ -401,29 +401,6 @@ def ownership_epoch(event: dict) -> str:
     return f"legacy-{identity}"
 
 
-def legacy_operation_allowed(comment: dict) -> bool:
-    return comment.get("includesCreatedEdit") is False
-
-
-def valid_operation_marker(mark: dict) -> bool:
-    kind = mark.get("kind")
-    if not mark.get("run-id") or not OPERATION_ID_RE.fullmatch(mark.get("op-id", "")):
-        return False
-    if kind in {"claim", "reclaim"}:
-        return valid_acquisition_marker(mark) and (mark.get("forced") != "true"
-                                                   or bool(mark.get("evidence-hash")))
-    return bool(mark.get("target-op") and (
-        kind == "standdown" and mark["target-op"] == mark["op-id"]
-        or kind == "unassign" and mark.get("runtime")))
-
-
-def operation_activation_position(comments: list[dict]) -> int:
-    return min((position for position, comment in enumerate(comments)
-                if comment.get("viewerDidAuthor") is True and legacy_operation_allowed(comment)
-                for mark in parse_markers(comment.get("body", ""))
-                if valid_operation_marker(mark)), default=len(comments))
-
-
 def forced_evidence_digest(comment: dict, marker_index: int | None) -> str | None:
     body, matches = comment.get("body", ""), list(MARKER_RE.finditer(comment.get("body", "")))
     marker_at = matches[marker_index].start() if marker_index is not None else -1
@@ -476,11 +453,10 @@ def claim_comments(comments: list[dict]) -> list[tuple[str, str, dict]]:
         has_acquisition_marker = any(mark.get("kind") in {"claim", "reclaim"} for mark in parsed)
         for mark in parsed:
             if (mark.get("kind") == "claim" and mark.get("run-id")
-                    and valid_acquisition_marker(mark)
-                    and ("op-id" in mark or legacy_operation_allowed(comment))):
+                    and valid_acquisition_marker(mark)):
                 run_id = mark["run-id"]
                 break
-        if not run_id and not has_acquisition_marker and legacy_operation_allowed(comment):
+        if not run_id and not has_acquisition_marker:
             # Both conditions, never one: the phrase must open the comment AND the horizon clause
             # must be present. A mention like "already claimed by @someone months ago" satisfies
             # neither, and must not be able to unseat a real claim.
@@ -498,13 +474,12 @@ def ownership_events(comments: list[dict]) -> list[dict]:
     claims = {id(comment): run_id for _at, run_id, comment in claim_comments(comments)}
     events = []
     for position, comment in enumerate(comments):
-        if comment.get("viewerDidAuthor") is not True or not legacy_operation_allowed(comment):
+        if comment.get("viewerDidAuthor") is not True:
             continue
         parsed = parse_markers(comment.get("body", ""))
         selected = next(((index, mark) for index, mark in enumerate(parsed)
                          if mark.get("kind") in {"claim", "reclaim"} and mark.get("run-id")
-                         and valid_acquisition_marker(mark)
-                         and ("op-id" in mark or legacy_operation_allowed(comment))), None)
+                         and valid_acquisition_marker(mark)), None)
         marker_index, event = selected if selected else (None, None)
         if not event and id(comment) in claims:
             event = {"kind": "claim", "run-id": claims[id(comment)]}
@@ -535,9 +510,6 @@ def ownership_events(comments: list[dict]) -> list[dict]:
                 "comment": comment,
             })
     ordered = sorted(events, key=lambda item: (stamp_order(item["created_at"]), item["position"]))
-    activation = operation_activation_position(comments)
-    ordered = [event for event in ordered
-               if event["operation_id"] or event["position"] < activation]
     seen, unique = set(), []
     for event in ordered:
         operation_id = event["operation_id"]
@@ -671,9 +643,8 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
                       for event in events if event["kind"] == "reclaim"}
     controls, conflicts = {}, set()
     legacy_release_positions, epoch_release_positions = {}, {}
-    activation = operation_activation_position(comments)
     for position, comment in enumerate(comments):
-        if comment.get("viewerDidAuthor") is not True or not legacy_operation_allowed(comment):
+        if comment.get("viewerDidAuthor") is not True:
             continue
         for marker_index, mark in enumerate(parse_markers(comment.get("body", ""))):
             kind = mark.get("kind")
@@ -684,42 +655,41 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
             operation_scoped = any(key in mark for key in ("op-id", "target-op", "from-op"))
             if (kind in RELEASE_ATTRS_BY_KIND and kind in OPERATION_FIELDS and operation_id
                     and OPERATION_ID_RE.fullmatch(operation_id)):
+                if operation_id in controls or operation_id in conflicts:
+                    continue
                 target = event_by_epoch.get(target_epoch)
-                signature = (kind, *(mark.get(field) for field in OPERATION_FIELDS[kind]))
                 if (not target_epoch or (kind in {"standdown", "unassign"} and (
                         not target or target["run_id"] != mark.get("run-id")
                         or (kind == "standdown" and operation_id != target_epoch)
                         or (kind == "unassign" and (not mark.get("runtime")
-                                                    or target.get("runtime") != mark["runtime"]))))):
-                    conflicts.add(operation_id)
-                elif operation_id in controls and controls[operation_id][0] != signature:
+                                                    or target.get("runtime") != mark["runtime"]))))
+                        or (kind == "unassign" and operation_id in acquisition_ids)):
                     conflicts.add(operation_id)
                 else:
-                    controls.setdefault(operation_id, (signature, target_epoch, position))
-                if kind == "unassign" and operation_id in acquisition_ids:
-                    conflicts.add(operation_id)
+                    controls[operation_id] = (target_epoch, position)
                 continue
             if operation_scoped:
                 # A malformed operation-scoped control must not downgrade into a broad legacy release.
-                continue
-            if position >= activation:
                 continue
             for attr in RELEASE_ATTRS_BY_KIND.get(kind, ()):
                 target = mark.get(attr)
                 if target:
                     legacy_release_positions[target] = max(
                         position, legacy_release_positions.get(target, -1))
-    for operation_id, (_signature, target, position) in controls.items():
-        if operation_id not in conflicts:
-            epoch_release_positions[target] = max(position, epoch_release_positions.get(target, -1))
+    for target, position in controls.values():
+        epoch_release_positions[target] = max(position, epoch_release_positions.get(target, -1))
     takeovers = [index for index, event in enumerate(events) if event["kind"] == "reclaim"]
     candidates = events[takeovers[-1]:] if takeovers else events
     latest_by_run = {}
     for event in candidates:
         previous = latest_by_run.get(event["run_id"])
-        if (previous and previous.get("operation_id") == event.get("operation_id")
+        release = max(legacy_release_positions.get(event["run_id"], -1),
+                      epoch_release_positions.get(ownership_epoch(previous), -1) if previous else -1)
+        released_between = bool(previous and previous["position"] < release < event["position"])
+        same = (previous and previous.get("operation_id") == event.get("operation_id")
                 and all(previous[field] == event[field]
-                        for field in ("kind", "runtime", "horizon", "from", "forced"))):
+                        for field in ("kind", "runtime", "horizon", "from", "forced")))
+        if same and (event.get("operation_id") or not released_between):
             # A hidden first write may be retried. Identical acquisitions keep their earliest
             # server timestamp so a duplicate cannot lose a race that its first write won.
             continue
