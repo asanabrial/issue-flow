@@ -10,7 +10,7 @@ the surviving executable or document owner changes.
 |---|---|---|---|
 | I01 | Correct prose was repeatedly remembered incompletely: board mirroring was skipped for a whole session, five claimed issues were never relabeled, and heartbeat loops wrote without reading. | Put reversible, mechanical operations and their readbacks in the selected binding executable; leave judgement in prose. | `scripts/github.py`; each selected binding's operations table |
 | I04 | A correctly assigned and transitioned issue received its `dev:<runtime>` marker only at close, so live-holder queries could not find it during the build. | Project the bounded runtime marker when work becomes held; do not add a second claim event. | `SKILL.md` dev step 3; binding claim/transition operations |
-| I06 | Five runs died after claim and before transition, leaving assigned issues labeled `ready` after their horizons expired. | Treat claim and state as separate evidence, reclaim from any state, and transition to the state supported by retained work. | `SKILL.md` abandoned-work rules; binding claim/reclaim/transition operations |
+| I06 | Five runs died after claim and before transition, leaving assigned issues labeled `ready` after their horizons expired. | Treat claim and state as separate evidence, reclaim from any state, and transition to the state supported by retained work. | Claim recovery below; binding claim/reclaim/transition operations |
 | I11 | On 2026-07-25, issues #61 and #62 traversed labels through delivery while their configured board cards stayed on `Ready`; the mirror ran zero times. | A transition includes every configured projection and readback; both surfaces must agree before success. | Binding transition executable and board audit; `SKILL.md` state contract |
 | X02 | A tracker that rejects unknown labels can fail only after the analyst has completed all judgement and attempts the first create. | Provision the state vocabulary and supplied marker labels before attaching them; make setup idempotent. | Binding ensure/create operations; `SKILL.md` Hard Rules and Execution Steps |
 
@@ -20,8 +20,26 @@ the surviving executable or document owner changes.
 |---|---|---|---|
 | I02 | On 2026-07-26, a five-minute dev loop repeatedly re-entered selection while already holding one issue and nearly started additional work on every tick. | Resume self-held work before consulting any queue; one run holds one task. | `SKILL.md` dev step 1 |
 | I03 | On 2026-07-24, issue #58 was claimed by two runs 1m46s apart; the loser did not renew before filesystem work and wrote a model, migration, and tests into the winner's checkout. | Verify the live claim immediately before branch, worktree, or file creation; stop if the timeline says another run won. | Binding verify-claim and start-branch operations; `SKILL.md` dev step 4 |
-| I07 | On 2026-07-22, a run lost a claim race by five seconds, was told 33 seconds later, then posted three heartbeats and worked about 48 more minutes without rereading control messages. | Every heartbeat reads before it writes, and the same renewal precedes expensive or irreversible boundaries. | Binding heartbeat/verify-claim operations; `SKILL.md` abandoned-work rules |
-| I08 | Agent-team tasks have remained incomplete and blocked dependants after their session disappeared, requiring manual status repair. | Treat in-session task lists as ephemeral; persist progress on the issue and recover abandoned work from server-timestamped evidence. | `references/runtime-notes.md`; `SKILL.md` abandoned-work rules |
+| I07 | On 2026-07-22, a run lost a claim race by five seconds, was told 33 seconds later, then posted three heartbeats and worked about 48 more minutes without rereading control messages. | Every heartbeat reads before it writes, and the same renewal precedes expensive or irreversible boundaries. | Renewal and reclaim below; binding heartbeat/verify-claim operations |
+| I08 | Agent-team tasks have remained incomplete and blocked dependants after their session disappeared, requiring manual status repair. | Treat in-session task lists as ephemeral; persist progress on the issue and recover abandoned work from server-timestamped evidence. | Renewal and reclaim below; `references/runtime-notes.md` |
+
+### Renewal and reclaim procedure
+
+1. Claim with a declared horizon and persist progress through the binding's heartbeat operation. A
+   note, diagnosis, mention, unrelated update, or control target does not renew ownership.
+2. Every heartbeat runs `verify_claim` before writing. Run the same renewal before filesystem work,
+   evaluation, review, merge, publication, and close. A failed read answered nothing: write nothing
+   and retry the read. A successful stop answer means stop, acknowledge once when the binding asks,
+   release only this runtime's projection, and leave state owned by whoever moved it.
+3. A holder is reclaimable from any state when its attributed activity has passed its declared
+   horizon plus the bounded renewal window, or the binding's legacy window when no horizon exists.
+   Use the binding's reclaim operation and exact target discovery; never infer authority from labels,
+   assignee, prose, or a locally observed worktree alone.
+4. Record who was displaced and the server-timestamped evidence before repository work. Replace the
+   dead runtime projection, retain every branch, diagnosis, ruled-out hypothesis, and partial result,
+   then move to the state supported by that evidence rather than restarting from the displayed label.
+   A live prior holder will receive the takeover through its next renewal and must stand down.
+5. A run ending deliberately uses `unassign`, persists its state and evidence, and needs no reclaim.
 
 ## Repository isolation and immutable evidence
 
@@ -45,7 +63,22 @@ the surviving executable or document owner changes.
 
 | ID | Failure mode and evidence | Protection or invariant | Surviving executable or document owner |
 |---|---|---|---|
-| I09 | Recoverable work was buried by choosing state from the obstacle rather than the evidence: external outages went to analysis, incoherent specifications to blocked, and built work could be hidden as unbuilt. | Route wrong specifications to analysis, unbuilt external waits to blocked, and built-undeliverable work to review; record the evidence and owner of the next action. | `SKILL.md` handoff and state decision gates |
-| I10 | During the session that produced the handoff threshold, a long-running agent repeated its already-documented `$?`-after-a-pipe mistake while debugging. | Hand off after repeating a known mistake, three non-narrowing hypotheses, or more editing than measuring; preserve the diagnosis on the issue. | `SKILL.md` handoff rules |
-| X08 | An issue without acceptance criteria forces the implementer to invent the bar it later claims to have met, and a partial improvement can then masquerade as completion. | Write criteria before implementation or return the issue to analysis; never ship a partial fix as complete. | `SKILL.md` dev/handoff rules; `references/domain-composition.md` |
+| I09 | Recoverable work was buried by choosing state from the obstacle rather than the evidence: external outages went to analysis, incoherent specifications to blocked, and built work could be hidden as unbuilt. | Route wrong specifications to analysis, unbuilt external waits to blocked, and built-undeliverable work to review; record the evidence and owner of the next action. | Handoff procedure below; `SKILL.md` decision gates |
+| I10 | During the session that produced the handoff threshold, a long-running agent repeated its already-documented `$?`-after-a-pipe mistake while debugging. | Hand off after repeating a known mistake, three non-narrowing hypotheses, or more editing than measuring; preserve the diagnosis on the issue. | Handoff procedure below |
+| X08 | An issue without acceptance criteria forces the implementer to invent the bar it later claims to have met, and a partial improvement can then masquerade as completion. | Write criteria before implementation or return the issue to analysis; never ship a partial fix as complete. | Handoff procedure below; `SKILL.md` dev steps; `references/domain-composition.md` |
 | X09 | A blocked item has no natural holder or selection queue; vague conditions and unnamed human decisions therefore become abandoned work. | Name the exact exit condition and its discharger, surface overdue human decisions, and move discharged blockers back to ready. | `SKILL.md` Analyst steps and Decision Gates |
+
+### Handoff and incomplete-work procedure
+
+- Choose from evidence, not frustration: a wrong or contradictory specification returns to
+  `analysis`; an unbuilt external wait goes to `blocked` with its exact exit condition and
+  discharger; built-but-undeliverable work stays in `review`; a useful partial diagnosis returns to
+  `ready`. Never silently reinterpret the issue.
+- Persist ruled-out hypotheses, confirmed evidence, methodological errors, branch/worktree location,
+  and the next action on the issue. Preserve an out-of-scope discovery as a separate finding. Chat
+  and in-session task state are not durable handoff stores.
+- Hand off when a known mistake repeats, three hypotheses fail without narrowing, or editing exceeds
+  measurement. A fresh run with a retained diagnosis is safer than a tired run continuing blindly.
+- Acceptance criteria exist before implementation. If absent, state a narrow defensible contract on
+  the issue or return it to `analysis`; never reconstruct criteria around completed bytes, and never
+  ship a partial fix as complete.
