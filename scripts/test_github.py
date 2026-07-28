@@ -13,6 +13,7 @@ adversarial review of the first version of that file, not from imagination.
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -49,6 +50,7 @@ check("a prose mention is not a claim",
 
 check("claim-shaped prose without a horizon is not a claim",
       m.claim_comments([comment("Claimed by mistake, reverting")]), [])
+check("rejected acquisition markers cannot fall through to claim prose", m.claim_comments([comment("Claimed by ghost, expect to report by later.\n\n<!-- issue-flow: reclaim run-id=ghost runtime=opencode horizon=2026-01-03T00:00Z from-op=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->")]), [])
 
 check("a real legacy claim still parses",
       [r for _, r, _ in m.claim_comments(
@@ -111,7 +113,8 @@ check("previously shipped forced reclaims remain authoritative",
       m.reduce_ownership(LEGACY_FORCED, "2026-01-01T02:01Z")["holder"], "legacy")
 EDITED_FORCED = [dict(item) for item in LEGACY_FORCED]
 EDITED_FORCED[-1]["includesCreatedEdit"] = True
-check("edited pre-cutover comments cannot mint evidence-free reclaims",
+EDITED_FORCED[-1]["body"] = f"{m.FORCED_EVIDENCE_HEADING}\n\nchanged\n\n<!-- issue-flow: reclaim run-id=legacy from=dead-run forced=true evidence=required -->"
+check("edited forced evidence cannot downgrade operation hashing",
       m.reduce_ownership(EDITED_FORCED, "2026-01-01T02:01Z")["holder"], "dead-run")
 
 RAW_FORCED = RECLAIMED[:1] + [comment(
@@ -469,6 +472,7 @@ check("writing a reclaim does not release its author",
 
 NOW = "2026-01-02T00:00Z"
 FUTURE = "2026-01-03T00:00Z"
+OP_A, OP_B, OP_C = "a" * 32, "b" * 32, "c" * 32
 class FakeIssue:
     def __init__(self, comments=None, labels=None):
         self.comments = list(comments or [])
@@ -659,6 +663,42 @@ with m.body_file("evidence") as unused_reason:
         rejected_unused_reason = exc.payload["reason"]
 check("reason files cannot be silently ignored without force", rejected_unused_reason,
       "force-required-for-reason")
+
+duplicate_epoch = [comment(m.marker("claim", run_id=ME, runtime="claude-code", horizon=FUTURE, op_id=OP_A), stamp) for stamp in (NOW, "2026-01-02T00:00:01Z")]
+check("duplicate operation comments reduce to one acquisition event", len(m.ownership_events(duplicate_epoch)), 1)
+conflicting_epoch = duplicate_epoch + [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_A), "2026-01-02T00:00:02Z")]
+check("conflicting copies invalidate an operation", m.reduce_ownership(conflicting_epoch, NOW)["holder"], None)
+acquisitions = [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=op), f"2026-01-02T00:00:0{i}Z") for i, op in enumerate((OP_A, OP_B))]
+delayed_release = acquisitions + [comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C, target_op=OP_A), "2026-01-02T00:00:02Z")]
+check("a delayed release cannot cancel a later reacquisition", m.reduce_ownership(delayed_release, NOW)["event"]["operation_id"], OP_B)
+delayed_standdown = acquisitions + [comment(m.marker("standdown", run_id=ME, op_id=OP_A, target_op=OP_A), "2026-01-02T00:00:02Z")]
+check("a delayed standdown cannot cancel a later reacquisition", m.reduce_ownership(delayed_standdown, NOW)["event"]["operation_id"], OP_B)
+delayed_takeover = delayed_release + [comment(m.marker("reclaim", run_id=OTHER, runtime="codex", horizon=FUTURE, op_id=OP_C, from_op=OP_A, **{"from": ME}), "2026-01-02T00:00:03Z")]
+check("a delayed reclaim cannot take over a later holder epoch", m.reduce_ownership(delayed_takeover, NOW)["event"]["operation_id"], OP_B)
+verify_delayed = FakeIssue(delayed_takeover, ["dev:opencode"])
+with remote(verify_delayed): verify_result = m.do_verify_claim(1, ME, "ready", Path("."))
+check("renewal ignores reducer-invalid delayed controls", verify_result["ok"], True)
+legacy_claim = comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE)); legacy_claim["id"] = "IC_stable"
+legacy_target = m.ownership_epoch(m.ownership_events([legacy_claim])[0])
+legacy_timeline = [comment("untrusted", trusted=False), legacy_claim, comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C, target_op=legacy_target))]
+check("unrelated deletion cannot change a legacy epoch ID", [m.reduce_ownership(items, NOW)["holder"] for items in (legacy_timeline, legacy_timeline[1:])], [None, None])
+
+conflicting_release = acquisitions[:1] + [comment(m.marker("standdown", run_id=ME, op_id=OP_A, target_op=target)) for target in (OP_A, OP_B)]
+check("conflicting release copies invalidate their acquisition", m.reduce_ownership(conflicting_release, NOW)["holder"], None)
+forged_target = [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_A)), comment(m.marker("claim", run_id=OTHER, runtime="codex", horizon=FUTURE, op_id=OP_B), "2026-01-02T00:00:01Z"), comment(m.marker("standdown", run_id=OTHER, op_id=OP_B, target_op=OP_A), "2026-01-02T00:00:02Z")]
+check("a scoped control cannot release another run's acquisition", m.reduce_ownership(forged_target, NOW)["holder"], ME)
+check("empty operation syntax cannot downgrade to legacy", [m.reduce_ownership(items, NOW)["holder"] for items in ([comment(f"<!-- issue-flow: claim run-id={ME} runtime=opencode horizon={FUTURE} op-id= -->")], acquisitions[:1] + [comment(f"<!-- issue-flow: unassign run-id={ME} op-id= target-op= -->")])], [None, ME])
+check("modern acquisitions require complete valid metadata", [m.reduce_ownership([comment(body)], NOW)["holder"] for body in (m.marker("claim", run_id=ME, horizon=FUTURE, op_id=OP_A), m.marker("claim", run_id=ME, runtime="opencode", horizon="2026-99-99T99:99Z", op_id=OP_A), m.marker("reclaim", run_id=OTHER, runtime="codex", horizon=FUTURE, from_op=OP_A, **{"from": ME}))], [None, None, None])
+check("a standdown ID cannot be retargeted to a later same-run epoch", m.reduce_ownership(acquisitions + [comment(m.marker("standdown", run_id=ME, op_id=OP_A, target_op=OP_B), "2026-01-02T00:00:02Z")], NOW)["event"]["operation_id"], OP_B)
+runtime_target = [comment(m.marker("claim", run_id="opencode-owner", runtime="codex", horizon=FUTURE, op_id=OP_A)), comment(m.marker("unassign", run_id="opencode-owner", runtime="opencode", op_id=OP_C, target_op=OP_A))]
+check("scoped unassign requires exact runtime metadata", m.reduce_ownership(runtime_target, NOW)["holder"], "opencode-owner")
+evidence_digest = hashlib.sha256(b"reason").hexdigest()
+wrong_target_hash = m.forced_reclaim_hash(OP_C, evidence_digest, OTHER, "codex", FUTURE, ME, OP_A)
+edited_target = acquisitions + [comment(f"{m.FORCED_EVIDENCE_HEADING}\n\nreason\n\n{m.marker('reclaim', run_id=OTHER, runtime='codex', horizon=FUTURE, op_id=OP_C, from_op=OP_B, evidence_hash=wrong_target_hash, forced='true', evidence='required', **{'from': ME})}", "2026-01-02T00:00:03Z")]
+check("forced evidence binds the exact takeover metadata", m.reduce_ownership(edited_target, NOW)["holder"], ME)
+right_hash = m.forced_reclaim_hash(OP_C, evidence_digest, OTHER, "codex", FUTURE, ME, OP_B)
+check("forced evidence binds operation identity", [m.reduce_ownership(acquisitions + [comment(f"{m.FORCED_EVIDENCE_HEADING}\n\nreason\n\n{m.marker('reclaim', run_id=OTHER, runtime='codex', horizon=FUTURE, op_id=op, from_op=OP_B, evidence_hash=right_hash, forced='true', evidence='required', **{'from': ME})}", "2026-01-02T00:00:03Z")], NOW)["holder"] for op in (OP_C, "d" * 32)], [OTHER, ME])
+
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):
         if getattr(self, "outage", False):
@@ -830,7 +870,7 @@ legacy_reclaim_mismatch = None
 with remote(legacy_reclaim):
     try:
         m.cmd_reclaim(SimpleNamespace(issue=1, run_id="codex-old", runtime="opencode",
-                                      horizon=None, force=False), {}, Path("."))
+                                       horizon=None, force=False), {}, Path("."))
     except m.Stop as exc:
         legacy_reclaim_mismatch = exc.payload["reason"]
 check("metadata-less reclaim retries cannot change inferred runtime",

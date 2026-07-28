@@ -156,6 +156,8 @@ ones.
 `<n>` is the issue number throughout. `SCRIPT` abbreviates
 `python <skill>/scripts/github.py --repo-dir <repo>`.
 
+The reducer recognizes operation-scoped markers and exact acquisition targets for the next transport slice, but current commands continue emitting the compatible legacy markers documented below.
+
 | Operation | Command | What it guarantees beyond the obvious |
 |---|---|---|
 | `ensure_states` | `SCRIPT ensure-states` | idempotent; run it before your first write to an unfamiliar project |

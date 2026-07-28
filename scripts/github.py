@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -84,6 +85,7 @@ STATES = ["analysis", "ready", "in-progress", "review", "blocked", "done"]
 MARKER_RE = re.compile(r"<!--\s*issue-flow:\s*(?P<kind>[a-z-]+)\s+(?P<attrs>[^>]*?)\s*-->")
 MARKER_KEY_RE = re.compile(r"[a-z][a-z-]*")
 HORIZON_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z")
+OPERATION_ID_RE = re.compile(r"[0-9a-f]{32}")
 # The last shipped evidence-free forced event was issue #7 at 11:59:58Z. After this activation
 # boundary, stale clients cannot mint a new "legacy" event by merely omitting the protocol attr.
 FORCED_EVIDENCE_SINCE = "2026-07-27T19:00:00Z"
@@ -375,6 +377,47 @@ def parse_markers(body: str) -> list[dict[str, str]]:
     return found
 
 
+def valid_acquisition_marker(mark: dict) -> bool:
+    if not any(key in mark for key in ("op-id", "from-op", "target-op", "evidence-hash")):
+        return True
+    return bool(OPERATION_ID_RE.fullmatch(mark.get("op-id", "")) and mark.get("runtime")
+                and HORIZON_RE.fullmatch(mark.get("horizon", "")) and parse_stamp(mark["horizon"])
+                and (mark["kind"] == "claim" or (mark.get("from") and mark.get("from-op"))))
+
+
+OPERATION_FIELDS = {
+    "reclaim": ("run-id", "runtime", "horizon", "from", "from-op", "forced", "evidence-hash"),
+    "standdown": ("run-id", "target-op"),
+    "unassign": ("run-id", "runtime", "target-op"),
+}
+
+
+def ownership_epoch(event: dict) -> str:
+    if event.get("operation_id"):
+        return event["operation_id"]
+    comment = event["comment"]
+    identity = comment.get("id") or hashlib.sha256(
+        f"{comment.get('createdAt')}\n{comment.get('body')}".encode()).hexdigest()[:32]
+    return f"legacy-{identity}"
+
+
+def forced_evidence_digest(comment: dict, marker_index: int | None) -> str | None:
+    body, matches = comment.get("body", ""), list(MARKER_RE.finditer(comment.get("body", "")))
+    marker_at = matches[marker_index].start() if marker_index is not None else -1
+    heading_at = body.find(FORCED_EVIDENCE_HEADING)
+    evidence = body[heading_at + len(FORCED_EVIDENCE_HEADING):marker_at].strip()
+    if marker_at < 0 or heading_at < 0 or not evidence or MARKER_RE.search(evidence):
+        return None
+    return hashlib.sha256(evidence.encode()).hexdigest()
+
+
+def forced_reclaim_hash(operation_id: str, evidence: str, run_id: str, runtime: str, horizon: str,
+                        from_run: str, from_operation: str) -> str:
+    fields = ["forced-reclaim-v1", operation_id, True, evidence, run_id, runtime,
+              horizon, from_run, from_operation]
+    return hashlib.sha256(json.dumps(fields, separators=(",", ":")).encode()).hexdigest()
+
+
 # Prose fallback for comments written before markers existed. Deliberately narrow: a comment that
 # merely MENTIONS a run-id is not a control message, and treating one as a stand-down would have a
 # run abandon work nobody asked it to drop.
@@ -406,11 +449,14 @@ def claim_comments(comments: list[dict]) -> list[tuple[str, str, dict]]:
     for comment in comments:
         body = comment.get("body", "")
         run_id = None
-        for mark in parse_markers(body):
-            if mark.get("kind") == "claim" and mark.get("run-id"):
+        parsed = parse_markers(body)
+        has_acquisition_marker = any(mark.get("kind") in {"claim", "reclaim"} for mark in parsed)
+        for mark in parsed:
+            if (mark.get("kind") == "claim" and mark.get("run-id")
+                    and valid_acquisition_marker(mark)):
                 run_id = mark["run-id"]
                 break
-        if not run_id:
+        if not run_id and not has_acquisition_marker:
             # Both conditions, never one: the phrase must open the comment AND the horizon clause
             # must be present. A mention like "already claimed by @someone months ago" satisfies
             # neither, and must not be able to unseat a real claim.
@@ -432,7 +478,8 @@ def ownership_events(comments: list[dict]) -> list[dict]:
             continue
         parsed = parse_markers(comment.get("body", ""))
         selected = next(((index, mark) for index, mark in enumerate(parsed)
-                         if mark.get("kind") in {"claim", "reclaim"} and mark.get("run-id")), None)
+                         if mark.get("kind") in {"claim", "reclaim"} and mark.get("run-id")
+                         and valid_acquisition_marker(mark)), None)
         marker_index, event = selected if selected else (None, None)
         if not event and id(comment) in claims:
             event = {"kind": "claim", "run-id": claims[id(comment)]}
@@ -449,6 +496,10 @@ def ownership_events(comments: list[dict]) -> list[dict]:
                 "horizon": event.get("horizon"),
                 "kind": event["kind"],
                 "from": event.get("from"),
+                "operation_id": event.get("op-id"),
+                "from_operation": event.get("from-op"),
+                "evidence_hash": event.get("evidence-hash"),
+                "evidence_body_hash": forced_evidence_digest(comment, marker_index) if forced else None,
                 "forced": forced,
                 "evidence_required": forced and (
                     event.get("evidence") == "required" or created is None
@@ -458,7 +509,21 @@ def ownership_events(comments: list[dict]) -> list[dict]:
                 "marker_index": marker_index,
                 "comment": comment,
             })
-    return sorted(events, key=lambda item: (stamp_order(item["created_at"]), item["position"]))
+    ordered = sorted(events, key=lambda item: (stamp_order(item["created_at"]), item["position"]))
+    first, conflicts = {}, set()
+    fields = ("kind", "run_id", "runtime", "horizon", "from", "from_operation",
+              "evidence_hash", "evidence_body_hash", "forced")
+    for event in ordered:
+        operation_id = event["operation_id"]
+        if not operation_id:
+            continue
+        signature = tuple(event.get(field) for field in fields)
+        if operation_id in first and first[operation_id][0] != signature:
+            conflicts.add(operation_id)
+        else:
+            first.setdefault(operation_id, (signature, event))
+    return [event for event in ordered if not event["operation_id"] or (
+        event["operation_id"] not in conflicts and first[event["operation_id"]][1] is event)]
 
 
 def released_at(comments: list[dict]) -> dict[str, str]:
@@ -576,22 +641,62 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
     """
     events = [event for event in ownership_events(comments)
               if event["kind"] != "reclaim" or valid_reclaim(event, comments)]
-    takeovers = [index for index, event in enumerate(events) if event["kind"] == "reclaim"]
-    candidates = events[takeovers[-1]:] if takeovers else events
+    acquisition_ids = {event["operation_id"] for event in events if event.get("operation_id")}
+    event_by_epoch = {ownership_epoch(event): event for event in events}
     valid_reclaims = {(event["position"], event["marker_index"])
                       for event in events if event["kind"] == "reclaim"}
-    release_positions = {
-        mark[attr]: position for position, comment in enumerate(comments)
-        if comment.get("viewerDidAuthor") is True
-        for marker_index, mark in enumerate(parse_markers(comment.get("body", "")))
-        if mark.get("kind") != "reclaim" or (position, marker_index) in valid_reclaims
-        for attr in RELEASE_ATTRS_BY_KIND.get(mark.get("kind"), ()) if mark.get(attr)}
+    controls, conflicts = {}, set()
+    legacy_release_positions, epoch_release_positions = {}, {}
+    for position, comment in enumerate(comments):
+        if comment.get("viewerDidAuthor") is not True:
+            continue
+        for marker_index, mark in enumerate(parse_markers(comment.get("body", ""))):
+            kind = mark.get("kind")
+            if kind == "reclaim" and (position, marker_index) not in valid_reclaims:
+                continue
+            target_epoch = mark.get("from-op") if kind == "reclaim" else mark.get("target-op")
+            operation_id = mark.get("op-id")
+            operation_scoped = any(key in mark for key in ("op-id", "target-op", "from-op"))
+            if (kind in RELEASE_ATTRS_BY_KIND and kind in OPERATION_FIELDS and operation_id
+                    and OPERATION_ID_RE.fullmatch(operation_id)):
+                target = event_by_epoch.get(target_epoch)
+                signature = (kind, *(mark.get(field) for field in OPERATION_FIELDS[kind]))
+                if (not target_epoch or (kind in {"standdown", "unassign"} and (
+                        not target or target["run_id"] != mark.get("run-id")
+                        or (kind == "standdown" and operation_id != target_epoch)
+                        or (kind == "unassign" and (not mark.get("runtime")
+                                                    or target.get("runtime") != mark["runtime"]))))):
+                    conflicts.add(operation_id)
+                elif operation_id in controls and controls[operation_id][0] != signature:
+                    conflicts.add(operation_id)
+                else:
+                    controls.setdefault(operation_id, (signature, target_epoch, position))
+                if kind == "unassign" and operation_id in acquisition_ids:
+                    conflicts.add(operation_id)
+                continue
+            if operation_scoped:
+                # A malformed operation-scoped control must not downgrade into a broad legacy release.
+                continue
+            for attr in RELEASE_ATTRS_BY_KIND.get(kind, ()):
+                target = mark.get(attr)
+                if target:
+                    legacy_release_positions[target] = max(
+                        position, legacy_release_positions.get(target, -1))
+    for operation_id, (_signature, target, position) in controls.items():
+        if operation_id not in conflicts:
+            epoch_release_positions[target] = max(position, epoch_release_positions.get(target, -1))
+    events = [event for event in events if event.get("operation_id") not in conflicts]
+    takeovers = [index for index, event in enumerate(events) if event["kind"] == "reclaim"]
+    candidates = events[takeovers[-1]:] if takeovers else events
     latest_by_run = {}
     for event in candidates:
-        if event["position"] > release_positions.get(event["run_id"], -1):
+        released = max(legacy_release_positions.get(event["run_id"], -1),
+                       epoch_release_positions.get(ownership_epoch(event), -1))
+        if event["position"] > released:
             previous = latest_by_run.get(event["run_id"])
-            if previous and all(previous[field] == event[field]
-                                for field in ("kind", "runtime", "horizon", "from", "forced")):
+            if (previous and previous.get("operation_id") == event.get("operation_id")
+                    and all(previous[field] == event[field]
+                            for field in ("kind", "runtime", "horizon", "from", "forced"))):
                 # A hidden first write may be retried. Identical acquisitions keep their earliest
                 # server timestamp so a duplicate cannot lose a race that its first write won.
                 continue
@@ -623,18 +728,24 @@ def holder_uses_runtime(event: dict | None, runtime: str) -> bool:
 
 def valid_reclaim(event: dict, comments: list[dict]) -> bool:
     if event["forced"] and event["evidence_required"]:
-        body = event["comment"].get("body", "")
-        matches = list(MARKER_RE.finditer(body))
-        marker_index = event["marker_index"]
-        marker_at = matches[marker_index].start() if marker_index is not None else -1
-        heading_at = body.find(FORCED_EVIDENCE_HEADING)
-        evidence = body[heading_at + len(FORCED_EVIDENCE_HEADING):marker_at].strip()
-        if marker_at < 0 or heading_at < 0 or not evidence or MARKER_RE.search(evidence):
+        digest = event["evidence_body_hash"]
+        if not digest:
             return False
+        bound = forced_reclaim_hash(event.get("operation_id"), digest, event["run_id"],
+                                    event["runtime"], event["horizon"], event["from"],
+                                    event.get("from_operation"))
+        if (event.get("operation_id") or event["comment"].get("includesCreatedEdit") is not False) and (
+                not event.get("evidence_hash") or bound != event["evidence_hash"]):
+            return False
+    if event.get("operation_id") and not event.get("from_operation"):
+        return False
     prior = reduce_ownership(comments[:event["position"]], event["created_at"])
-    target = prior["event"] or next(
-        (candidate for candidate in prior["stale"] if candidate["run_id"] == event["from"]), None
-    )
+    if event.get("from_operation"):
+        target = next((candidate for candidate in [prior["event"], *prior["stale"]]
+                       if candidate and ownership_epoch(candidate) == event["from_operation"]), None)
+    else:
+        target = prior["event"] or next(
+            (candidate for candidate in prior["stale"] if candidate["run_id"] == event["from"]), None)
     return bool(target and target["run_id"] == event["from"]
                 and (prior["holder"] is None or event["forced"]))
 
@@ -985,7 +1096,8 @@ def projection_state(data: dict) -> tuple[set[str], set[str]]:
 
 
 def ownership_identity(event: dict | None) -> tuple:
-    fields = ("created_at", "position", "run_id", "kind", "runtime", "horizon", "from", "forced")
+    fields = ("created_at", "position", "run_id", "kind", "runtime", "horizon", "from",
+              "operation_id", "forced")
     return tuple((event or {}).get(key) for key in fields)
 
 
@@ -1154,7 +1266,7 @@ def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
         body = comment.get("body", "")
         marks = parse_markers(body)
         controlled = any(
-            is_control_for(mark, run_id)
+            mark.get("kind") not in RELEASE_KINDS and is_control_for(mark, run_id)
             for mark in marks
         )
         if not controlled and not marks:
