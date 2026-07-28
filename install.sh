@@ -10,7 +10,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.sh | sh
 #   ./install.sh status
 #   ./install.sh install [--dry-run]
-#   ./install.sh sync --from <path/to/newer/SKILL.md> [--dry-run]
+#   ./install.sh sync [--from <clean-git-checkout>] [--dry-run]
 #   ./install.sh uninstall [--dry-run]
 #   ./install.sh config [--set '<Setting>=<value>'] [--dry-run]
 
@@ -24,6 +24,7 @@ END='<!-- issue-flow:config:end -->'
 
 # The skill's real home is wherever this script sits.
 CANONICAL=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || CANONICAL=''
+case ${0##*/} in sh|dash|bash|ksh|zsh) CANONICAL='' ;; esac
 
 # Piped (`curl | sh`) or run from outside a checkout, there is no skill next to this script.
 # Then the installer acquires itself - clone on first contact, upgrade after - and hands over to
@@ -47,10 +48,12 @@ if [ ! -f "$CANONICAL/SKILL.md" ] || [ ! -f "$CANONICAL/install.sh" ]; then
         printf 'upgrading %s
 ' "$DEST"
         git -C "$DEST" fetch -q origin
-        git -C "$DEST" checkout -q origin/main -- .
-        git -C "$DEST" reset -q origin/main
+        [ "$(git -C "$DEST" symbolic-ref --quiet --short HEAD)" = main ] &&
+            git -C "$DEST" diff --quiet -- && git -C "$DEST" diff --cached --quiet -- || { printf 'error: upgrade requires clean main.\n' >&2; exit 1; }
+        git -C "$DEST" ls-tree -r --name-only origin/main -- "$CONFIG_FILE" | grep . >/dev/null && { printf 'error: target tracks local operator policy.\n' >&2; exit 1; }
+        git -C "$DEST" merge --ff-only -q origin/main
     fi
-    exec sh "$DEST/install.sh" "${1:-install}"
+    exec sh "$DEST/install.sh" "$@"
 fi
 
 # Per-runtime skill directories that must point at the canonical one. `.agents/skills/` is the
@@ -184,45 +187,47 @@ cmd_uninstall() {
 }
 
 cmd_sync() {
-    installed="$CANONICAL/$SKILL_FILE"
-    [ -f "$FROM" ] || die "$FROM not found."
-    [ -f "$installed" ] || die "$installed not found - nothing to sync."
-
-    # Refusing beats guessing: a sync that cannot locate the block would silently drop the operator's
-    # settings, and they would find out the next time an agent asked for a confirmation it should not
-    # have needed.
-    if ! has_config "$installed"; then
-        printf 'error: config markers not found in the installed skill.\n' >&2
-        printf '       expected %s ... %s\n' "$START" "$END" >&2
-        printf '       refusing to sync - resolve by hand so no settings are lost.\n' >&2
-        exit 1
-    fi
-
-    tmpdir=$(mktemp -d)
-    trap 'rm -rf -- "$tmpdir"' EXIT
-    block="$tmpdir/block"
-    merged="$tmpdir/merged"
-
-    extract_block "$installed" > "$block"
-
-    if has_config "$FROM"; then
-        # The incoming version ships its own block; ours replaces it verbatim.
-        splice_block "$FROM" "$block" > "$merged"
+    git -C "$CANONICAL" rev-parse --git-dir >/dev/null 2>&1 || die "$CANONICAL is not a Git checkout."
+    branch=$(git -C "$CANONICAL" symbolic-ref --quiet --short HEAD) || die 'sync requires the main branch, not detached HEAD.'
+    [ "$branch" = main ] || die "sync requires main; current branch is $branch."
+    for base in $RUNTIME_DIRS; do
+        [ "$(link_kind "$base/$SKILL_NAME")" != directory ] || die "runtime copy $base/$SKILL_NAME would stay stale; remove it and reinstall a link before sync."
+    done
+    git -C "$CANONICAL" diff --quiet -- && git -C "$CANONICAL" diff --cached --quiet -- ||
+        die 'tracked files are dirty; preserve or revert them before sync.'
+    destination_origin=$(git -C "$CANONICAL" remote get-url origin) || die 'origin is not configured.'
+    if [ -n "$FROM" ]; then
+        [ -d "$FROM" ] || die '--from accepts only a clean Git checkout, never a loose SKILL.md.'
+        git -C "$FROM" diff --quiet -- && git -C "$FROM" diff --cached --quiet -- || die 'source checkout is dirty.'
+        source_origin=$(git -C "$FROM" remote get-url origin) || die 'source origin is not configured.'
+        [ "$source_origin" = "$destination_origin" ] || die 'source and destination origins differ.'
+        git -C "$CANONICAL" fetch -q --no-tags "$FROM" HEAD
     else
-        # A template with no block at all: append ours so the settings survive.
-        { cat -- "$FROM"; printf '\n'; cat -- "$block"; } > "$merged"
+        git -C "$CANONICAL" fetch -q --no-tags origin main
     fi
+    target=$(git -C "$CANONICAL" rev-parse 'FETCH_HEAD^{commit}') || die 'fetched target is not a commit.'
+    old=$(git -C "$CANONICAL" rev-parse HEAD)
+    git -C "$CANONICAL" merge-base --is-ancestor "$old" "$target" || die 'target would discard or diverge from local commits.'
+    git -C "$CANONICAL" ls-tree -r --name-only "$target" -- "$CONFIG_FILE" | grep . >/dev/null &&
+        die "$CONFIG_FILE is tracked by the target; refusing to overwrite local policy."
+    locals=$(mktemp); target_paths=$(mktemp); trap 'rm -f -- "$locals" "$target_paths"' EXIT
+    git -C "$CANONICAL" ls-files --others --exclude-standard > "$locals"
+    git -C "$CANONICAL" ls-files --others --ignored --exclude-standard >> "$locals"
+    git -C "$CANONICAL" ls-tree -r --name-only "$target" > "$target_paths"
+    while IFS= read -r local; do
+        awk -v l="$local" '$0 == l || index($0, l "/") == 1 || index(l, $0 "/") == 1 { found=1; exit } END { exit !found }' "$target_paths" &&
+            die "target collides with local path: $local"
+    done < "$locals"
+    local_hash=absent; [ ! -f "$CANONICAL/$CONFIG_FILE" ] || local_hash=$(git hash-object --no-filters "$CANONICAL/$CONFIG_FILE")
+    if [ "$DRY_RUN" -eq 1 ]; then printf 'would   sync Git tree %s -> %s\n' "$old" "$target"; return 0; fi
 
-    chars=$(wc -c < "$block" | tr -d ' ')
-    if [ "$DRY_RUN" -eq 1 ]; then
-        printf 'would   sync %s from %s, preserving %s chars of config\n' "$installed" "$FROM" "$chars"
-        return 0
-    fi
-
-    saved=$(backup_file "$installed")
-    cat -- "$merged" > "$installed"
-    printf 'backup  %s\n' "$saved"
-    printf 'synced  %s  (config preserved: %s chars)\n' "$installed" "$chars"
+    # The clean-tree and collision checks make this hard reset a complete tree transaction rather
+    # than a data-loss shortcut. Git serializes it with index locks and records the old HEAD in reflog.
+    git -C "$CANONICAL" reset --hard -q "$target"
+    [ "$(git -C "$CANONICAL" rev-parse HEAD)" = "$target" ] || die 'Git tree did not reach target commit.'
+    after_hash=absent; [ ! -f "$CANONICAL/$CONFIG_FILE" ] || after_hash=$(git hash-object --no-filters "$CANONICAL/$CONFIG_FILE")
+    [ "$after_hash" = "$local_hash" ] || die "$CONFIG_FILE changed during sync; restore from reflog commit $old."
+    printf 'synced  Git tree %s -> %s  (rollback: git reset --hard %s)\n' "$old" "$target" "$old"
 }
 
 cmd_config() {
@@ -328,6 +333,6 @@ case "$COMMAND" in
     uninstall) cmd_uninstall ;;
     status)    cmd_status ;;
     config)    cmd_config ;;
-    sync)      [ -n "$FROM" ] || die 'sync needs --from <path to the newer SKILL.md>'; cmd_sync ;;
+    sync)      cmd_sync ;;
     *)         die "unknown command: $COMMAND" ;;
 esac

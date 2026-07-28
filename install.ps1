@@ -12,7 +12,7 @@
 .EXAMPLE
     .\install.ps1 status
     .\install.ps1 install -DryRun
-    .\install.ps1 sync -From .\downloaded-SKILL.md
+    .\install.ps1 sync
     .\install.ps1 config -Set 'Tracker=linear'
 #>
 
@@ -41,6 +41,13 @@ $EndMark   = '<!-- issue-flow:config:end -->'
 # The skill's real home is wherever this script sits.
 $Canonical = $PSScriptRoot
 
+function Invoke-Git {
+    param([string]$Path, [string[]]$Arguments)
+    $output = @(& git -C $Path @Arguments 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "git $($Arguments -join ' ') failed ($LASTEXITCODE): $($output -join ' ')" }
+    return ($output -join "`n").Trim()
+}
+
 # Piped (`irm | iex`) there is no script location at all; run from elsewhere, no skill next to it.
 # Either way the installer acquires itself - clone on first contact, upgrade after - and hands over
 # to the on-disk copy, so everything of substance always executes from files you can read. All file
@@ -57,14 +64,21 @@ if (-not $Canonical -or -not (Test-Path (Join-Path $Canonical 'SKILL.md'))) {
     }
     if (-not (Test-Path $Dest)) {
         Write-Host "installing into $Dest"
-        git clone -q --depth 1 $Repo $Dest
+        & git clone -q --depth 1 $Repo $Dest
+        if ($LASTEXITCODE -ne 0) { throw "git clone failed ($LASTEXITCODE)." }
     } else {
         Write-Host "upgrading $Dest"
-        git -C $Dest fetch -q origin
-        git -C $Dest checkout -q origin/main -- .
-        git -C $Dest reset -q origin/main
+        [void](Invoke-Git -Path $Dest -Arguments @('fetch', '-q', 'origin'))
+        if ((Invoke-Git -Path $Dest -Arguments @('symbolic-ref', '--quiet', '--short', 'HEAD')) -ne 'main' -or
+            (Invoke-Git -Path $Dest -Arguments @('status', '--porcelain', '--untracked-files=no'))) { throw 'upgrade requires clean main.' }
+        if (Invoke-Git -Path $Dest -Arguments @('ls-tree', '-r', '--name-only', 'origin/main', '--', $ConfigFile)) { throw 'target tracks local operator policy.' }
+        [void](Invoke-Git -Path $Dest -Arguments @('merge', '--ff-only', '-q', 'origin/main'))
     }
-    & (Join-Path $Dest 'install.ps1') $Command
+    $forward = @{ Command = $Command }
+    if ($From) { $forward.From = $From }
+    if ($Set) { $forward.Set = $Set }
+    if ($DryRun) { $forward.DryRun = $true }
+    & (Join-Path $Dest 'install.ps1') @forward
     return
 }
 
@@ -222,31 +236,64 @@ function Invoke-Uninstall {
 function Invoke-Sync {
     param([string]$Source)
 
-    $installed = Join-Path $Canonical $SkillFile
-    if (-not (Test-Path -LiteralPath $Source))    { throw "$Source not found." }
-    if (-not (Test-Path -LiteralPath $installed)) { throw "$installed not found - nothing to sync." }
+    [void](Invoke-Git -Path $Canonical -Arguments @('rev-parse', '--git-dir'))
+    $branch = Invoke-Git -Path $Canonical -Arguments @('symbolic-ref', '--quiet', '--short', 'HEAD')
+    if ($branch -ne 'main') { throw "sync requires main; current branch is $branch." }
+    foreach ($base in $RuntimeDirs) {
+        $link = Join-Path $base $SkillName
+        if ((Get-LinkKind $link) -eq 'directory') { throw "runtime copy $link would stay stale; remove it and reinstall a link before sync." }
+    }
+    if (Invoke-Git -Path $Canonical -Arguments @('status', '--porcelain', '--untracked-files=no')) {
+        throw 'tracked files are dirty; preserve or revert them before sync.'
+    }
 
-    $newText = Get-Content -LiteralPath $Source -Raw -Encoding UTF8
-    $mine    = Split-Config -Text (Get-Content -LiteralPath $installed -Raw -Encoding UTF8) -Origin 'the installed skill'
-
-    if (Test-HasConfig $newText) {
-        # The incoming version ships its own block; ours replaces it verbatim.
-        $theirs = Split-Config -Text $newText -Origin 'the incoming skill'
-        $merged = $theirs.Before + $mine.Block + $theirs.After
+    $destinationOrigin = Invoke-Git -Path $Canonical -Arguments @('remote', 'get-url', 'origin')
+    if ($Source) {
+        if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
+            throw '-From accepts only a clean Git checkout, never a loose SKILL.md.'
+        }
+        if (Invoke-Git -Path $Source -Arguments @('status', '--porcelain', '--untracked-files=no')) {
+            throw 'source checkout is dirty.'
+        }
+        $sourceOrigin = Invoke-Git -Path $Source -Arguments @('remote', 'get-url', 'origin')
+        if ($sourceOrigin -ne $destinationOrigin) { throw 'source and destination origins differ.' }
+        [void](Invoke-Git -Path $Canonical -Arguments @('fetch', '-q', '--no-tags', $Source, 'HEAD'))
     } else {
-        # A template with no block at all: append ours so the settings survive.
-        $merged = $newText.TrimEnd() + "`n`n" + $mine.Block + "`n"
+        [void](Invoke-Git -Path $Canonical -Arguments @('fetch', '-q', '--no-tags', 'origin', 'main'))
     }
-
-    if ($DryRun) {
-        Write-Host "would   sync $installed from $Source, preserving $($mine.Block.Length) chars of config"
-        return
+    $target = Invoke-Git -Path $Canonical -Arguments @('rev-parse', 'FETCH_HEAD^{commit}')
+    $old = Invoke-Git -Path $Canonical -Arguments @('rev-parse', 'HEAD')
+    & git -C $Canonical merge-base --is-ancestor $old $target
+    if ($LASTEXITCODE -ne 0) { throw 'target would discard or diverge from local commits.' }
+    if (Invoke-Git -Path $Canonical -Arguments @('ls-tree', '-r', '--name-only', $target, '--', $ConfigFile)) {
+        throw "$ConfigFile is tracked by the target; refusing to overwrite local policy."
     }
+    $targetPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    (Invoke-Git -Path $Canonical -Arguments @('ls-tree', '-r', '--name-only', $target)) -split "`n" |
+        Where-Object { $_ } | ForEach-Object { [void]$targetPaths.Add($_) }
+    $locals = @((Invoke-Git -Path $Canonical -Arguments @('ls-files', '--others', '--exclude-standard')) -split "`n")
+    $locals += @((Invoke-Git -Path $Canonical -Arguments @('ls-files', '--others', '--ignored', '--exclude-standard')) -split "`n")
+    if ($locals | Where-Object { $local = $_; $local -and ($targetPaths | Where-Object {
+            $_ -eq $local -or $_.StartsWith("$local/") -or $local.StartsWith("$_/") }) }) {
+        throw 'target collides with an untracked or ignored local file.'
+    }
+    $config = Join-Path $Canonical $ConfigFile
+    $localHash = if (Test-Path -LiteralPath $config -PathType Leaf) {
+        Invoke-Git -Path $Canonical -Arguments @('hash-object', '--no-filters', $config)
+    } else { 'absent' }
+    if ($DryRun) { Write-Host "would   sync Git tree $old -> $target"; return }
 
-    $saved = Backup-File $installed
-    Write-Utf8NoBom -Path $installed -Text $merged
-    Write-Host "backup  $saved"
-    Write-Host "synced  $installed  (config preserved: $($mine.Block.Length) chars)"
+    # Destination tracked state is clean and local collisions were refused, so hard reset is a
+    # complete Git-tree transaction. Git serializes it with index locks and retains reflog recovery.
+    [void](Invoke-Git -Path $Canonical -Arguments @('reset', '--hard', '-q', $target))
+    if ((Invoke-Git -Path $Canonical -Arguments @('rev-parse', 'HEAD')) -ne $target) {
+        throw 'Git tree did not reach target commit.'
+    }
+    $afterHash = if (Test-Path -LiteralPath $config -PathType Leaf) {
+        Invoke-Git -Path $Canonical -Arguments @('hash-object', '--no-filters', $config)
+    } else { 'absent' }
+    if ($afterHash -ne $localHash) { throw "$ConfigFile changed; restore with git reset --hard $old." }
+    Write-Host "synced  Git tree $old -> $target  (rollback: git reset --hard $old)"
 }
 
 function Invoke-Config {
@@ -339,7 +386,6 @@ switch ($Command) {
     'status'    { Invoke-Status }
     'config'    { Invoke-Config -Assignment $Set }
     'sync'      {
-        if (-not $From) { throw "sync needs -From <path to the newer SKILL.md>" }
         Invoke-Sync -Source $From
     }
 }
