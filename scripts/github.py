@@ -555,6 +555,8 @@ def released_at(comments: list[dict]) -> dict[str, str]:
     """
     released: dict[str, str] = {}
     for comment in comments:
+        if comment.get("includesCreatedEdit") is True:
+            continue
         stamp = comment.get("createdAt", "")
         for mark in parse_markers(comment.get("body", "")):
             attrs = RELEASE_ATTRS_BY_KIND.get(mark.get("kind"))
@@ -2326,7 +2328,8 @@ def cmd_unassign(args, config, cwd) -> dict:
     events = ownership["live"] + ownership["stale"]
     mine = next((event for event in events if event["run_id"] == args.run_id), None)
     releases = [mark for comment in data.get("comments", [])
-                if comment.get("viewerDidAuthor") is True
+                if (comment.get("viewerDidAuthor") is True
+                    and comment.get("includesCreatedEdit") is False)
                 for mark in parse_markers(comment.get("body", ""))
                 if mark.get("kind") == "unassign" and mark.get("run-id") == args.run_id]
     if not mine and not releases:
@@ -2359,6 +2362,7 @@ def cmd_unassign(args, config, cwd) -> dict:
         after = wait_for_issue(
             args.issue, "assignees,labels,comments",
             lambda item: any(index > mine["position"] and comment.get("viewerDidAuthor") is True
+                             and comment.get("includesCreatedEdit") is False
                              and marker("unassign", run_id=args.run_id, runtime=args.runtime)
                              in comment.get("body", "")
                              for index, comment in enumerate(item.get("comments", []))),
@@ -2368,6 +2372,9 @@ def cmd_unassign(args, config, cwd) -> dict:
 
     after = after or data
     ownership = reduce_ownership(after.get("comments", []), utc_now_stamp())
+    if mine and any(ownership_epoch(event) == ownership_epoch(mine)
+                    for event in ownership["live"] + ownership["stale"]):
+        raise WriteFailure("release is visible but its target ownership epoch remains authoritative")
     converge_ownership_projection(args.issue, ownership["event"], cwd, login=login)
     if args.held_by_other and not ownership["holder"]:
         raise Stop({"ok": False, "reason": "held-by-other-holder-disappeared"})

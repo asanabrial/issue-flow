@@ -731,6 +731,23 @@ check("an edited heartbeat cannot renew ownership", m.reduce_ownership(edited_he
 edited_adjudication = FakeIssue(acquisitions[:1]); edited_adjudication.comments.append(comment(m.marker("adjudication", run_id=ME), "2026-01-02T00:00:01Z")); edited_adjudication.comments[-1]["includesCreatedEdit"] = True
 with remote(edited_adjudication): edited_adjudication_result = m.do_verify_claim(1, ME, "ready", Path("."))
 check("an edited control message cannot stop the holder", edited_adjudication_result["ok"], True)
+class EditedRelease(FakeIssue):
+    def run(self, argv, cwd=None, check=True, writes=False):
+        result = super().run(argv, cwd=cwd, check=check, writes=writes)
+        if argv[:3] == ["gh", "issue", "comment"]: self.comments[-1]["includesCreatedEdit"] = True
+        return result
+edited_release_write = EditedRelease([comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE))], ["dev:opencode"])
+try:
+    with remote(edited_release_write): m.cmd_unassign(SimpleNamespace(issue=1, run_id=ME, runtime="opencode", held_by_other=False), {}, Path("."))
+except m.WriteFailure: edited_release_result = "ambiguous-write"
+check("unassign cannot confirm an edited release", (edited_release_result, m.reduce_ownership(edited_release_write.comments, NOW)["holder"]), ("ambiguous-write", ME))
+edited_retry_marker = comment(m.marker("unassign", run_id=ME, runtime="opencode")); edited_retry_marker["includesCreatedEdit"] = True
+edited_release_retry = FakeIssue([edited_retry_marker], ["dev:opencode"]); edited_release_retry.assigned = True
+try:
+    with remote(edited_release_retry): m.cmd_unassign(SimpleNamespace(issue=1, run_id=ME, runtime="opencode", held_by_other=False), {}, Path("."))
+except m.Stop as exc: edited_retry_reason = exc.payload["reason"]
+check("edited releases are not retry provenance", (edited_retry_reason, edited_release_retry.assigned), ("nothing-to-unassign", True))
+check("release compatibility ignores edited markers", m.released_at([edited_retry_marker]), {})
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):
         if getattr(self, "outage", False):
