@@ -7,11 +7,21 @@ import os
 import hashlib
 import json
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
 
-from install_bundle import InstallerLock, InstallError, Paths, validate_tree_path
+from install_bundle import (
+    InstallerLock,
+    InstallError,
+    Paths,
+    create_directory_pointer,
+    policy_generation,
+    remove_directory_pointer,
+    replace_hardlink,
+    validate_tree_path,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -110,7 +120,7 @@ def write_contract(repository: Path, version: str, companion: str) -> None:
     (repository / "SKILL.md").write_text(
         "---\nname: issue-flow\nmetadata:\n"
         f"  version: \"{version}\"\n---\n\n"
-        "Load [runtime notes][runtime].\n\n"
+        "Load [runtime].\n\n"
         "[runtime]: references/runtime-notes.md\n\n"
         "<!-- issue-flow:config:start -->\n"
         "| Setting | Value here | Skill default |\n"
@@ -175,6 +185,9 @@ def clone_legacy(remote: Path, target: Path, revision: str) -> None:
     cache = target / ".codegraph"
     cache.mkdir()
     (cache / "index").write_bytes(b"local-index\x00")
+    hook = target / "custom-hook.sh"
+    hook.write_bytes(b"#!/bin/sh\nexit 0\n")
+    os.chmod(hook, 0o755)
 
 
 def external_installer(root: Path, kind: str, repository: str) -> Path:
@@ -308,6 +321,36 @@ for kind, executable in shells():
             result,
         )
         fresh_script = fresh_canonical / ("install.sh" if kind == "POSIX" else "install.ps1")
+        fresh_state = fresh_install_home / ".agents/skills/.issue-flow"
+        (fresh_state / "current.json").unlink()
+        (fresh_state / "transaction.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "phase": "prepared",
+                    "previous": None,
+                    "target": candidate,
+                    "prior_previous": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = command(kind, executable, fresh_script, shell_args(kind, "recover"), fresh_install_home)
+        check(
+            f"{kind} recovers first activation after pointer publication",
+            result.returncode == 0
+            and current_revision(fresh_install_home) == candidate
+            and not (fresh_state / "transaction.json").exists(),
+            result,
+        )
+        (fresh_canonical / "operator.local.md").write_bytes(b"forged local policy\n")
+        result = command(kind, executable, fresh_script, shell_args(kind, "status"), fresh_install_home)
+        check(
+            f"{kind} rejects bundle-local policy without stable state",
+            result.returncode != 0,
+            result,
+        )
+        (fresh_canonical / "operator.local.md").unlink()
         result = command(kind, executable, fresh_script, shell_args(kind, "status"), fresh_install_home)
         check(
             f"{kind} status reports immutable tree and healthy runtime links",
@@ -362,7 +405,10 @@ for kind, executable in shells():
             and current_revision(home) == candidate
             and (installed / "references/runtime-notes.md").read_text(encoding="utf-8") == "candidate companion\n"
             and (installed / "operator.local.md").read_bytes() == LOCAL_POLICY
-            and (installed / ".codegraph/index").read_bytes() == b"local-index\x00",
+            and (installed / ".codegraph/index").read_bytes() == b"local-index\x00"
+            and (installed / "custom-hook.sh").read_bytes() == b"#!/bin/sh\nexit 0\n"
+            and stat.S_IMODE((installed / "custom-hook.sh").stat().st_mode)
+            == stat.S_IMODE((home / ".agents/skills/.issue-flow/local/custom-hook.sh").stat().st_mode),
             result,
         )
 
@@ -391,6 +437,52 @@ for kind, executable in shells():
             result,
         )
 
+        interrupted_policy = configured_policy.replace(
+            b"| Tracker | linear | github |",
+            b"| Tracker | trello | github |",
+        )
+        fixture_paths = Paths.for_home(home)
+        interrupted_generation = policy_generation(fixture_paths, interrupted_policy)
+        replace_hardlink(fixture_paths.config, interrupted_generation)
+        fixture_paths.policy_transaction.write_text(
+            json.dumps({"schema": 1, "generation": interrupted_generation.name}),
+            encoding="utf-8",
+        )
+        result = command(
+            kind,
+            executable,
+            installed / ("install.sh" if kind == "POSIX" else "install.ps1"),
+            shell_args(kind, "config"),
+            home,
+        )
+        configured_policy = (installed / "operator.local.md").read_bytes()
+        check(
+            f"{kind} config retry completes an interrupted policy generation switch",
+            result.returncode == 0
+            and configured_policy == interrupted_policy
+            and not fixture_paths.policy_transaction.exists()
+            and os.path.samefile(installed / "operator.local.md", fixture_paths.config),
+            result,
+        )
+
+        direct_runtime = home / ".claude/skills/issue-flow"
+        remove_directory_pointer(direct_runtime)
+        create_directory_pointer(direct_runtime, installed.resolve(strict=True))
+        result = command(
+            kind,
+            executable,
+            installed / ("install.sh" if kind == "POSIX" else "install.ps1"),
+            shell_args(kind, "install"),
+            home,
+        )
+        check(
+            f"{kind} refuses a runtime pointer that bypasses canonical",
+            result.returncode != 0 and current_revision(home) == candidate,
+            result,
+        )
+        remove_directory_pointer(direct_runtime)
+        create_directory_pointer(direct_runtime, installed)
+
         publish(author, new)
         active_script = installed / ("install.sh" if kind == "POSIX" else "install.ps1")
         result = command(kind, executable, active_script, shell_args(kind, "sync"), home)
@@ -414,6 +506,48 @@ for kind, executable in shells():
 
         state_root = home / ".agents/skills/.issue-flow"
         state_before_dry_rollback = (state_root / "current.json").read_bytes()
+        forged_current = json.loads(state_before_dry_rollback)
+        forged_current["current"] = candidate
+        (state_root / "current.json").write_text(json.dumps(forged_current), encoding="utf-8")
+        result = command(kind, executable, active_script, shell_args(kind, "rollback"), home)
+        check(
+            f"{kind} rollback rejects state that disagrees with the active pointer",
+            result.returncode != 0 and current_revision(home) == new,
+            result,
+        )
+        (state_root / "current.json").write_bytes(state_before_dry_rollback)
+
+        write_contract(author, "9.99.0", "never activated\n")
+        git(author, "add", "-A")
+        git(author, "commit", "-m", "unactivated rollback target")
+        unactivated = git(author, "rev-parse", "HEAD")
+        publish(author, unactivated)
+        object_store = state_root / "repository.git"
+        git(
+            state_root,
+            f"--git-dir={object_store}",
+            "-c",
+            "protocol.file.allow=always",
+            "fetch",
+            "--no-tags",
+            remote.as_uri(),
+            f"{unactivated}:refs/issue-flow/test-unactivated",
+        )
+        publish(author, new)
+        forged_previous = json.loads(state_before_dry_rollback)
+        forged_previous["previous"] = unactivated
+        (state_root / "current.json").write_text(json.dumps(forged_previous), encoding="utf-8")
+        result = command(kind, executable, active_script, shell_args(kind, "rollback"), home)
+        check(
+            f"{kind} rollback rejects a commit that was never activated",
+            result.returncode != 0
+            and current_revision(home) == new
+            and not (state_root / "bundles" / unactivated).exists(),
+            result,
+        )
+        (state_root / "current.json").write_bytes(state_before_dry_rollback)
+        git(state_root, f"--git-dir={object_store}", "update-ref", "-d", "refs/issue-flow/test-unactivated")
+
         result = command(kind, executable, active_script, shell_args(kind, "rollback", "--dry-run"), home)
         check(
             f"{kind} rollback dry-run is strictly read-only",
@@ -514,15 +648,43 @@ for kind, executable in shells():
         )
         result = command(kind, executable, active_script, shell_args(kind, "sync"), home)
         check(
-            f"{kind} can reactivate the published target and prunes older bundles",
+            f"{kind} can reactivate the published target and retains resolved bundles",
             result.returncode == 0
             and current_revision(home) == new
-            and len([path for path in (state_root / "bundles").iterdir() if path.is_dir()]) == 2,
+            and len([path for path in (state_root / "bundles").iterdir() if path.is_dir()]) == 3,
             result,
         )
 
+        obsolete_file = state_root / "bundles" / legacy / "removed.md"
+        obsolete_bytes = obsolete_file.read_bytes()
+        obsolete_file.write_bytes(b"obsolete local damage\n")
+        result = command(kind, executable, active_script, shell_args(kind, "sync"), home)
+        check(
+            f"{kind} obsolete bundle damage does not wedge active sync",
+            result.returncode == 0 and current_revision(home) == new,
+            result,
+        )
+        result = command(kind, executable, active_script, shell_args(kind, "status"), home)
+        check(
+            f"{kind} status reports obsolete bundle damage without failing",
+            result.returncode == 0 and "corrupt=1" in result.stdout,
+            result,
+        )
+        obsolete_file.write_bytes(obsolete_bytes)
+
         lock_path = home / ".agents/skills/.issue-flow/sync.lock"
         state_root = lock_path.parent
+        lock_path.unlink()
+        lock_victim = root / "lock-victim"
+        lock_victim.write_bytes(b"must-survive")
+        os.link(lock_victim, lock_path)
+        result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
+        check(
+            f"{kind} lock refuses an external hard link without truncating it",
+            result.returncode != 0 and lock_victim.read_bytes() == b"must-survive",
+            result,
+        )
+        lock_path.unlink()
         (state_root / "transaction.json").write_text(
             json.dumps(
                 {
@@ -546,6 +708,13 @@ for kind, executable in shells():
             ),
             encoding="utf-8",
         )
+        git(
+            state_root,
+            f"--git-dir={object_store}",
+            "update-ref",
+            "-d",
+            f"refs/issue-flow/bundles/{new}",
+        )
         with InstallerLock(Paths.for_home(home)):
             locked = command(kind, executable, active_script, shell_args(kind, "recover"), home)
         check(
@@ -553,14 +722,27 @@ for kind, executable in shells():
             locked.returncode != 0,
             locked,
         )
+        abandoned_repository = state_root / ".repository-dead"
+        abandoned_repository.mkdir()
+        abandoned_json = state_root / ".current.json.dead.tmp"
+        abandoned_json.write_text("partial", encoding="utf-8")
+        abandoned_activation = home / ".agents/skills/.issue-flow.activate-dead"
+        create_directory_pointer(abandoned_activation, installed.resolve(strict=True))
         result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
         check(
             f"{kind} recovers a post-switch receipt write after lock release",
             result.returncode == 0
             and not (state_root / "transaction.json").exists()
+            and not abandoned_repository.exists()
+            and not abandoned_json.exists()
+            and not os.path.lexists(abandoned_activation)
             and current_revision(home) == new
             and json.loads((state_root / "current.json").read_text(encoding="utf-8"))["previous"] == candidate,
             result,
+        )
+        check(
+            f"{kind} recovery re-retains active Git objects",
+            git(state_root, f"--git-dir={object_store}", "rev-parse", f"refs/issue-flow/bundles/{new}") == new,
         )
 
         outside_backup = root / "outside-backup"
@@ -585,6 +767,29 @@ for kind, executable in shells():
         )
         (state_root / "transaction.json").unlink()
 
+        forged_backup = state_root / "legacy/forged"
+        create_directory_pointer(forged_backup, outside_backup)
+        (state_root / "transaction.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "phase": "moved",
+                    "previous": candidate,
+                    "target": new,
+                    "backup": str(forged_backup),
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
+        check(
+            f"{kind} recovery rejects an in-store backup pointer",
+            result.returncode != 0 and outside_backup.is_dir() and current_revision(home) == new,
+            result,
+        )
+        (state_root / "transaction.json").unlink()
+        remove_directory_pointer(forged_backup)
+
         repository_config = state_root / "repository.git/config"
         safe_config = repository_config.read_bytes()
         with repository_config.open("ab") as handle:
@@ -597,7 +802,6 @@ for kind, executable in shells():
         )
         repository_config.write_bytes(safe_config)
 
-        object_store = state_root / "repository.git"
         git(state_root, f"--git-dir={object_store}", "replace", new, candidate)
         result = command(kind, executable, active_script, shell_args(kind, "sync"), home)
         check(
@@ -632,6 +836,23 @@ for kind, executable in shells():
             result.returncode != 0
             and current_revision(home) == new
             and (installed / "operator.local.md").read_bytes() == configured_policy,
+            result,
+        )
+
+        retained_reader = state_root / "bundles" / candidate / "references/runtime-notes.md"
+        git(author, "reset", "--hard", new)
+        write_contract(author, "1.12.2", "third companion\n")
+        git(author, "add", "-A")
+        git(author, "commit", "-m", "third contract")
+        third = git(author, "rev-parse", "HEAD")
+        publish(author, third)
+        result = command(kind, executable, active_script, shell_args(kind, "sync"), home)
+        check(
+            f"{kind} readers retain resolved bundles across multiple upgrades",
+            result.returncode == 0
+            and current_revision(home) == third
+            and retained_reader.read_text(encoding="utf-8") == "candidate companion\n"
+            and len([path for path in (state_root / "bundles").iterdir() if path.is_dir()]) == 4,
             result,
         )
 

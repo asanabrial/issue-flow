@@ -151,10 +151,18 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def fsync_descriptor(descriptor: int) -> None:
+    os.fsync(descriptor)
+    if sys.platform == "darwin":
+        import fcntl
+
+        fcntl.fcntl(descriptor, 51)  # F_FULLFSYNC reaches stable storage on macOS.
+
+
 def fsync_file(path: Path) -> None:
     descriptor = os.open(path, os.O_RDWR if os.name == "nt" else os.O_RDONLY)
     try:
-        os.fsync(descriptor)
+        fsync_descriptor(descriptor)
     finally:
         os.close(descriptor)
 
@@ -179,6 +187,18 @@ def replace_path(source: Path, destination: Path) -> None:
             fsync_directory(destination_parent)
 
 
+def remove_tree(path: Path, ignore_errors: bool = False) -> None:
+    def make_writable(function, target, _error) -> None:
+        os.chmod(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        function(target)
+
+    try:
+        shutil.rmtree(path, onerror=make_writable)
+    except OSError:
+        if not ignore_errors:
+            raise
+
+
 def write_bytes(path: Path, content: bytes, exclusive: bool = False) -> None:
     flags = os.O_WRONLY | os.O_CREAT | (os.O_EXCL if exclusive else os.O_TRUNC)
     if hasattr(os, "O_NOFOLLOW"):
@@ -188,7 +208,7 @@ def write_bytes(path: Path, content: bytes, exclusive: bool = False) -> None:
         with os.fdopen(descriptor, "wb", closefd=False) as handle:
             handle.write(content)
             handle.flush()
-            os.fsync(handle.fileno())
+            fsync_descriptor(handle.fileno())
     finally:
         os.close(descriptor)
 
@@ -226,7 +246,7 @@ class InstallerLock:
         self.handle = None
 
     def __enter__(self) -> "InstallerLock":
-        self.handle = self.paths.lock.open("a+b")
+        self.handle = open_safe_lock(self.paths.lock)
         try:
             if os.name == "nt":
                 import msvcrt
@@ -267,6 +287,75 @@ class InstallerLock:
             fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
         self.handle.close()
         self.handle = None
+
+
+def open_safe_lock(path: Path):
+    if os.name != "nt":
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except OSError as error:
+            fail(f"cannot open installer lock safely: {error}")
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+            os.close(descriptor)
+            fail(f"installer lock must be a private regular file: {path}")
+        return os.fdopen(descriptor, "r+b", closefd=True)
+
+    import msvcrt
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    class FileInformation(ctypes.Structure):
+        _fields_ = [
+            ("attributes", ctypes.c_uint32),
+            ("creation", FileTime),
+            ("access", FileTime),
+            ("write", FileTime),
+            ("volume", ctypes.c_uint32),
+            ("size_high", ctypes.c_uint32),
+            ("size_low", ctypes.c_uint32),
+            ("links", ctypes.c_uint32),
+            ("index_high", ctypes.c_uint32),
+            ("index_low", ctypes.c_uint32),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    handle = create_file(
+        str(path),
+        0x80000000 | 0x40000000,
+        0x00000001,
+        None,
+        4,
+        0x00000080 | 0x00200000,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        fail(f"cannot open installer lock safely (Windows error {ctypes.get_last_error()})")
+    information = FileInformation()
+    if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(handle)
+        fail(f"cannot inspect installer lock (Windows error {error})")
+    if information.attributes & 0x400 or information.links != 1:
+        kernel32.CloseHandle(handle)
+        fail(f"installer lock must be a private regular file: {path}")
+    descriptor = msvcrt.open_osfhandle(handle, os.O_RDWR)
+    return os.fdopen(descriptor, "r+b", closefd=True)
 
 
 def clean_git_environment() -> dict[str, str]:
@@ -355,6 +444,8 @@ def validate_repository_config(repository: Path) -> None:
     unexpected = set(parser["core"]) - allowed
     if unexpected or parser["core"].get("bare", "").casefold() != "true":
         fail(f"bare repository config is not installer-owned: unexpected={sorted(unexpected)}")
+    if (repository / "objects" / "info" / "alternates").exists():
+        fail(f"bare repository must not use an alternate object database: {repository}")
 
 
 def initialize_repository(paths: Paths) -> None:
@@ -367,7 +458,7 @@ def initialize_repository(paths: Paths) -> None:
             fsync_directory(paths.state)
         finally:
             if staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
+                remove_tree(staging, ignore_errors=True)
     elif is_pointer(paths.repository) or not paths.repository.is_dir():
         fail(f"{paths.repository} is not the installer-owned bare repository")
     validate_repository_config(paths.repository)
@@ -384,25 +475,59 @@ def initialize_state(paths: Paths) -> None:
 def fetch_target(paths: Paths) -> str:
     temporary_ref = "refs/issue-flow/incoming"
     allow_file = "always" if urllib.parse.urlparse(REPOSITORY_URL).scheme == "file" else "never"
-    git(
-        paths,
-        "-c",
-        f"protocol.file.allow={allow_file}",
-        "fetch",
-        "--force",
-        "--no-tags",
-        REPOSITORY_URL,
-        f"+refs/heads/main:{temporary_ref}",
-        repository=paths.repository,
-    )
-    target = git(
-        paths,
-        "rev-parse",
-        f"{temporary_ref}^{{commit}}",
-        repository=paths.repository,
-    ).stdout.strip()
-    validate_commit_id(target)
-    return target
+    staging = paths.state / f".fetch-{uuid.uuid4().hex}"
+    try:
+        git(paths, "init", "--bare", f"--template={paths.template}", str(staging))
+        validate_repository_config(staging)
+        git(
+            paths,
+            "-c",
+            f"protocol.file.allow={allow_file}",
+            "fetch",
+            "--force",
+            "--no-tags",
+            REPOSITORY_URL,
+            f"+refs/heads/main:{temporary_ref}",
+            repository=staging,
+        )
+        target = git(
+            paths,
+            "rev-parse",
+            f"{temporary_ref}^{{commit}}",
+            repository=staging,
+        ).stdout.strip()
+        validate_commit_id(target)
+        copy_object_database(staging / "objects", paths.repository / "objects")
+        git(paths, "cat-file", "-e", f"{target}^{{commit}}", repository=paths.repository)
+        git(paths, "update-ref", temporary_ref, target, repository=paths.repository)
+        return target
+    finally:
+        if staging.exists():
+            remove_tree(staging)
+            fsync_directory(paths.state)
+
+
+def copy_object_database(source: Path, destination: Path) -> None:
+    created_directories: set[Path] = {destination}
+    for item in source.rglob("*"):
+        relative = item.relative_to(source)
+        target = destination / relative
+        if item.is_symlink():
+            fail(f"fetched object database contains a link: {relative}")
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            created_directories.add(target)
+            continue
+        content = item.read_bytes()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        created_directories.add(target.parent)
+        if target.exists():
+            if target.read_bytes() != content:
+                fail(f"fetched Git object conflicts with local object bytes: {relative}")
+            continue
+        write_bytes(target, content, exclusive=True)
+    for directory in sorted(created_directories, key=lambda item: len(item.parts), reverse=True):
+        fsync_directory(directory)
 
 
 def finish_target(paths: Paths, target: str, keep: bool) -> None:
@@ -512,6 +637,9 @@ def validate_markdown_links(bundle: Path, tracked: set[str]) -> None:
         for match in LOCAL_LINK.finditer(text):
             validate_destination(name, match.group(1))
         definitions = {match.group(1).strip().casefold(): match.group(2) for match in REFERENCE_DEFINITION.finditer(text)}
+        for label, destination in definitions.items():
+            if not label.startswith("^"):
+                validate_destination(name, destination)
         for match in REFERENCE_LINK.finditer(text):
             label = (match.group(2) or match.group(1)).strip().casefold()
             if label not in definitions:
@@ -526,6 +654,13 @@ def materialize_bundle(paths: Paths, target: str, require_entrypoints: bool = Tr
     tree = git(paths, "rev-parse", f"{target}^{{tree}}", repository=paths.repository).stdout.strip()
     if final.exists():
         verify_bundle_against_git(paths, final, target, tree, entries)
+        git(
+            paths,
+            "update-ref",
+            f"refs/issue-flow/bundles/{target}",
+            target,
+            repository=paths.repository,
+        )
         return final
     staging = paths.bundles / f".staging-{target}-{uuid.uuid4().hex}"
     staging.mkdir()
@@ -576,9 +711,16 @@ def materialize_bundle(paths: Paths, target: str, require_entrypoints: bool = Tr
         replace_path(staging, final)
         fsync_directory(paths.bundles)
     except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
+        remove_tree(staging, ignore_errors=True)
         raise
     verify_bundle_against_git(paths, final, target, tree, entries)
+    git(
+        paths,
+        "update-ref",
+        f"refs/issue-flow/bundles/{target}",
+        target,
+        repository=paths.repository,
+    )
     return final
 
 
@@ -623,7 +765,9 @@ def verify_bundle(paths: Paths, bundle: Path, expected_commit: str | None = None
     if not isinstance(files, dict):
         fail(f"bundle receipt has no file map: {bundle}")
     expected = set(files)
-    allowed_top = {CONFIG_FILE, RECEIPT_FILE, *(record["name"] for record in attachment_records(paths))}
+    allowed_top = {RECEIPT_FILE, *(record["name"] for record in attachment_records(paths))}
+    if paths.config.exists():
+        allowed_top.add(CONFIG_FILE)
     actual: set[str] = set()
     stack: list[tuple[Path, PurePosixPath]] = [(bundle, PurePosixPath())]
     while stack:
@@ -651,10 +795,10 @@ def verify_bundle(paths: Paths, bundle: Path, expected_commit: str | None = None
         if details.st_nlink != 1:
             fail(f"tracked bundle file has external hard links: {name}")
         if os.name != "nt":
-            executable = bool(details.st_mode & stat.S_IXUSR)
-            expected_executable = bool(int(str(metadata.get("mode")), 8) & stat.S_IXUSR)
-            if executable != expected_executable:
-                fail(f"tracked bundle executable mode drifted: {name}")
+            actual_mode = stat.S_IMODE(details.st_mode)
+            expected_mode = int(str(metadata.get("mode")), 8) & 0o777
+            if actual_mode != expected_mode:
+                fail(f"tracked bundle mode drifted: {name}: {actual_mode:o} != {expected_mode:o}")
         content = path.read_bytes()
         if len(content) != metadata.get("size") or hashlib.sha256(content).hexdigest() != metadata.get("sha256"):
             fail(f"tracked bundle bytes drifted: {name}")
@@ -832,7 +976,7 @@ def create_attachment(path: Path, record: dict[str, str]) -> None:
     if record["kind"] == "directory":
         create_directory_pointer(path, target)
     elif record["kind"] == "file":
-        os.link(target, path)
+        replace_hardlink(path, target)
     else:
         fail(f"unknown local attachment kind: {record['kind']}")
 
@@ -933,13 +1077,32 @@ def recover_policy_transaction(paths: Paths) -> None:
     remove_state_file(paths.policy_transaction)
 
 
+def abandoned_paths(paths: Paths) -> list[Path]:
+    candidates = list(paths.bundles.glob(".staging-*")) if paths.bundles.exists() else []
+    if paths.state.exists():
+        for pattern in (".repository-*", ".fetch-*", ".*.tmp"):
+            candidates.extend(paths.state.glob(pattern))
+    if paths.skills.exists():
+        candidates.extend(paths.skills.glob(f".{SKILL_NAME}.activate-*"))
+    return sorted(set(candidates))
+
+
+def cleanup_abandoned(paths: Paths) -> None:
+    for candidate in abandoned_paths(paths):
+        if is_pointer(candidate):
+            remove_directory_pointer(candidate)
+        elif candidate.is_dir():
+            remove_tree(candidate)
+        else:
+            candidate.unlink(missing_ok=True)
+
+
 def attach_local(paths: Paths, bundle: Path, allow_dangling: bool = False) -> None:
     generation = current_policy_generation(paths)
     if generation:
         destination = bundle / CONFIG_FILE
         if not destination.exists():
-            os.link(generation, destination)
-            fsync_directory(bundle)
+            replace_hardlink(destination, generation)
         elif not os.path.samefile(generation, destination):
             fail(f"bundle policy is not linked to stable local state: {destination}")
     for record in attachment_records(paths):
@@ -976,6 +1139,8 @@ def verify_attachments(paths: Paths, bundle: Path) -> None:
         candidate = bundle / CONFIG_FILE
         if not candidate.exists() or not os.path.samefile(generation, candidate):
             fail(f"active bundle does not expose the stable operator policy: {candidate}")
+    elif path_exists(bundle / CONFIG_FILE):
+        fail(f"bundle contains operator policy without stable installer state: {bundle / CONFIG_FILE}")
     for record in attachment_records(paths):
         candidate = bundle / record["name"]
         target = Path(record["target"])
@@ -997,8 +1162,28 @@ def validate_runtime_paths(paths: Paths) -> None:
             fail(f"runtime skill exists before canonical installation; move it aside first: {runtime}")
         if not is_pointer(runtime):
             fail(f"runtime skill is an independent stale copy; move it aside before sync: {runtime}")
+        if not pointer_targets(runtime, paths.canonical):
+            fail(f"runtime pointer bypasses the stable canonical path: {runtime}")
         if runtime.resolve(strict=True) != canonical_target:
             fail(f"runtime skill does not target the canonical active bundle: {runtime}")
+
+
+def pointer_targets(pointer: Path, expected: Path) -> bool:
+    try:
+        raw = os.readlink(pointer)
+    except OSError:
+        return False
+    if os.name == "nt":
+        if raw.startswith("\\\\?\\UNC\\"):
+            raw = "\\\\" + raw[8:]
+        elif raw.startswith("\\??\\UNC\\"):
+            raw = "\\\\" + raw[8:]
+        elif raw.startswith(("\\\\?\\", "\\??\\")):
+            raw = raw[4:]
+    target = Path(raw)
+    if not target.is_absolute():
+        target = pointer.parent / target
+    return os.path.normcase(os.path.abspath(target)) == os.path.normcase(os.path.abspath(expected))
 
 
 def legacy_git(paths: Paths, *arguments: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -1096,41 +1281,21 @@ def record_current(paths: Paths, current: str, previous: str | None) -> None:
     )
 
 
-def remove_bundle(paths: Paths, bundle: Path) -> None:
-    verify_stored_bundle(paths, bundle)
-    for record in attachment_records(paths):
-        attachment = bundle / record["name"]
-        if not path_exists(attachment):
-            continue
-        if record["kind"] == "directory":
-            remove_directory_pointer(attachment)
-        else:
-            attachment.unlink()
-    (bundle / CONFIG_FILE).unlink(missing_ok=True)
-    shutil.rmtree(bundle)
-    fsync_directory(paths.bundles)
-
-
-def prune_retained_state(paths: Paths) -> None:
+def reconcile_retained_state(paths: Paths) -> None:
     state = read_current_state(paths)
-    keep = {str(state["current"])}
-    if state.get("previous"):
-        keep.add(str(state["previous"]))
-    if paths.transaction.exists():
-        transaction = read_json(paths.transaction)
-        keep.update(str(transaction[key]) for key in ("previous", "target") if transaction.get(key))
+    active, receipt = active_bundle(paths)
+    if state["current"] != receipt["commit"]:
+        fail(f"refusing retention reconciliation: {paths.current} disagrees with active bundle {active}")
     for bundle in paths.bundles.iterdir():
-        if bundle.name.startswith(".staging-") or bundle.name in keep:
+        if bundle.name.startswith(".staging-"):
             continue
         validate_commit_id(bundle.name)
-        remove_bundle(paths, bundle)
         git(
             paths,
             "update-ref",
-            "-d",
             f"refs/issue-flow/bundles/{bundle.name}",
+            bundle.name,
             repository=paths.repository,
-            check=False,
         )
     current_generation = current_policy_generation(paths)
     for generation in paths.policies.iterdir():
@@ -1138,7 +1303,6 @@ def prune_retained_state(paths: Paths) -> None:
             continue
         if generation.is_file() and generation.stat().st_nlink == 1:
             generation.unlink()
-    git(paths, "gc", "--quiet", "--prune=now", repository=paths.repository)
 
 
 def prepare_legacy_local_state(
@@ -1160,6 +1324,9 @@ def prepare_legacy_local_state(
                     fail(f"stable local attachment conflicts with legacy bytes: {destination}")
             else:
                 write_bytes(destination, content, exclusive=True)
+                os.chmod(destination, stat.S_IMODE(source.stat().st_mode))
+                fsync_file(destination)
+                fsync_directory(paths.local)
             records.append({"kind": "file", "name": name, "target": str(destination)})
     write_json(paths.attachments, {"schema": STATE_SCHEMA, "entries": records})
     for bundle in bundles:
@@ -1226,9 +1393,11 @@ def recover_transaction(paths: Paths) -> None:
     transaction = read_json(paths.transaction)
     if transaction.get("schema") != STATE_SCHEMA:
         fail(f"invalid activation transaction schema: {paths.transaction}")
-    previous = str(transaction.get("previous", ""))
+    previous_value = transaction.get("previous")
+    previous = str(previous_value) if previous_value else None
     target = str(transaction.get("target", ""))
-    validate_commit_id(previous)
+    if previous:
+        validate_commit_id(previous)
     validate_commit_id(target)
     prior_previous_value = transaction.get("prior_previous")
     prior_previous = str(prior_previous_value) if prior_previous_value else None
@@ -1238,6 +1407,8 @@ def recover_transaction(paths: Paths) -> None:
     backup = Path(str(backup_value)) if backup_value else None
     if backup and (not backup.is_absolute() or backup.parent.resolve() != paths.legacy.resolve()):
         fail(f"activation transaction backup escapes the legacy store: {backup}")
+    if backup and backup.exists() and (is_pointer(backup) or not backup.is_dir()):
+        fail(f"activation transaction backup is not a real legacy directory: {backup}")
     if is_pointer(paths.canonical):
         _, receipt = active_bundle(paths)
         current = str(receipt["commit"])
@@ -1247,25 +1418,32 @@ def recover_transaction(paths: Paths) -> None:
     if path_exists(paths.canonical):
         remove_state_file(paths.transaction)
         return
-    previous_bundle = paths.bundles / previous
-    if previous and previous_bundle.exists():
+    previous_bundle = paths.bundles / previous if previous else None
+    if previous_bundle and previous_bundle.exists():
         verify_stored_bundle(paths, previous_bundle)
         attach_local(paths, previous_bundle)
         activate(paths, previous_bundle)
         record_current(paths, previous, target or None)
         remove_state_file(paths.transaction)
         return
-    if backup and backup.exists():
-        replace_path(backup, paths.canonical)
+    target_bundle = paths.bundles / target
+    if previous is None and target_bundle.exists():
+        verify_stored_bundle(paths, target_bundle)
+        attach_local(paths, target_bundle)
+        activate(paths, target_bundle)
+        record_current(paths, target, None)
         remove_state_file(paths.transaction)
         return
-    fail(f"incomplete migration cannot find either previous bundle or legacy backup: {paths.transaction}")
+    fail(f"incomplete activation cannot find a verified recovery bundle: {paths.transaction}")
 
 
 def sync_versioned(paths: Paths, target: str) -> None:
     bundle, receipt = active_bundle(paths)
     current = str(receipt["commit"])
     ensure_ancestor(paths, current, target)
+    state = read_current_state(paths)
+    if state["current"] != current:
+        fail(f"current activation receipt disagrees with the active bundle: {paths.current}")
     if current == target:
         print(f"ok      complete bundle already active at {target}")
         return
@@ -1273,9 +1451,6 @@ def sync_versioned(paths: Paths, target: str) -> None:
     attach_local(paths, target_bundle)
     verify_attachments(paths, target_bundle)
     validate_runtime_paths(paths)
-    state = read_current_state(paths)
-    if state["current"] != current:
-        fail(f"current activation receipt disagrees with the active bundle: {paths.current}")
     write_json(
         paths.transaction,
         {
@@ -1333,6 +1508,7 @@ def sync(paths: Paths, dry_run: bool) -> None:
         initialize_repository(paths)
         recover_policy_transaction(paths)
         recover_transaction(paths)
+        cleanup_abandoned(paths)
         validate_runtime_paths(paths)
         target = fetch_target(paths)
         keep = False
@@ -1342,8 +1518,19 @@ def sync(paths: Paths, dry_run: bool) -> None:
             if not path_exists(paths.canonical):
                 target_bundle = paths.bundles / target
                 attach_local(paths, target_bundle)
+                write_json(
+                    paths.transaction,
+                    {
+                        "schema": STATE_SCHEMA,
+                        "phase": "prepared",
+                        "previous": None,
+                        "target": target,
+                        "prior_previous": None,
+                    },
+                )
                 activate(paths, target_bundle)
                 record_current(paths, target, None)
+                remove_state_file(paths.transaction)
                 print(f"installed complete Git tree at {target}")
             elif is_pointer(paths.canonical):
                 sync_versioned(paths, target)
@@ -1354,7 +1541,7 @@ def sync(paths: Paths, dry_run: bool) -> None:
         finally:
             finish_target(paths, target, keep)
         if keep:
-            prune_retained_state(paths)
+            reconcile_retained_state(paths)
 
 
 def ensure_layout(paths: Paths, dry_run: bool) -> None:
@@ -1385,7 +1572,11 @@ def install_runtime_links(paths: Paths, dry_run: bool) -> None:
         if not runtime.parent.parent.exists():
             continue
         if path_exists(runtime):
-            if is_pointer(runtime) and runtime.resolve(strict=True) == paths.canonical.resolve(strict=True):
+            if (
+                is_pointer(runtime)
+                and pointer_targets(runtime, paths.canonical)
+                and runtime.resolve(strict=True) == paths.canonical.resolve(strict=True)
+            ):
                 print(f"ok      {runtime} already targets the active bundle")
                 continue
             fail(f"runtime skill exists independently; move it aside before linking: {runtime}")
@@ -1427,13 +1618,21 @@ def config_block(text: str, origin: Path) -> tuple[int, int, str]:
 
 
 def configure(paths: Paths, assignment: str | None, dry_run: bool) -> None:
-    ensure_layout(paths, dry_run)
-    if dry_run and (not path_exists(paths.canonical) or not is_pointer(paths.canonical)):
-        return
-    context = nullcontext() if dry_run else InstallerLock(paths)
+    if dry_run:
+        ensure_layout(paths, True)
+        if not path_exists(paths.canonical) or not is_pointer(paths.canonical):
+            return
+        context = nullcontext()
+    else:
+        if not path_exists(paths.canonical) or not is_pointer(paths.canonical):
+            sync(paths, False)
+        initialize_directories(paths)
+        context = InstallerLock(paths)
     with context:
         if not dry_run:
+            initialize_repository(paths)
             recover_policy_transaction(paths)
+            recover_transaction(paths)
         bundle, _ = active_bundle(paths)
         template = (bundle / "SKILL.md").read_bytes().decode("utf-8")
         _, _, defaults = config_block(template, bundle / "SKILL.md")
@@ -1476,6 +1675,8 @@ def rollback(paths: Paths, dry_run: bool) -> None:
     if dry_run:
         _, receipt = active_bundle(paths)
         state = read_current_state(paths)
+        if state["current"] != receipt["commit"]:
+            fail(f"current activation receipt disagrees with the active bundle: {paths.current}")
         previous = state.get("previous")
         if not isinstance(previous, str) or not previous:
             fail("no retained previous bundle is recorded")
@@ -1489,10 +1690,15 @@ def rollback(paths: Paths, dry_run: bool) -> None:
         recover_transaction(paths)
         _, receipt = active_bundle(paths)
         state = read_current_state(paths)
+        if state["current"] != receipt["commit"]:
+            fail(f"current activation receipt disagrees with the active bundle: {paths.current}")
         previous = state.get("previous")
         if not isinstance(previous, str) or not previous:
             fail("no retained previous bundle is recorded")
-        previous_bundle = materialize_bundle(paths, previous, require_entrypoints=False)
+        previous_bundle = paths.bundles / previous
+        if not previous_bundle.is_dir():
+            fail(f"recorded rollback bundle was never activated: {previous}")
+        verify_stored_bundle(paths, previous_bundle)
         attach_local(paths, previous_bundle)
         validate_runtime_paths(paths)
         write_json(
@@ -1506,9 +1712,10 @@ def rollback(paths: Paths, dry_run: bool) -> None:
             },
         )
         activate(paths, previous_bundle)
+        validate_runtime_paths(paths)
         record_current(paths, previous, str(receipt["commit"]))
         remove_state_file(paths.transaction)
-        prune_retained_state(paths)
+        reconcile_retained_state(paths)
         print(f"rolled  back {receipt['commit']} -> {previous}")
 
 
@@ -1519,22 +1726,20 @@ def recover(paths: Paths, dry_run: bool) -> None:
             print(f"would   recover transaction {paths.transaction}")
         if paths.policy_transaction.exists():
             print(f"would   recover policy transaction {paths.policy_transaction}")
-        staging = len(list(paths.bundles.glob(".staging-*"))) if paths.bundles.exists() else 0
-        print(f"would   remove {staging} abandoned staging bundle(s)")
+        print(f"would   remove {len(abandoned_paths(paths))} abandoned installer temporary path(s)")
         return
     initialize_directories(paths)
     with InstallerLock(paths):
         initialize_repository(paths)
         recover_policy_transaction(paths)
         recover_transaction(paths)
-        for candidate in paths.bundles.glob(".staging-*"):
-            shutil.rmtree(candidate)
+        cleanup_abandoned(paths)
         if is_pointer(paths.canonical):
             bundle, receipt = active_bundle(paths)
             state = read_current_state(paths) if paths.current.exists() else {}
             previous = state.get("previous") if isinstance(state.get("previous"), str) else None
             record_current(paths, str(receipt["commit"]), previous)
-            prune_retained_state(paths)
+            reconcile_retained_state(paths)
             print(f"recovered active bundle {bundle.name}")
         else:
             print("recovery found no incomplete immutable-bundle activation")
@@ -1544,21 +1749,24 @@ def status(paths: Paths) -> None:
     print(f"canonical  {paths.canonical}")
     if paths.state.exists():
         transactions = [path.name for path in (paths.transaction, paths.policy_transaction) if path.exists()]
-        staging = len(list(paths.bundles.glob(".staging-*"))) if paths.bundles.exists() else 0
+        staging = len(abandoned_paths(paths))
         bundles = [path for path in paths.bundles.iterdir() if path.is_dir()] if paths.bundles.exists() else []
-        bundle_bytes = sum(
-            sum(int(metadata["size"]) for metadata in read_json(bundle / RECEIPT_FILE)["files"].values())
-            for bundle in bundles
-            if (bundle / RECEIPT_FILE).is_file()
-        )
+        bundle_bytes = 0
+        corrupt_bundles = 0
+        for candidate in bundles:
+            try:
+                receipt = verify_stored_bundle(paths, candidate)
+                bundle_bytes += sum(int(metadata["size"]) for metadata in receipt["files"].values())
+            except (InstallError, KeyError, TypeError, ValueError):
+                corrupt_bundles += 1
         repository_bytes = sum(
             item.stat().st_size
             for item in paths.repository.rglob("*")
             if item.is_file() and not item.is_symlink()
         ) if paths.repository.exists() else 0
         store_bytes = bundle_bytes + repository_bytes
-        print(f"store      {len(bundles)} bundle(s), {store_bytes} bytes")
-        print(f"recovery   transactions={transactions or 'none'} staging={staging}")
+        print(f"store      {len(bundles)} bundle(s), {store_bytes} bytes, corrupt={corrupt_bundles}")
+        print(f"recovery   transactions={transactions or 'none'} temporaries={staging}")
     if not path_exists(paths.canonical):
         print("layout     absent")
         return
@@ -1572,6 +1780,7 @@ def status(paths: Paths) -> None:
     print("layout     immutable bundle")
     print(f"active     {receipt['commit']} tree {receipt['tree']}")
     print(f"bundle     {bundle}")
+    print(f"state      {'healthy' if state.get('current') == receipt['commit'] else 'MISMATCH'}")
     print(f"previous   {state.get('previous') or 'none'}")
     print(f"config     {paths.config if paths.config.exists() else 'portable defaults'}")
     for runtime in runtime_paths(paths):
@@ -1579,6 +1788,8 @@ def status(paths: Paths) -> None:
             health = "absent"
         elif not is_pointer(runtime):
             health = "independent"
+        elif not pointer_targets(runtime, paths.canonical):
+            health = f"BYPASS -> {runtime.resolve(strict=True)}"
         else:
             resolved = runtime.resolve(strict=True)
             health = f"healthy -> {resolved.name}" if resolved == bundle else f"STALE -> {resolved}"

@@ -115,11 +115,12 @@ POSIX atomically replaces the public symlink; Windows atomically retargets its d
 which needs no elevation. Runtime paths under `~/.claude/skills/` and `~/.codex/skills/` point at the
 stable public path. Independent copies are refused because they would remain on stale policy.
 
-The store retains only the active and previous bundles after a successful operation. A new load sees
-one complete generation; an already-running load must keep using the immutable path it resolved at
-activation rather than reopen companions through the stable alias. The one-time legacy directory
-move has a brief availability gap, so run that migration between agent sessions; its journal makes an
-interruption recoverable.
+The store retains every activated bundle so an already-running load can keep using the immutable path
+it resolved at activation across any number of later upgrades. `rollback` selects the recorded
+previous generation, while `status` makes total bundle count and storage visible for deliberate
+operator cleanup. A new load sees one complete generation and must not reopen companions through the
+stable alias. The one-time legacy directory move has a brief availability gap, so run that migration
+between agent sessions; its journal makes an interruption recoverable.
 
 Run `status` to verify the active commit, tree, runtime targets and pending recovery state; `rollback`
 reactivates the retained previous bundle, and `recover` completes an interrupted transaction. `uninstall`
