@@ -695,15 +695,43 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
     resurrect when the reclaimed run releases. Within an epoch, each run's newest acquisition is
     its proof, while the earliest live run still wins a normal claim race.
     """
-    events = [event for event in ownership_events(comments)
-              if event["kind"] != "reclaim" or valid_reclaim(event, comments)]
-    first_operations = first_operation_markers(comments)
+    return _reduce_ownership(comments, now, authoritative_ownership_events(comments))
+
+
+def event_history(events: list[dict]) -> dict[str, list[dict]]:
+    # Epoch windows drop old candidates, but broad legacy releases still need to know whether the
+    # target's preceding acquisition was modern; keep that context indexed by global position.
+    history: dict[str, list[dict]] = {}
+    for event in sorted(events, key=lambda item: item["position"]):
+        history.setdefault(event["run_id"], []).append(event)
+    return history
+
+
+def latest_event_before(history: dict[str, list[dict]], run_id: str, position: int) -> dict | None:
+    candidates = history.get(run_id, ())
+    low, high = 0, len(candidates)
+    while low < high:
+        middle = (low + high) // 2
+        if candidates[middle]["position"] < position:
+            low = middle + 1
+        else:
+            high = middle
+    return candidates[low - 1] if low else None
+
+
+def _reduce_ownership(comments: list[dict], now: str, events: list[dict], start_position: int = 0,
+                      first_operations: dict | None = None,
+                      history: dict[str, list[dict]] | None = None) -> dict:
+    if first_operations is None:
+        first_operations = first_operation_markers(comments)
+    if history is None:
+        history = event_history(events)
     event_by_epoch = {ownership_epoch(event): event for event in events}
     valid_reclaims = {(event["position"], event["marker_index"])
                       for event in events if event["kind"] == "reclaim"}
     controls, conflicts, companions = {}, set(), set()
     legacy_release_positions, epoch_release_positions, epoch_release_history = {}, {}, {}
-    for position, comment in enumerate(comments):
+    for position, comment in enumerate(comments[start_position:], start_position):
         if comment.get("viewerDidAuthor") is not True:
             continue
         for marker_index, mark in enumerate(parse_markers(comment.get("body", ""))):
@@ -750,9 +778,7 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
                 if target:
                     # Broad legacy controls remain compatible only while the target's latest epoch
                     # is legacy; otherwise a delayed old retry could erase a modern reacquisition.
-                    latest = max((event for event in events if event["run_id"] == target
-                                  and event["position"] < position),
-                                 key=lambda event: event["position"], default=None)
+                    latest = latest_event_before(history, target, position)
                     if latest and latest.get("operation_id"):
                         continue
                     legacy_release_positions[target] = max(
@@ -785,7 +811,8 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
                                                 epoch_release_positions.get(ownership_epoch(event), -1))}
 
     moment = parse_stamp(now)
-    trusted = [comment for comment in comments if comment.get("viewerDidAuthor") is True]
+    trusted = [comment for comment in comments[start_position:]
+               if comment.get("viewerDidAuthor") is True]
     live, stale = [], []
     for event in sorted(latest_by_run.values(),
                         key=lambda item: (stamp_order(item["created_at"]), item["position"])):
@@ -808,7 +835,7 @@ def holder_uses_runtime(event: dict | None, runtime: str) -> bool:
     ))
 
 
-def valid_reclaim(event: dict, comments: list[dict]) -> bool:
+def reclaim_proof_is_valid(event: dict) -> bool:
     if event["forced"] and event["evidence_required"]:
         digest = event["evidence_body_hash"]
         if not digest:
@@ -821,7 +848,16 @@ def valid_reclaim(event: dict, comments: list[dict]) -> bool:
             return False
     if event.get("operation_id") and not event.get("from_operation"):
         return False
-    prior = reduce_ownership(comments[:event["position"]], event["created_at"])
+    return True
+
+
+def _valid_reclaim(event: dict, comments: list[dict], prior_events: list[dict],
+                   history: dict[str, list[dict]], start_position: int,
+                   first_operations: dict) -> bool:
+    if not reclaim_proof_is_valid(event):
+        return False
+    prior = _reduce_ownership(comments[:event["position"]], event["created_at"], prior_events,
+                              start_position, first_operations, history)
     if event.get("from_operation"):
         target = next((candidate for candidate in [prior["event"], *prior["stale"]]
                        if candidate and ownership_epoch(candidate) == event["from_operation"]), None)
@@ -832,6 +868,68 @@ def valid_reclaim(event: dict, comments: list[dict]) -> bool:
                 and (event.get("operation_id") or not target.get("operation_id"))
                 and target["run_id"] == event["from"]
                 and (prior["holder"] is None or event["forced"]))
+
+
+def comments_are_chronological(comments: list[dict]) -> bool:
+    ownership_kinds = RELEASE_KINDS | ACTIVITY_KINDS | {"claim"}
+    relevant = [comment for comment in comments if comment.get("viewerDidAuthor") is True and (
+        any(mark.get("kind") in ownership_kinds
+            for mark in parse_markers(comment.get("body", ""))) or (
+            CLAIM_PROSE.match(comment.get("body", ""))
+            and CLAIM_HORIZON_PROSE.search(comment.get("body", ""))))]
+    return all(stamp_order(previous.get("createdAt", "")) <= stamp_order(current.get("createdAt", ""))
+               for previous, current in zip(relevant, relevant[1:]))
+
+
+def valid_reclaim(event: dict, comments: list[dict]) -> bool:
+    """Validate the supplied takeover after reducing each predecessor exactly once."""
+    events = ownership_events(comments)
+    _, prior_events, history, start_position, first_operations = reclaim_validation_state(
+        events, comments, event["position"])
+    return _valid_reclaim(event, comments, prior_events, history, start_position, first_operations)
+
+
+def reclaim_validation_state(events: list[dict], comments: list[dict],
+                             before_position: int | None = None) -> tuple:
+    """Reduce takeover dependencies bottom-up so a deep history cannot branch recursively."""
+    valid: set[tuple[int, int]] = set()
+    prior_events: list[dict] = []
+    history: dict[str, list[dict]] = {}
+    start_position = 0
+    chronological = comments_are_chronological(comments)
+    first_operations = first_operation_markers(comments)
+    for event in sorted(events, key=lambda item: (item["position"], item["marker_index"])):
+        if before_position is not None and event["position"] >= before_position:
+            break
+        if event["kind"] == "reclaim":
+            ordered_prior = prior_events if chronological else sorted(
+                prior_events, key=lambda item: (stamp_order(item["created_at"]), item["position"]))
+            if not _valid_reclaim(
+                    event, comments, ordered_prior, history, start_position, first_operations):
+                continue
+            valid.add((event["position"], event["marker_index"]))
+            if chronological:
+                # An accepted takeover makes earlier candidates unable to resurrect. Out-of-order
+                # fixtures retain the full prefix because timestamp order can move that boundary.
+                prior_events = []
+                start_position = event["position"]
+        prior_events.append(event)
+        history.setdefault(event["run_id"], []).append(event)
+    if not chronological:
+        prior_events.sort(key=lambda item: (stamp_order(item["created_at"]), item["position"]))
+    return valid, prior_events, history, start_position, first_operations
+
+
+def valid_reclaim_positions(events: list[dict], comments: list[dict],
+                            before_position: int | None = None) -> set[tuple[int, int]]:
+    return reclaim_validation_state(events, comments, before_position)[0]
+
+
+def authoritative_ownership_events(comments: list[dict]) -> list[dict]:
+    events = ownership_events(comments)
+    valid_reclaims = valid_reclaim_positions(events, comments)
+    return [event for event in events if event["kind"] != "reclaim"
+            or (event["position"], event["marker_index"]) in valid_reclaims]
 
 
 def utc_now_stamp() -> str:
@@ -2625,9 +2723,8 @@ def cmd_unassign(args, config, cwd) -> dict:
     if existing:
         target_epoch = existing.get("target-op")
         control_position = first_operation_markers(comments)[operation_id][0]
-        target = next((event for event in ownership_events(comments)
-                       if (event["kind"] != "reclaim" or valid_reclaim(event, comments))
-                       and event["position"] < control_position
+        target = next((event for event in authoritative_ownership_events(comments)
+                       if event["position"] < control_position
                        and ownership_epoch(event) == target_epoch
                        and event["run_id"] == args.run_id
                        and event.get("runtime") in {None, args.runtime}), None)
