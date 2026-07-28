@@ -450,13 +450,13 @@ def claim_comments(comments: list[dict]) -> list[tuple[str, str, dict]]:
         body = comment.get("body", "")
         run_id = None
         parsed = parse_markers(body)
-        has_claim_marker = any(mark.get("kind") == "claim" for mark in parsed)
+        has_acquisition_marker = any(mark.get("kind") in {"claim", "reclaim"} for mark in parsed)
         for mark in parsed:
             if (mark.get("kind") == "claim" and mark.get("run-id")
                     and valid_acquisition_marker(mark)):
                 run_id = mark["run-id"]
                 break
-        if not run_id and not has_claim_marker:
+        if not run_id and not has_acquisition_marker:
             # Both conditions, never one: the phrase must open the comment AND the horizon clause
             # must be present. A mention like "already claimed by @someone months ago" satisfies
             # neither, and must not be able to unseat a real claim.

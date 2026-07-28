@@ -50,6 +50,7 @@ check("a prose mention is not a claim",
 
 check("claim-shaped prose without a horizon is not a claim",
       m.claim_comments([comment("Claimed by mistake, reverting")]), [])
+check("rejected acquisition markers cannot fall through to claim prose", m.claim_comments([comment("Claimed by ghost, expect to report by later.\n\n<!-- issue-flow: reclaim run-id=ghost runtime=opencode horizon=2026-01-03T00:00Z from-op=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->")]), [])
 
 check("a real legacy claim still parses",
       [r for _, r, _ in m.claim_comments(
