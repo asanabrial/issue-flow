@@ -34,12 +34,11 @@ Place each implementation checkout outside the base working tree and include the
 in its parent path. A shared parent keyed only by branch can collide across repositories, while an
 in-tree worktree pollutes status and ignore behavior for every run.
 
-The worktree path MUST be unique per run. Version-control registration protects a branch, not a
-process: during reclaim, a displaced process may still be writing its registered checkout until its
-next renewal. Resume only the current run's registered path; a branch registered anywhere else needs
-an explicit handoff and removal after its work is preserved. Reject every foreign or orphaned
-directory. Tools with per-checkout indexes or caches get a fresh local instance rather than one
-copied or linked from another checkout.
+The worktree strategy MUST prevent two live runs from writing the same directory. Either make the
+path unique per run or rely on the version-control registration of one common issue branch; under the
+latter strategy, resume only a registered checkout for that exact branch and reject every foreign or
+orphaned directory. Tools with per-checkout indexes or caches get a fresh local instance rather than
+one copied or linked from another checkout.
 
 Confirm isolation before the first edit and whenever the tree changes unexpectedly. Stop writing and
 renew the claim. A losing run leaves the tree untouched and records where its own work is; the winning

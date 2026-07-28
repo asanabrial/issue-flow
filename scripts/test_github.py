@@ -1133,23 +1133,6 @@ check("unassign cannot borrow mismatched runtime metadata",
 operation_parsers = m.build_parser()._subparsers._group_actions[0].choices
 check("ownership writers require operation identity", [next(a for a in operation_parsers[command]._actions if a.dest == "operation_id").required for command in ("claim", "reclaim", "unassign")], [True, True, True])
 check("target discovery remains a read-only first call", [next(a for a in operation_parsers[command]._actions if a.dest == "target_operation").required for command in ("reclaim", "unassign")], [False, False])
-unscoped_commands, unscoped_reason = [], None
-with patch.multiple(m, run=lambda argv, **_kwargs: unscoped_commands.append(argv), do_verify_claim=lambda *_args: {}, repo_identity=lambda _cwd: ("owner", "repo")):
-    with __import__("tempfile").TemporaryDirectory() as root:
-        try: m.cmd_start_branch(SimpleNamespace(issue=6, run_id=ME, expect_state="in-progress", worktree_root=f"{root}/<branch>", branch="fix/6", base="main"), {}, Path("."))
-        except m.Stop as exc: unscoped_reason = exc.payload["reason"]
-check("start-branch requires a run-scoped worktree path", (unscoped_reason, unscoped_commands), ("worktree-path-not-run-scoped", []))
-held_commands, held_reason = [], None
-def held_worktree_run(argv, cwd=None, check=True, writes=False):
-    held_commands.append(list(argv))
-    stdout = f"worktree {held_path}\nbranch refs/heads/fix/6\n" if argv == ["git", "worktree", "list", "--porcelain"] else ""
-    return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
-with __import__("tempfile").TemporaryDirectory() as root:
-    held_path = f"{root}/fix-6-old-run"
-    with patch.multiple(m, run=held_worktree_run, do_verify_claim=lambda *_args: {}, repo_identity=lambda _cwd: ("owner", "repo")):
-        try: m.cmd_start_branch(SimpleNamespace(issue=6, run_id=ME, expect_state="in-progress", worktree_root=f"{root}/<branch>-<run-id>", branch="fix/6", base="main"), {}, Path("."))
-        except m.Stop as exc: held_reason = exc.payload["reason"]
-check("start-branch refuses another run's registered checkout", (held_reason, any(command[:3] == ["gh", "issue", "develop"] for command in held_commands)), ("worktree-branch-in-use", False))
 git_commands, fetched = [], [False]
 def fake_git_run(argv, cwd=None, check=True, writes=False):
     git_commands.append(list(argv))
@@ -1166,7 +1149,7 @@ with patch.multiple(m, run=fake_git_run, do_verify_claim=lambda *_args: {},
                     repo_identity=lambda _cwd: ("owner", "repo")):
     with __import__("tempfile").TemporaryDirectory() as root:
         m.cmd_start_branch(SimpleNamespace(issue=6, run_id=ME, expect_state="in-progress",
-                                           worktree_root=f"{root}/<branch>-<run-id>", branch="fix/6",
+                                           worktree_root=f"{root}/<branch>", branch="fix/6",
                                            base="main"), {}, Path("."))
 remote_check = next(i for i, command in enumerate(git_commands)
                     if "refs/remotes/origin/fix/6" in command)

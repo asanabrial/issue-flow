@@ -284,16 +284,25 @@ The worktree path comes from the `Worktree location` configuration row, with `<r
 `<issue>` and `<run-id>` substituted; every component is flattened, so a `docs/113-…` branch does not
 create a stray `docs/` directory under the worktree root.
 
-**The path must be run-scoped, normally as `…/<branch>-<run-id>`.** Git registers a branch to a
-worktree, not a process to a directory. During reclaim, the displaced process can remain alive until
-its next renewal; reusing its registered branch-only checkout would let both runs write there. This
-is how issue #58 acquired one directory containing two runs' model, migration and tests.
+**What the path must guarantee is that no two live runs share a directory** — not that it contains
+any particular token. Two templates achieve that differently, and the choice is a real trade:
 
-`start-branch` therefore rejects templates that contain neither `<run-id>` nor the current run-id as
-a bounded token. A registered worktree at this run's resolved path is a resume and is reported as
-`resumed_existing_worktree`. The same branch registered anywhere else is an active handoff blocker:
-preserve its work, prove the prior holder stopped, remove that worktree, then retry. Foreign paths and
-unregistered orphan directories are likewise refused.
+| Template | Collision is prevented by | Cost |
+|---|---|---|
+| `…/<branch>-<run-id>` | construction — no two runs ever compute the same path | one orphan directory per run that dies; they accumulate |
+| `…/<branch>` | git itself — `worktree add` refuses a branch already checked out elsewhere (`fatal: '<branch>' is already used by worktree at …`) | needs the resume check below to be correct |
+
+The second is safe only because the branch carries the issue number, so two runs on one issue compute
+the same BRANCH and git blocks the second checkout. It was NOT safe in the original convention, where
+the path was derived from the issue while the branch varied — that is how, on 2026-07-24, two runs
+derived the same directory and the loser wrote its model, its migration and its tests into the
+winner's checkout mid-build.
+
+**So `start-branch` asks whether the directory is YOURS, not whether it exists.** A registered
+worktree for this exact branch is a resume: it is reused and reported as `resumed_existing_worktree`.
+Anything else — a stranger's checkout, or an orphan left by a dead run — is refused, because writing
+into either is the failure above. Merely refusing every existing path would make resume impossible
+under a run-id-free template while protecting against nothing git had not already caught.
 
 **A fresh worktree does not have the files git never tracked.** Everything gitignored — environment
 files, secrets, credentials, local settings — is simply absent, and the failure it produces is
