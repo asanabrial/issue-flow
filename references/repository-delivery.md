@@ -16,6 +16,14 @@ the operation implementation and exact tracker commands.
   changed byte invalidates prior evidence.
 - Preserve unfinished work and its diagnosis. A handoff is safer than an unverified merge.
 
+## Keep review units coherent
+
+Aim for no more than 800 changed lines in one pull request so an independent reviewer can inspect the
+complete delivery target without losing context. This is a recommendation, not a gate. Use a larger
+coherent pull request when splitting would create unsafe intermediate states, duplicate migrations,
+or otherwise reduce review quality. Record that rationale on the issue or review target; size never
+waives exact-SHA review, tests, CI, authority checks, or any stricter repository rule.
+
 ## Start from a fresh base
 
 1. Read the repository instructions before choosing branch, worktree, integration, test, or merge

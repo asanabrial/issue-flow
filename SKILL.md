@@ -4,7 +4,7 @@ description: "Trigger: issue-flow analyst [conditions], issue-flow dev, analyst,
 license: GPL-2.0
 metadata:
   author: asanabrial
-  version: "1.10.0"
+  version: "1.11.0"
 ---
 
 # Issue Flow — Analyst / Dev over a shared issue tracker
