@@ -82,7 +82,7 @@ workflow already demands).
 
 ## Install
 
-The installer needs Git and Python 3, the same Python runtime used by the GitHub binding. One line
+The installer needs Git and Python 3.10 or newer, the same Python runtime used by the GitHub binding. One line
 acquires the current commit into quarantine, materializes its complete Git tree as a new immutable
 bundle, and points `~/.agents/skills/issue-flow` at that bundle:
 
@@ -109,13 +109,20 @@ git clone https://github.com/asanabrial/issue-flow ~/.agents/skills/issue-flow
 ```
 
 The stable public path remains `~/.agents/skills/issue-flow/`. Its bundles, Git object store, local
-policy, activation receipt and retained rollback target live under `~/.agents/skills/.issue-flow/`.
+policy generations, activation receipt and retained rollback target live under
+`~/.agents/skills/.issue-flow/`.
 POSIX atomically replaces the public symlink; Windows atomically retargets its directory junction,
 which needs no elevation. Runtime paths under `~/.claude/skills/` and `~/.codex/skills/` point at the
 stable public path. Independent copies are refused because they would remain on stale policy.
 
-Run `status` to verify the active commit and tree, `rollback` to reactivate the retained previous
-bundle, and `recover` after an interrupted legacy migration or abandoned installer lock. `uninstall`
+The store retains only the active and previous bundles after a successful operation. A new load sees
+one complete generation; an already-running load must keep using the immutable path it resolved at
+activation rather than reopen companions through the stable alias. The one-time legacy directory
+move has a brief availability gap, so run that migration between agent sessions; its journal makes an
+interruption recoverable.
+
+Run `status` to verify the active commit, tree, runtime targets and pending recovery state; `rollback`
+reactivates the retained previous bundle, and `recover` completes an interrupted transaction. `uninstall`
 removes only installer-owned runtime links; it never removes bundles, policy or rollback state.
 
 ## Use
@@ -196,14 +203,14 @@ per-run worktree path, PR reuse, the closing-keyword scan — execute as code, a
 **judgement** stay in prose. Irreversible remote writes (merge, version tags, close) are deliberately
 left to the agent: a defect in a script must not be able to merge, tag or close anything.
 
-The script needs Python 3 and `gh`. Its exit codes separate "a check said stop" from "the read
+The script needs Python 3.10 or newer and `gh`. Its exit codes separate "a check said stop" from "the read
 failed" — treating a timeout as a stand-down halts every run, treating it as clearance lets a run
 write deaf, and it never collapses the two.
 
 ## Configuration
 
-Settings appear as the ignored `operator.local.md` beside `SKILL.md` and persist canonically under
-`~/.agents/skills/.issue-flow/` across bundle switches. They include tracker, delivery route, merge
+Settings appear as the ignored `operator.local.md` beside `SKILL.md` and persist as immutable local
+generations under `~/.agents/skills/.issue-flow/` across bundle switches. They include tracker, delivery route, merge
 strategy, worktree location, and whether delivery is pre-authorised. The `config` command creates
 the file from the marked defaults in `SKILL.md` when needed. A pull-request route publishes the branch
 for independent review, waits for required CI on the latest head, and then merges using the selected
@@ -212,7 +219,8 @@ immutable tag on the delivered commit and pushes it to the remote before closing
 Releases remain a separate publication layer and follow the repository's existing convention. The
 configuration is a table with the defaults written next to each value, so it reads on its own.
 
-Edit it by hand, or from the installer:
+Read or update it through the installer. The visible file is managed state; editors that replace it
+would sever the generation link and are deliberately rejected on the next verification:
 
 ```sh
 ./install.sh config                                              # print the table
@@ -220,9 +228,9 @@ Edit it by hand, or from the installer:
 ```
 
 The installer matches a setting **by its name** and carries no setting list of its own, so a default
-row added to the skill is settable immediately. It backs the stable local file up first, refuses a
-name that matches no row or more than one, and refuses a value containing `|`, which would split the
-cell and corrupt the table.
+row added to the skill is settable immediately. It writes and fsyncs a new policy generation before
+atomically changing any visible hard link, refuses a name that matches no row or more than one, and
+refuses a value containing `|`, which would split the cell and corrupt the table.
 
 `sync` fetches canonical `main`, validates the complete target tree, and atomically activates its
 bundle while leaving `operator.local.md` byte-identical:

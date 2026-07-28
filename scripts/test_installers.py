@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from install_bundle import InstallerLock, InstallError, Paths, validate_tree_path
+
 
 ROOT = Path(__file__).resolve().parent.parent
 UPSTREAM = "https://github.com/asanabrial/issue-flow.git"
@@ -23,6 +25,20 @@ LOCAL_POLICY = (
     "<!-- issue-flow:config:end -->\r\n"
 ).encode("utf-8")
 FAILURES: list[str] = []
+
+for unsafe_path in (
+    r"..\outside",
+    r"C:\outside",
+    "payload:stream",
+    "trailing. ",
+    "CON/file.md",
+    "decomposed-e\u0301.md",
+):
+    try:
+        validate_tree_path(unsafe_path)
+    except InstallError:
+        continue
+    FAILURES.append(f"unsafe tree path accepted: {unsafe_path!r}")
 
 
 def check(name: str, condition: bool, result: subprocess.CompletedProcess | None = None) -> None:
@@ -94,7 +110,8 @@ def write_contract(repository: Path, version: str, companion: str) -> None:
     (repository / "SKILL.md").write_text(
         "---\nname: issue-flow\nmetadata:\n"
         f"  version: \"{version}\"\n---\n\n"
-        "Load [runtime notes](references/runtime-notes.md).\n\n"
+        "Load [runtime notes][runtime].\n\n"
+        "[runtime]: references/runtime-notes.md\n\n"
         "<!-- issue-flow:config:start -->\n"
         "| Setting | Value here | Skill default |\n"
         "|---|---|---|\n"
@@ -192,6 +209,37 @@ def command(
     return run(invocation, env=env)
 
 
+def piped_posix(executable: str, script: Path, args: list[str], home: Path, cwd: Path) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
+    return subprocess.run(
+        [executable, "-s", "--", *args],
+        cwd=cwd,
+        env=env,
+        input=script.read_text(encoding="utf-8"),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def invoked_powershell(kind: str, executable: str, script: Path, home: Path) -> subprocess.CompletedProcess:
+    escaped = str(script).replace("'", "''")
+    invocation = [
+        executable,
+        "-NoProfile",
+        *(["-ExecutionPolicy", "Bypass"] if kind == "Windows PowerShell" else []),
+        "-Command",
+        f"try {{ Invoke-Expression (Get-Content -LiteralPath '{escaped}' -Raw) }} catch {{ 'caught' }}; 'after-iex'",
+    ]
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
+    return run(invocation, env=env)
+
+
 def current_revision(home: Path) -> str | None:
     current = home / ".agents/skills/issue-flow"
     if not current.exists():
@@ -219,6 +267,22 @@ for kind, executable in shells():
         installed = home / ".agents/skills/issue-flow"
         external = external_installer(root, kind, remote.as_uri())
 
+        if kind == "POSIX":
+            hostile = root / "hostile cwd"
+            (hostile / "scripts").mkdir(parents=True)
+            sentinel = hostile / "sentinel"
+            (hostile / "scripts/install_bundle.py").write_text(
+                f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('executed')\n",
+                encoding="utf-8",
+            )
+            piped_home = root / "piped home"
+            result = piped_posix(executable, external, ["sync", "--dry-run"], piped_home, hostile)
+            check(
+                "POSIX piped bootstrap ignores a hostile cwd helper",
+                result.returncode == 0 and not sentinel.exists() and not (piped_home / ".agents").exists(),
+                result,
+            )
+
         fresh_home = root / "fresh dry-run home"
         result = command(kind, executable, external, shell_args(kind, "sync", "--dry-run"), fresh_home)
         check(
@@ -227,9 +291,71 @@ for kind, executable in shells():
             result,
         )
 
-        clone_legacy(remote, installed, legacy)
+        fresh_install_home = root / "fresh install home"
+        (fresh_install_home / ".claude").mkdir(parents=True)
+        (fresh_install_home / ".codex").mkdir()
+        result = command(kind, executable, external, shell_args(kind, "install"), fresh_install_home)
+        fresh_canonical = fresh_install_home / ".agents/skills/issue-flow"
+        check(
+            f"{kind} fresh install activates one complete tree and runtime links",
+            result.returncode == 0
+            and current_revision(fresh_install_home) == candidate
+            and all(
+                (fresh_install_home / runtime / "skills/issue-flow").resolve(strict=True)
+                == fresh_canonical.resolve(strict=True)
+                for runtime in (".claude", ".codex")
+            ),
+            result,
+        )
+        fresh_script = fresh_canonical / ("install.sh" if kind == "POSIX" else "install.ps1")
+        result = command(kind, executable, fresh_script, shell_args(kind, "status"), fresh_install_home)
+        check(
+            f"{kind} status reports immutable tree and healthy runtime links",
+            result.returncode == 0 and "immutable bundle" in result.stdout and "healthy" in result.stdout,
+            result,
+        )
+        result = command(kind, executable, fresh_script, shell_args(kind, "uninstall"), fresh_install_home)
+        check(
+            f"{kind} uninstall removes only runtime links",
+            result.returncode == 0
+            and fresh_canonical.exists()
+            and not (fresh_install_home / ".claude/skills/issue-flow").exists()
+            and not (fresh_install_home / ".codex/skills/issue-flow").exists(),
+            result,
+        )
 
-        result = command(kind, executable, external, shell_args(kind, "sync"), home)
+        blocked_home = root / "stale runtime home"
+        (blocked_home / ".claude/skills/issue-flow").mkdir(parents=True)
+        result = command(kind, executable, external, shell_args(kind, "install"), blocked_home)
+        check(
+            f"{kind} refuses an independent runtime copy before canonical installation",
+            result.returncode != 0 and not (blocked_home / ".agents").exists(),
+            result,
+        )
+        if kind != "POSIX":
+            result = invoked_powershell(kind, executable, external, blocked_home)
+            check(
+                f"{kind} IEX bootstrap returns control to the caller",
+                result.returncode == 0 and "after-iex" in result.stdout,
+                result,
+            )
+
+        clone_legacy(remote, installed, legacy)
+        (home / ".claude").mkdir()
+        (home / ".codex").mkdir()
+
+        result = command(kind, executable, external, shell_args(kind, "install", "--dry-run"), home)
+        check(
+            f"{kind} legacy install dry-run leaves clone and runtime paths unchanged",
+            result.returncode == 0
+            and git(installed, "rev-parse", "HEAD") == legacy
+            and current_revision(home) is None
+            and not (home / ".claude/skills/issue-flow").exists()
+            and not (home / ".codex/skills/issue-flow").exists(),
+            result,
+        )
+
+        result = command(kind, executable, external, shell_args(kind, "install"), home)
         check(
             f"{kind} migrates a legacy clone only after preparing a complete bundle",
             result.returncode == 0
@@ -240,6 +366,7 @@ for kind, executable in shells():
             result,
         )
 
+        policy_inode = (home / ".agents/skills/.issue-flow/operator.local.md").stat().st_ino
         result = command(
             kind,
             executable,
@@ -248,11 +375,19 @@ for kind, executable in shells():
             home,
         )
         configured_policy = (installed / "operator.local.md").read_bytes()
+        policy_files = list((home / ".agents/skills/.issue-flow/policies").iterdir())
         check(
             f"{kind} updates stable policy through the active hard link",
             result.returncode == 0
             and b"| Tracker | linear | github |" in configured_policy
-            and configured_policy.endswith(b"\r\n"),
+            and configured_policy.endswith(b"\r\n")
+            and len(policy_files) == 1
+            and policy_files[0].read_bytes() == configured_policy
+            and (home / ".agents/skills/.issue-flow/operator.local.md").stat().st_ino != policy_inode
+            and os.path.samefile(
+                installed / "operator.local.md",
+                home / ".agents/skills/.issue-flow/operator.local.md",
+            ),
             result,
         )
 
@@ -269,6 +404,55 @@ for kind, executable in shells():
             and (installed / "operator.local.md").read_bytes() == configured_policy,
             result,
         )
+        check(
+            f"{kind} runtime links follow the stable canonical pointer after sync",
+            all(
+                (home / runtime / "skills/issue-flow").resolve(strict=True) == installed.resolve(strict=True)
+                for runtime in (".claude", ".codex")
+            ),
+        )
+
+        state_root = home / ".agents/skills/.issue-flow"
+        state_before_dry_rollback = (state_root / "current.json").read_bytes()
+        result = command(kind, executable, active_script, shell_args(kind, "rollback", "--dry-run"), home)
+        check(
+            f"{kind} rollback dry-run is strictly read-only",
+            result.returncode == 0
+            and current_revision(home) == new
+            and (state_root / "current.json").read_bytes() == state_before_dry_rollback
+            and not (state_root / "transaction.json").exists(),
+            result,
+        )
+
+        retained = state_root / "bundles" / candidate
+        retained_file = retained / "references/runtime-notes.md"
+        retained_receipt = retained / ".issue-flow-bundle.json"
+        retained_file_bytes = retained_file.read_bytes()
+        retained_receipt_bytes = retained_receipt.read_bytes()
+        retained_file.write_bytes(b"forged retained bundle\n")
+        forged_retained = json.loads(retained_receipt_bytes)
+        retained_metadata = forged_retained["files"]["references/runtime-notes.md"]
+        retained_metadata["size"] = len(b"forged retained bundle\n")
+        retained_metadata["sha256"] = hashlib.sha256(b"forged retained bundle\n").hexdigest()
+        retained_receipt.write_bytes((json.dumps(forged_retained) + "\n").encode("utf-8"))
+        result = command(kind, executable, active_script, shell_args(kind, "rollback"), home)
+        check(
+            f"{kind} rollback rejects a forged retained bundle",
+            result.returncode != 0 and current_revision(home) == new,
+            result,
+        )
+        retained_file.write_bytes(retained_file_bytes)
+        retained_receipt.write_bytes(retained_receipt_bytes)
+
+        external_hardlink = root / "tracked-hardlink"
+        os.link(installed / "references/runtime-notes.md", external_hardlink)
+        result = command(kind, executable, active_script, shell_args(kind, "sync"), home)
+        check(
+            f"{kind} refuses tracked bytes hard-linked outside the bundle",
+            result.returncode != 0 and current_revision(home) == new,
+            result,
+        )
+        external_hardlink.unlink()
 
         (installed / "references/runtime-notes.md").write_bytes(b"drifted\n")
         result = command(kind, executable, active_script, shell_args(kind, "sync"), home)
@@ -305,6 +489,13 @@ for kind, executable in shells():
             and (installed / "operator.local.md").read_bytes() == configured_policy,
             result,
         )
+        check(
+            f"{kind} runtime links follow canonical rollback",
+            all(
+                (home / runtime / "skills/issue-flow").resolve(strict=True) == installed.resolve(strict=True)
+                for runtime in (".claude", ".codex")
+            ),
+        )
 
         supplied = root / "newer-SKILL.md"
         supplied.write_text("partial\n", encoding="utf-8")
@@ -322,10 +513,16 @@ for kind, executable in shells():
             result,
         )
         result = command(kind, executable, active_script, shell_args(kind, "sync"), home)
-        check(f"{kind} can reactivate the published target", result.returncode == 0 and current_revision(home) == new, result)
+        check(
+            f"{kind} can reactivate the published target and prunes older bundles",
+            result.returncode == 0
+            and current_revision(home) == new
+            and len([path for path in (state_root / "bundles").iterdir() if path.is_dir()]) == 2,
+            result,
+        )
 
-        stale_lock = home / ".agents/skills/.issue-flow/sync.lock"
-        state_root = stale_lock.parent
+        lock_path = home / ".agents/skills/.issue-flow/sync.lock"
+        state_root = lock_path.parent
         (state_root / "transaction.json").write_text(
             json.dumps(
                 {
@@ -349,21 +546,66 @@ for kind, executable in shells():
             ),
             encoding="utf-8",
         )
-        stale_lock.mkdir()
-        (stale_lock / "owner.json").write_text(
-            json.dumps({"schema": 1, "pid": 99999999, "started": 0}),
-            encoding="utf-8",
+        with InstallerLock(Paths.for_home(home)):
+            locked = command(kind, executable, active_script, shell_args(kind, "recover"), home)
+        check(
+            f"{kind} recovery cannot steal a live operating-system lock",
+            locked.returncode != 0,
+            locked,
         )
         result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
         check(
-            f"{kind} recovers an abandoned lock and post-switch receipt write",
+            f"{kind} recovers a post-switch receipt write after lock release",
             result.returncode == 0
-            and not stale_lock.exists()
             and not (state_root / "transaction.json").exists()
             and current_revision(home) == new
             and json.loads((state_root / "current.json").read_text(encoding="utf-8"))["previous"] == candidate,
             result,
         )
+
+        outside_backup = root / "outside-backup"
+        outside_backup.mkdir()
+        (state_root / "transaction.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "phase": "moved",
+                    "previous": candidate,
+                    "target": new,
+                    "backup": str(outside_backup),
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
+        check(
+            f"{kind} recovery rejects a backup path outside installer state",
+            result.returncode != 0 and outside_backup.is_dir() and current_revision(home) == new,
+            result,
+        )
+        (state_root / "transaction.json").unlink()
+
+        repository_config = state_root / "repository.git/config"
+        safe_config = repository_config.read_bytes()
+        with repository_config.open("ab") as handle:
+            handle.write(b"\n[url \"ext::malicious\"]\n\tinsteadOf = file://\n")
+        result = command(kind, executable, active_script, shell_args(kind, "sync"), home)
+        check(
+            f"{kind} rejects persisted Git authority configuration",
+            result.returncode != 0 and current_revision(home) == new,
+            result,
+        )
+        repository_config.write_bytes(safe_config)
+
+        object_store = state_root / "repository.git"
+        git(state_root, f"--git-dir={object_store}", "replace", new, candidate)
+        result = command(kind, executable, active_script, shell_args(kind, "sync"), home)
+        check(
+            f"{kind} ignores local Git replacement objects",
+            result.returncode == 0 and current_revision(home) == new,
+            result,
+        )
+        git(state_root, f"--git-dir={object_store}", "replace", "-d", new)
 
         git(author, "reset", "--hard", new)
         (author / "references/runtime-notes.md").unlink()

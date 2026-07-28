@@ -26,10 +26,16 @@ $RepositoryUrl = 'https://github.com/asanabrial/issue-flow.git'
 
 function Get-PythonCommand {
     $python = Get-Command python -ErrorAction SilentlyContinue
-    if ($python) { return @{ Executable = $python.Source; Prefix = @() } }
+    if ($python) {
+        & $python.Source -c 'import sys;raise SystemExit(sys.version_info < (3, 10))' 2>$null
+        if ($LASTEXITCODE -eq 0) { return @{ Executable = $python.Source; Prefix = @() } }
+    }
     $launcher = Get-Command py -ErrorAction SilentlyContinue
-    if ($launcher) { return @{ Executable = $launcher.Source; Prefix = @('-3') } }
-    throw 'Python 3 is required; install it and retry.'
+    if ($launcher) {
+        & $launcher.Source -3 -c 'import sys;raise SystemExit(sys.version_info < (3, 10))' 2>$null
+        if ($LASTEXITCODE -eq 0) { return @{ Executable = $launcher.Source; Prefix = @('-3') } }
+    }
+    throw 'Python 3.10 or newer is required; install it and retry.'
 }
 
 function Invoke-Helper {
@@ -39,13 +45,14 @@ function Invoke-Helper {
     if ($Set) { $arguments += @('--set', $Set) }
     if ($DryRun) { $arguments += '--dry-run' }
     & $Python.Executable @arguments
-    return $LASTEXITCODE
+    $script:HelperResult = $LASTEXITCODE
 }
 
 $python = Get-PythonCommand
 $helper = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'scripts\install_bundle.py' } else { $null }
 if ($helper -and (Test-Path -LiteralPath $helper -PathType Leaf)) {
-    exit (Invoke-Helper -Path $helper -Python $python)
+    Invoke-Helper -Path $helper -Python $python
+    exit $script:HelperResult
 }
 
 if ($From) {
@@ -69,7 +76,7 @@ New-Item -ItemType Directory -Path $hooks, $template | Out-Null
 
 $gitNames = @(
     'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
-    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_TEMPLATE_DIR',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_TEMPLATE_DIR', 'GIT_EXEC_PATH',
     'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL',
     'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT', 'GIT_ASKPASS'
 )
@@ -120,11 +127,13 @@ subprocess.run([*common, "-C", source, "checkout", "-q", "--detach", "FETCH_HEAD
     )
     & $python.Executable @bootstrapArguments
     if ($LASTEXITCODE -ne 0) { throw "bootstrap acquisition failed ($LASTEXITCODE)." }
-    $result = Invoke-Helper -Path (Join-Path $bootstrapSource 'scripts\install_bundle.py') -Python $python
+    Invoke-Helper -Path (Join-Path $bootstrapSource 'scripts\install_bundle.py') -Python $python
+    $result = $script:HelperResult
 } finally {
     foreach ($name in $gitNames) {
         [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process')
     }
     Remove-Item -LiteralPath $bootstrap -Recurse -Force -ErrorAction SilentlyContinue
 }
-exit $result
+if ($result -ne 0) { throw "issue-flow installer failed ($result)." }
+return

@@ -13,6 +13,8 @@ All notable changes to Issue Flow are documented here.
   Both shell entrypoints now delegate to one Python transaction implementation.
 - Preserve operator policy and ignored top-level runtime state during the journaled legacy-clone
   migration, retain the previous bundle for `rollback`, and provide explicit `recover` handling.
+- Harden bootstrap and recovery authority with portable path rejection, operating-system locks,
+  Git-bound rollback verification, immutable policy generations and bounded bundle retention.
 
 ## [1.11.0] - 2026-07-28
 

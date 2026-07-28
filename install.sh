@@ -5,13 +5,14 @@ set -eu
 
 REPOSITORY_URL='https://github.com/asanabrial/issue-flow.git'
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || SCRIPT_DIR=''
+case ${0##*/} in install.sh) ;; *) SCRIPT_DIR='' ;; esac
 HELPER="$SCRIPT_DIR/scripts/install_bundle.py"
 
 find_python() {
     if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then printf '%s\n' python3
     elif command -v python >/dev/null 2>&1 && python -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then printf '%s\n' python
     else
-        printf 'error: Python 3 is required; install it and retry.\n' >&2
+        printf 'error: Python 3.10 or newer is required; install it and retry.\n' >&2
         return 1
     fi
 }
@@ -24,7 +25,6 @@ fi
 
 # A raw/piped script has no companion files. Refuse unsafe legacy arguments and a fresh dry-run
 # before network or filesystem mutation, then acquire the complete current bootstrap in quarantine.
-COMMAND=${1:-install}
 FRESH_DRY=0
 for argument in "$@"; do
     case "$argument" in
@@ -53,7 +53,7 @@ mkdir -- "$BOOTSTRAP/hooks" "$BOOTSTRAP/template"
 
 case "$REPOSITORY_URL" in file://*) FILE_PROTOCOL=always ;; *) FILE_PROTOCOL=never ;; esac
 (
-    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_EXEC_PATH
     unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_TEMPLATE_DIR
     unset GIT_CONFIG_PARAMETERS GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
     export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0
