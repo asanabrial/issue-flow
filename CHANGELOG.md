@@ -14,7 +14,13 @@ All notable changes to Issue Flow are documented here.
 - Preserve operator policy and ignored top-level runtime state during the journaled legacy-clone
   migration, retain the previous bundle for `rollback`, and provide explicit `recover` handling.
 - Harden bootstrap and recovery authority with portable path rejection, operating-system locks,
-  Git-bound rollback verification, immutable policy generations and retained resolved bundles.
+  isolated Python imports, disabled Git hooks, core-only repository config, Git-bound rollback
+  verification and post-switch activation provenance.
+- Publish Git objects, policy generations and migrated local files through durable atomic
+  replacements; recover abandoned attachment temporaries and reject linked object-store parents,
+  symlinked policy generations and unexplained pointer/state drift.
+- Retain every activated bundle for resolved readers, verify retained bytes and attachments in
+  `status`, and report deduplicated storage including corrupt and auxiliary installer state.
 
 ## [1.11.0] - 2026-07-28
 

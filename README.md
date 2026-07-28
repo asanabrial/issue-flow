@@ -96,8 +96,9 @@ curl -fsSL https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.
 irm https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.ps1 | iex
 ```
 
-**The piped script is only a bootstrap.** It disables inherited Git configuration, fetches the
-canonical `main` into a temporary checkout, and hands over to the shared Python installer. The
+**The piped script is only a bootstrap.** It runs Python in isolated mode, disables inherited Git
+configuration and hooks, acquires canonical `main` into a temporary bare repository, extracts only
+the commit's shared installer, and hands over to it. The
 installer reads blobs directly from the fetched Git objects, rejects unsafe paths and broken local
 Markdown links, verifies every materialized byte against the commit tree, and activates only after
 the complete bundle is durable. Prefer to inspect the files first? The legacy clone layout is a
@@ -109,21 +110,25 @@ git clone https://github.com/asanabrial/issue-flow ~/.agents/skills/issue-flow
 ```
 
 The stable public path remains `~/.agents/skills/issue-flow/`. Its bundles, Git object store, local
-policy generations, activation receipt and retained rollback target live under
+policy generations, activation receipt, completed-activation refs and retained rollback targets live under
 `~/.agents/skills/.issue-flow/`.
 POSIX atomically replaces the public symlink; Windows atomically retargets its directory junction,
 which needs no elevation. Runtime paths under `~/.claude/skills/` and `~/.codex/skills/` point at the
 stable public path. Independent copies are refused because they would remain on stale policy.
 
 The store retains every activated bundle so an already-running load can keep using the immutable path
-it resolved at activation across any number of later upgrades. `rollback` selects the recorded
-previous generation, while `status` makes total bundle count and storage visible for deliberate
-operator cleanup. A new load sees one complete generation and must not reopen companions through the
-stable alias. The one-time legacy directory move has a brief availability gap, so run that migration
-between agent sessions; its journal makes an interruption recoverable.
+it resolved at activation across any number of later upgrades. Materialization and activation have
+separate Git refs: `rollback` accepts the recorded previous generation only when a completed
+post-switch activation marker exists. `status` verifies tracked bytes and local attachments for every
+retained bundle, reports corrupt generations, and measures all deduplicated installer-state storage
+for deliberate operator cleanup. A new load sees one complete generation and must not reopen
+companions through the stable alias. The one-time legacy directory move has a brief availability gap,
+so run that migration between agent sessions; its journal makes an interruption recoverable.
 
 Run `status` to verify the active commit, tree, runtime targets and pending recovery state; `rollback`
-reactivates the retained previous bundle, and `recover` completes an interrupted transaction. `uninstall`
+reactivates the retained previous bundle, and `recover` completes an interrupted transaction only
+when the pointer is one of that journal's declared endpoints. Unexplained pointer/state drift fails
+closed instead of being normalized. `uninstall`
 removes only installer-owned runtime links; it never removes bundles, policy or rollback state.
 
 ## Use
@@ -229,9 +234,11 @@ would sever the generation link and are deliberately rejected on the next verifi
 ```
 
 The installer matches a setting **by its name** and carries no setting list of its own, so a default
-row added to the skill is settable immediately. It writes and fsyncs a new policy generation before
-atomically changing any visible hard link, refuses a name that matches no row or more than one, and
-refuses a value containing `|`, which would split the cell and corrupt the table.
+row added to the skill is settable immediately. It verifies every destination, publishes the new
+content-addressed generation through a fsynced temporary file, then atomically changes each visible
+hard link. Recovery removes abandoned link temporaries before finishing the journal. It refuses a
+name that matches no row or more than one, and refuses a value containing `|`, which would split the
+cell and corrupt the table.
 
 `sync` fetches canonical `main`, validates the complete target tree, and atomically activates its
 bundle while leaving `operator.local.md` byte-identical:
@@ -241,9 +248,12 @@ bundle while leaving `operator.local.md` byte-identical:
 ```
 
 Single-file `--from`/`-From` sync fails before mutation because it cannot prove that required
-references and assets come from the same contract. A failed fetch, validation or materialization
-leaves the active pointer unchanged. The previous complete bundle remains available through
-`rollback`; `recover` reconciles the journal if the one-time legacy directory move was interrupted.
+references and assets come from the same contract. Remote acquisition uses a one-shot bare clone
+before any destination-local config exists, disables executable hooks and protocols outside the
+configured transport, and atomically copies verified objects into real store directories. A failed
+fetch, validation or materialization leaves the active pointer unchanged. The previous complete
+bundle remains available through `rollback`; `recover` reconciles the journal if the one-time legacy
+directory move was interrupted.
 Never force-add `operator.local.md`: its values are permissions, including whether an agent may
 publish or merge without asking.
 
@@ -252,8 +262,9 @@ publish or merge without asking.
 The workflow, the state machine and the GitHub binding are the mature parts, exercised against a
 live board. **The Linear and Trello bindings are written against their official API documentation
 but have not yet been exercised against a live workspace** — expect the first real run to find
-something. The installer acceptance suite runs the same migration, update, drift, rollback and
-policy-preservation cases through PowerShell 7, Windows PowerShell 5.1 and Git Bash. The POSIX adapter
+something. The installer acceptance suite runs the same bootstrap, migration, update, drift,
+authority, crash-recovery, rollback and policy-preservation cases through PowerShell 7, Windows
+PowerShell 5.1 and Git Bash. The POSIX adapter
 has not yet run on a native Linux or macOS shell.
 
 Licensed GPL-2.0. Issues and corrections welcome, preferably filed through the workflow itself.

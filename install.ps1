@@ -27,12 +27,12 @@ $RepositoryUrl = 'https://github.com/asanabrial/issue-flow.git'
 function Get-PythonCommand {
     $python = Get-Command python -ErrorAction SilentlyContinue
     if ($python) {
-        & $python.Source -c 'import sys;raise SystemExit(sys.version_info < (3, 10))' 2>$null
+        & $python.Source -I -c 'import sys;raise SystemExit(sys.version_info < (3, 10))' 2>$null
         if ($LASTEXITCODE -eq 0) { return @{ Executable = $python.Source; Prefix = @() } }
     }
     $launcher = Get-Command py -ErrorAction SilentlyContinue
     if ($launcher) {
-        & $launcher.Source -3 -c 'import sys;raise SystemExit(sys.version_info < (3, 10))' 2>$null
+        & $launcher.Source -3 -I -c 'import sys;raise SystemExit(sys.version_info < (3, 10))' 2>$null
         if ($LASTEXITCODE -eq 0) { return @{ Executable = $launcher.Source; Prefix = @('-3') } }
     }
     throw 'Python 3.10 or newer is required; install it and retry.'
@@ -40,7 +40,7 @@ function Get-PythonCommand {
 
 function Invoke-Helper {
     param([string]$Path, [hashtable]$Python)
-    $arguments = @($Python.Prefix) + @($Path, $Command)
+    $arguments = @($Python.Prefix) + @('-I', $Path, $Command)
     if ($From) { $arguments += @('--from', $From) }
     if ($Set) { $arguments += @('--set', $Set) }
     if ($DryRun) { $arguments += '--dry-run' }
@@ -69,10 +69,9 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 }
 
 $bootstrap = Join-Path ([IO.Path]::GetTempPath()) ('issue-flow-bootstrap-' + [guid]::NewGuid().ToString('N'))
-$hooks = Join-Path $bootstrap 'hooks'
-$template = Join-Path $bootstrap 'template'
 $bootstrapSource = Join-Path $bootstrap 'source'
-New-Item -ItemType Directory -Path $hooks, $template | Out-Null
+$bootstrapRepository = Join-Path $bootstrap 'repository.git'
+New-Item -ItemType Directory -Path $bootstrap | Out-Null
 
 $gitNames = @(
     'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
@@ -100,30 +99,47 @@ import os
 import subprocess
 import sys
 
-repository, source, hooks, template = sys.argv[1:]
+repository, source, bare = sys.argv[1:]
 environment = os.environ.copy()
 for name in tuple(environment):
     if name.startswith("GIT_"):
         environment.pop(name, None)
 environment.update({
     "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": os.devnull,
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_COUNT": "0",
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_ASKPASS": "",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
 })
 file_protocol = "always" if repository.lower().startswith("file:") else "never"
-os.mkdir(source)
-common = ["git", "-c", f"core.hooksPath={hooks}"]
-subprocess.run([*common, "init", "-q", f"--template={template}", source], env=environment, check=True)
-subprocess.run([*common, "-C", source, "-c", f"protocol.file.allow={file_protocol}", "fetch", "-q", "--depth", "1", "--no-tags", repository, "refs/heads/main"], env=environment, check=True)
-subprocess.run([*common, "-C", source, "checkout", "-q", "--detach", "FETCH_HEAD"], env=environment, check=True)
+disabled_hooks = "NUL" if os.name == "nt" else "/dev/null"
+os.makedirs(os.path.join(source, "scripts"))
+common = ["git", "--no-replace-objects", "-c", f"core.hooksPath={disabled_hooks}", "-c", "credential.helper="]
+subprocess.run([
+    *common,
+    "-c", "protocol.allow=never",
+    "-c", "protocol.ext.allow=never",
+    "-c", f"protocol.file.allow={file_protocol}",
+    "-c", "protocol.https.allow=always",
+    "clone", "-q", "--bare", "--no-tags", "--single-branch", "--branch", "main",
+    repository, bare,
+], env=environment, check=True)
+helper = subprocess.run([
+    "git", "--no-replace-objects", f"--git-dir={bare}",
+    "-c", f"core.hooksPath={disabled_hooks}", "-c", "core.fsmonitor=false",
+    "show", "refs/heads/main:scripts/install_bundle.py",
+], env=environment, check=True, stdout=subprocess.PIPE).stdout
+with open(os.path.join(source, "scripts", "install_bundle.py"), "xb") as handle:
+    handle.write(helper)
 '@
     # Base64 keeps Windows PowerShell 5.1 from stripping quotes in the multiline `-c` argument.
     $encodedBootstrap = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootstrapCode))
     $bootstrapArguments = @($python.Prefix) + @(
-        '-c', 'import base64,sys;code=base64.b64decode(sys.argv[1]);del sys.argv[1];exec(code)',
-        $encodedBootstrap, $RepositoryUrl, $bootstrapSource, $hooks, $template
+        '-I', '-c', 'import base64,sys;code=base64.b64decode(sys.argv[1]);del sys.argv[1];exec(code)',
+        $encodedBootstrap, $RepositoryUrl, $bootstrapSource, $bootstrapRepository
     )
     & $python.Executable @bootstrapArguments
     if ($LASTEXITCODE -ne 0) { throw "bootstrap acquisition failed ($LASTEXITCODE)." }

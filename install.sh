@@ -9,8 +9,8 @@ case ${0##*/} in install.sh) ;; *) SCRIPT_DIR='' ;; esac
 HELPER="$SCRIPT_DIR/scripts/install_bundle.py"
 
 find_python() {
-    if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then printf '%s\n' python3
-    elif command -v python >/dev/null 2>&1 && python -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then printf '%s\n' python
+    if command -v python3 >/dev/null 2>&1 && python3 -I -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then printf '%s\n' python3
+    elif command -v python >/dev/null 2>&1 && python -I -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then printf '%s\n' python
     else
         printf 'error: Python 3.10 or newer is required; install it and retry.\n' >&2
         return 1
@@ -20,7 +20,7 @@ find_python() {
 PYTHON=$(find_python) || exit 1
 
 if [ -f "$HELPER" ]; then
-    exec "$PYTHON" "$HELPER" "$@"
+    exec "$PYTHON" -I "$HELPER" "$@"
 fi
 
 # A raw/piped script has no companion files. Refuse unsafe legacy arguments and a fresh dry-run
@@ -49,25 +49,30 @@ command -v git >/dev/null 2>&1 || {
 
 BOOTSTRAP=$(mktemp -d "${TMPDIR:-/tmp}/issue-flow-bootstrap.XXXXXX") || exit 1
 trap 'rm -rf -- "$BOOTSTRAP"' EXIT HUP INT TERM
-mkdir -- "$BOOTSTRAP/hooks" "$BOOTSTRAP/template"
+mkdir -p -- "$BOOTSTRAP/source/scripts"
 
 case "$REPOSITORY_URL" in file://*) FILE_PROTOCOL=always ;; *) FILE_PROTOCOL=never ;; esac
+clean_git() {
+    env -i \
+        PATH="$PATH" HOME="${HOME-}" TMPDIR="${TMPDIR-}" TEMP="${TEMP-}" TMP="${TMP-}" \
+        SYSTEMROOT="${SYSTEMROOT-}" SystemRoot="${SystemRoot-}" COMSPEC="${COMSPEC-}" PATHEXT="${PATHEXT-}" \
+        LANG="${LANG-}" LC_ALL="${LC_ALL-}" \
+        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_GLOBAL=/dev/null \
+        GIT_CONFIG_COUNT=0 GIT_ATTR_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 \
+        GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= \
+        git "$@"
+}
 (
-    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_EXEC_PATH
-    unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_TEMPLATE_DIR
-    unset GIT_CONFIG_PARAMETERS GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
-    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0
-    export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=
-    mkdir -- "$BOOTSTRAP/source"
-    git -c "core.hooksPath=$BOOTSTRAP/hooks" init -q \
-        --template="$BOOTSTRAP/template" "$BOOTSTRAP/source"
-    git -C "$BOOTSTRAP/source" -c "core.hooksPath=$BOOTSTRAP/hooks" \
-        -c "protocol.file.allow=$FILE_PROTOCOL" fetch -q --depth 1 --no-tags \
-        "$REPOSITORY_URL" refs/heads/main
-    git -C "$BOOTSTRAP/source" -c "core.hooksPath=$BOOTSTRAP/hooks" \
-        checkout -q --detach FETCH_HEAD
+    clean_git --no-replace-objects -c core.hooksPath=/dev/null -c credential.helper= \
+        -c protocol.allow=never -c protocol.ext.allow=never \
+        -c "protocol.file.allow=$FILE_PROTOCOL" -c protocol.https.allow=always \
+        clone -q --bare --no-tags --single-branch --branch main \
+        "$REPOSITORY_URL" "$BOOTSTRAP/repository.git"
+    clean_git --no-replace-objects --git-dir="$BOOTSTRAP/repository.git" \
+        -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+        show refs/heads/main:scripts/install_bundle.py > "$BOOTSTRAP/source/scripts/install_bundle.py"
 )
 
-"$PYTHON" "$BOOTSTRAP/source/scripts/install_bundle.py" "$@"
+"$PYTHON" -I "$BOOTSTRAP/source/scripts/install_bundle.py" "$@"
 RESULT=$?
 exit "$RESULT"
