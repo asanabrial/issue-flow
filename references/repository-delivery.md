@@ -1,6 +1,7 @@
 # Repository delivery
 
-Use this fallback when a repository does not define a stricter isolation or integration policy. The
+Use this fallback when a repository does not define stricter isolation, integration, or review-unit
+sizing policy. The
 repository's instructions always win; this reference supplies a floor, not a competing convention.
 The runtime contract still owns role and state decisions, and the
 [abstract binding contract](../SKILL.md#hard-rules) selects
@@ -15,6 +16,15 @@ the operation implementation and exact tracker commands.
 - Publish shared bytes before review. Independent review and CI name the exact head and base; any
   changed byte invalidates prior evidence.
 - Preserve unfinished work and its diagnosis. A handoff is safer than an unverified merge.
+
+## Keep review units coherent
+
+Aim for no more than 800 changed lines in one pull request so an independent reviewer can inspect the
+complete delivery target without losing context. This is a recommendation, not a gate. Use a larger
+coherent pull request when splitting would create unsafe intermediate states, duplicate migrations,
+or otherwise reduce review quality. Before review, the developer records that rationale on the issue
+or review target; the independent reviewer assesses scope coherence and the risk of splitting. Size
+never waives exact-SHA review, tests, CI, authority checks, or any stricter repository rule.
 
 ## Start from a fresh base
 
