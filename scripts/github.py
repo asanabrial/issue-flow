@@ -462,6 +462,8 @@ def claim_comments(comments: list[dict]) -> list[tuple[str, str, dict]]:
     """Every claim on the timeline as (created_at, run_id, comment), server order preserved."""
     claims = []
     for comment in comments:
+        if comment.get("includesCreatedEdit") is not False:
+            continue
         body = comment.get("body", "")
         run_id = None
         parsed = parse_markers(body)
@@ -490,7 +492,8 @@ def ownership_events(comments: list[dict]) -> list[dict]:
     first_operations = first_operation_markers(comments)
     events = []
     for position, comment in enumerate(comments):
-        if comment.get("viewerDidAuthor") is not True:
+        if (comment.get("viewerDidAuthor") is not True
+                or comment.get("includesCreatedEdit") is not False):
             continue
         parsed = parse_markers(comment.get("body", ""))
         selected = next(((index, mark) for index, mark in enumerate(parsed)
@@ -580,6 +583,7 @@ def last_activity_by(comments: list[dict], run_id: str, after: str = "") -> str:
         comment.get("createdAt", "")
         for comment in comments
         if comment.get("viewerDidAuthor") is True
+        and comment.get("includesCreatedEdit") is False
         and stamp_order(comment.get("createdAt", "")) > stamp_order(after)
         and any(mark.get("run-id") == run_id and mark.get("kind") in ACTIVITY_KINDS
                 for mark in parse_markers(comment.get("body", "")))
@@ -652,7 +656,7 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
     event_by_epoch = {ownership_epoch(event): event for event in events}
     valid_reclaims = {(event["position"], event["marker_index"])
                       for event in events if event["kind"] == "reclaim"}
-    controls, conflicts = {}, set()
+    controls, conflicts, companions = {}, set(), set()
     legacy_release_positions, epoch_release_positions, epoch_release_history = {}, {}, {}
     for position, comment in enumerate(comments):
         if comment.get("viewerDidAuthor") is not True:
@@ -665,8 +669,13 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
             if (kind in RELEASE_ATTRS_BY_KIND and kind in OPERATION_FIELDS and operation_id
                     and OPERATION_ID_RE.fullmatch(operation_id)):
                 first = first_operations[operation_id]
-                companion = (kind == "standdown" and first[2].get("kind") == "claim"
-                             and first[3] and target_epoch == operation_id)
+                claim_companion = kind == "standdown" and first[2].get("kind") == "claim"
+                if claim_companion:
+                    if operation_id in companions:
+                        continue
+                    companions.add(operation_id)
+                companion = (claim_companion and first[3] and target_epoch == operation_id
+                             and comment.get("includesCreatedEdit") is False)
                 if (position, marker_index) != first[:2] and not companion:
                     continue
                 if operation_id in controls or operation_id in conflicts:
@@ -682,6 +691,8 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
                     conflicts.add(operation_id)
                 else:
                     controls[operation_id] = (target_epoch, position)
+                continue
+            if comment.get("includesCreatedEdit") is not False:
                 continue
             if kind == "reclaim" and (position, marker_index) not in valid_reclaims:
                 continue
@@ -1279,7 +1290,8 @@ def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
     for position, comment in enumerate(comments):
         if position <= watermark_position:
             continue
-        if comment.get("viewerDidAuthor") is not True:
+        if (comment.get("viewerDidAuthor") is not True
+                or comment.get("includesCreatedEdit") is not False):
             continue
         body = comment.get("body", "")
         marks = parse_markers(body)

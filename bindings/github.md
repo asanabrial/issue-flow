@@ -118,9 +118,11 @@ earlier claim stops counting. **Control** kinds (`standdown`, `reclaim`, `adjudi
 message instructs a run-id to stop. Note that `reclaim` names the run it took over **from**, not the
 run that wrote it — a marker's subject is not always its author.
 
-They are HTML comments, so they are invisible in rendered markdown and a later run rewording the
-surrounding prose cannot break them. Reading falls back to the prose forms (`Claimed by <run-id>`)
-for comments written before markers existed, and that fallback is deliberately narrow: a control
+They are HTML comments, so they are invisible in rendered markdown. Ownership comments are
+append-only protocol records: if edited, they become inert because GitHub no longer exposes their
+original bytes; corrections append a fresh operation. Reading falls back to the prose forms
+(`Claimed by <run-id>`) for comments written before markers existed, and that fallback is
+deliberately narrow: a control
 message must both **name the run-id AND instruct**. A heartbeat that mentions your run-id in passing
 ("waiting on `<run-id>`'s measurement phase") instructs you to do nothing, and classifying it as a
 stand-down would have you abandon work nobody asked you to drop.

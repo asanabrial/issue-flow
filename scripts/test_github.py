@@ -718,6 +718,19 @@ edited_first = comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=
 check("an edited first operation invalidates its unchanged retry", m.reduce_ownership([edited_first, acquisitions[0]], NOW)["holder"], None)
 edited_control = acquisitions[:1] + [comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C, target_op=OP_A), "2026-01-02T00:00:01Z"), comment(m.marker("unassign", run_id=ME, runtime="opencode", op_id=OP_C, target_op=OP_A), "2026-01-02T00:00:02Z")]; edited_control[1]["includesCreatedEdit"] = True
 check("an edited first control cannot override its retry", m.reduce_ownership(edited_control, NOW)["holder"], ME)
+edited_downgrade = comment(m.marker("claim", run_id=OTHER, runtime="codex", horizon=FUTURE)); edited_downgrade["includesCreatedEdit"] = True
+check("edited operation syntax cannot downgrade to legacy", m.reduce_ownership([edited_downgrade], NOW)["holder"], None)
+edited_legacy_release = acquisitions + [comment(m.marker("unassign", run_id=ME, runtime="opencode"), "2026-01-02T00:00:02Z")]; edited_legacy_release[-1]["includesCreatedEdit"] = True
+check("an edited legacy release cannot cancel a renewal", m.reduce_ownership(edited_legacy_release, NOW)["event"]["operation_id"], OP_B)
+edited_standdown = acquisitions[:1] + [comment(m.marker("standdown", run_id=ME, op_id=OP_A, target_op=OP_A), "2026-01-02T00:00:01Z"), comment(m.marker("standdown", run_id=ME, op_id=OP_A, target_op=OP_A), "2026-01-02T00:00:02Z")]; edited_standdown[1]["includesCreatedEdit"] = True
+check("an edited first standdown reserves its companion attempt", m.reduce_ownership(edited_standdown, NOW)["holder"], ME)
+malformed_standdown = acquisitions[:1] + [comment(m.marker("standdown", run_id=ME, op_id=OP_A, target_op=OP_B), "2026-01-02T00:00:01Z"), comment(m.marker("standdown", run_id=ME, op_id=OP_A, target_op=OP_A), "2026-01-02T00:00:02Z")]
+check("a malformed first standdown cannot be corrected in place", m.reduce_ownership(malformed_standdown, NOW)["holder"], ME)
+edited_heartbeat = [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon="2026-01-01T01:00Z", op_id=OP_A)), comment(m.marker("heartbeat", run_id=ME), "2026-01-02T00:00:01Z")]; edited_heartbeat[-1]["includesCreatedEdit"] = True
+check("an edited heartbeat cannot renew ownership", m.reduce_ownership(edited_heartbeat, NOW)["holder"], None)
+edited_adjudication = FakeIssue(acquisitions[:1]); edited_adjudication.comments.append(comment(m.marker("adjudication", run_id=ME), "2026-01-02T00:00:01Z")); edited_adjudication.comments[-1]["includesCreatedEdit"] = True
+with remote(edited_adjudication): edited_adjudication_result = m.do_verify_claim(1, ME, "ready", Path("."))
+check("an edited control message cannot stop the holder", edited_adjudication_result["ok"], True)
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):
         if getattr(self, "outage", False):
