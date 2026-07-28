@@ -377,12 +377,6 @@ def parse_markers(body: str) -> list[dict[str, str]]:
     return found
 
 
-def require_operation_id(value: str | None) -> str:
-    if not OPERATION_ID_RE.fullmatch(value or ""):
-        raise Stop({"ok": False, "reason": "invalid-operation-id"})
-    return value
-
-
 def valid_acquisition_marker(mark: dict) -> bool:
     if not any(key in mark for key in ("op-id", "from-op", "target-op", "evidence-hash")):
         return True
@@ -392,38 +386,10 @@ def valid_acquisition_marker(mark: dict) -> bool:
 
 
 OPERATION_FIELDS = {
-    "claim": ("run-id", "runtime", "horizon"),
     "reclaim": ("run-id", "runtime", "horizon", "from", "from-op", "forced", "evidence-hash"),
     "standdown": ("run-id", "target-op"),
     "unassign": ("run-id", "runtime", "target-op"),
 }
-
-
-def operation_marker(comments: list[dict], operation_id: str, kind: str,
-                     expected: dict | None = None) -> dict | None:
-    """Read one semantic operation across any number of identical transport comments."""
-    marks = [mark for comment in comments if (comment.get("viewerDidAuthor") is True
-                                               and comment.get("includesCreatedEdit") is False)
-             for mark in parse_markers(comment.get("body", ""))
-             if mark.get("kind") == kind and mark.get("op-id") == operation_id]
-    if not marks:
-        return None
-    fields = OPERATION_FIELDS[kind]
-    if len({tuple(mark.get(field) for field in fields) for mark in marks}) != 1:
-        raise Stop({"ok": False, "reason": f"{kind}-operation-conflict", "markers": marks})
-    if expected and any(marks[0].get(key) != value for key, value in expected.items()):
-        raise Stop({"ok": False, "reason": f"{kind}-metadata-mismatch",
-                    "persisted": marks[0]})
-    return marks[0]
-
-
-def reject_operation_kind_conflict(comments: list[dict], operation_id: str,
-                                   allowed: set[str]) -> None:
-    kinds = {mark["kind"] for comment in comments for mark in parse_markers(comment.get("body", ""))
-             if mark.get("op-id") == operation_id and comment.get("viewerDidAuthor") is True
-             and comment.get("includesCreatedEdit") is False}
-    if kinds - allowed:
-        raise Stop({"ok": False, "reason": "operation-id-kind-conflict", "kinds": sorted(kinds)})
 
 
 def ownership_epoch(event: dict) -> str:
@@ -439,18 +405,23 @@ def legacy_operation_allowed(comment: dict) -> bool:
     return comment.get("includesCreatedEdit") is False
 
 
+def valid_operation_marker(mark: dict) -> bool:
+    kind = mark.get("kind")
+    if not mark.get("run-id") or not OPERATION_ID_RE.fullmatch(mark.get("op-id", "")):
+        return False
+    if kind in {"claim", "reclaim"}:
+        return valid_acquisition_marker(mark) and (mark.get("forced") != "true"
+                                                   or bool(mark.get("evidence-hash")))
+    return bool(mark.get("target-op") and (
+        kind == "standdown" and mark["target-op"] == mark["op-id"]
+        or kind == "unassign" and mark.get("runtime")))
+
+
 def operation_activation_position(comments: list[dict]) -> int:
     return min((position for position, comment in enumerate(comments)
                 if comment.get("viewerDidAuthor") is True and legacy_operation_allowed(comment)
                 for mark in parse_markers(comment.get("body", ""))
-                if mark.get("kind") in OPERATION_FIELDS
-                and OPERATION_ID_RE.fullmatch(mark.get("op-id", ""))), default=len(comments))
-
-
-def reject_legacy_writer(comments: list[dict]) -> None:
-    if operation_activation_position(comments) < len(comments):
-        raise Stop({"ok": False, "reason": "legacy-writer-disabled",
-                    "action": "upgrade the caller and retry with a fresh operation ID"})
+                if valid_operation_marker(mark)), default=len(comments))
 
 
 def forced_evidence_digest(comment: dict, marker_index: int | None) -> str | None:
@@ -567,17 +538,14 @@ def ownership_events(comments: list[dict]) -> list[dict]:
     activation = operation_activation_position(comments)
     ordered = [event for event in ordered
                if event["operation_id"] or event["position"] < activation]
-    first, unique = {}, []
-    fields = ("kind", "run_id", "runtime", "horizon", "from", "from_operation",
-              "evidence_hash", "evidence_body_hash", "forced")
+    seen, unique = set(), []
     for event in ordered:
         operation_id = event["operation_id"]
         if not operation_id:
             unique.append(event)
             continue
-        signature = tuple(event.get(field) for field in fields)
-        if operation_id not in first:
-            first[operation_id] = signature
+        if operation_id not in seen:
+            seen.add(operation_id)
             unique.append(event)
     return unique
 
@@ -1466,7 +1434,7 @@ def cmd_list_state(args, config, cwd) -> dict:
     }
 
 
-def _cmd_claim_legacy(args, config, cwd) -> dict:
+def cmd_claim(args, config, cwd) -> dict:
     """Append ownership, adjudicate it, then converge assignee and runtime-label projections.
 
     Re-reading the assignee cannot adjudicate this: agents authenticate as ONE shared account, so
@@ -1478,7 +1446,6 @@ def _cmd_claim_legacy(args, config, cwd) -> dict:
                           horizon=require_horizon(args.horizon, now))
     data = issue_view(args.issue, "assignees,labels,comments", cwd=cwd)
     existing_comments = data.get("comments", [])
-    reject_legacy_writer(existing_comments)
     before = reduce_ownership(existing_comments, now)
     foreign_stale = {event["run_id"] for event in before["stale"]
                      if event["run_id"] != args.run_id}
@@ -1558,86 +1525,12 @@ def _cmd_claim_legacy(args, config, cwd) -> dict:
     }
 
 
-def cmd_claim(args, config, cwd) -> dict:
-    """Write or resume one operation-scoped acquisition; direct old callers retain legacy flow."""
-    if not hasattr(args, "operation_id"):
-        return _cmd_claim_legacy(args, config, cwd)
-    operation_id = require_operation_id(args.operation_id)
-    now = utc_now_stamp()
-    require_horizon(args.horizon)
-    data = issue_view(args.issue, "assignees,labels,comments", cwd=cwd)
-    comments = data.get("comments", [])
-    reject_operation_kind_conflict(comments, operation_id, {"claim", "standdown"})
-    expected = {"run-id": args.run_id, "runtime": args.runtime, "horizon": args.horizon}
-    existing = operation_marker(comments, operation_id, "claim", expected)
-    before = reduce_ownership(comments, now)
-    if not existing:
-        require_horizon(args.horizon, now)
-        foreign_stale = {event["run_id"] for event in before["stale"]
-                         if event["run_id"] != args.run_id}
-        if not before["holder"] and foreign_stale:
-            raise Stop({"ok": False, "reason": "stale-foreign-requires-reclaim",
-                        "holders": sorted(foreign_stale)})
-        mine = next((event for event in before["live"] if event["run_id"] == args.run_id), None)
-        if mine:
-            raise Stop({"ok": False, "reason": "already-owned-by-different-operation",
-                        "operation_id": mine.get("operation_id")})
-        ensure_label(f"dev:{args.runtime}", "bfd4f2", cwd)
-        with body_file(
-            f"Claimed by {args.run_id}, expect to report by {args.horizon}.\n\n"
-            f"{marker('claim', run_id=args.run_id, runtime=args.runtime, horizon=args.horizon, op_id=operation_id)}\n"
-        ) as path:
-            run(["gh", "issue", "comment", str(args.issue), "--body-file", path],
-                cwd=cwd, writes=True)
-        data = wait_for_issue(
-            args.issue, "assignees,labels,comments",
-            lambda item: operation_marker(item.get("comments", []), operation_id,
-                                          "claim", expected) is not None,
-            cwd, "claim operation is not visible; retry with the same operation ID",
-            ambiguous_write=True,
-        )
-
-    ownership = reduce_ownership(data.get("comments", []), utc_now_stamp())
-    active = next((event for event in ownership["live"] + ownership["stale"]
-                   if event.get("operation_id") == operation_id), None)
-    if not active:
-        converge_ownership_projection(args.issue, ownership["event"], cwd)
-        raise Stop({"ok": False, "reason": "claim-operation-no-longer-current",
-                    "winner": ownership["holder"]})
-    if existing and active in ownership["stale"]:
-        raise Stop({"ok": False, "reason": "claim-operation-expired",
-                    "operation_id": operation_id, "claimed_at": active["created_at"]})
-    if not ownership["event"]:
-        raise WriteFailure("claim became stale before adjudication; its event was written")
-    if ownership["holder"] != args.run_id:
-        standdown = {"run-id": args.run_id, "target-op": operation_id}
-        if not operation_marker(data.get("comments", []), operation_id, "standdown", standdown):
-            with body_file(
-                f"{args.run_id} standing down: {ownership['holder']} won the claim race.\n\n"
-                f"{marker('standdown', run_id=args.run_id, op_id=operation_id, target_op=operation_id)}\n"
-            ) as path:
-                run(["gh", "issue", "comment", str(args.issue), "--body-file", path],
-                    cwd=cwd, writes=True)
-            wait_for_issue(args.issue, "comments",
-                           lambda item: operation_marker(item.get("comments", []), operation_id,
-                                                         "standdown", standdown) is not None,
-                           cwd, "standdown operation is not visible; retry the claim with the same ID",
-                           ambiguous_write=True)
-        converge_ownership_projection(args.issue, ownership["event"], cwd)
-        raise Stop({"ok": False, "reason": "lost-claim-race", "winner": ownership["holder"]})
-    converge_ownership_projection(args.issue, ownership["event"], cwd)
-    return {"ok": True, "issue": args.issue, "run_id": args.run_id,
-            "reused_existing_claim": bool(existing), "claimed_at": active["created_at"],
-            "horizon": active["horizon"],
-            "next": "transition to in-progress before any repository write"}
-
-
 def cmd_verify_claim(args, config, cwd) -> dict:
     return do_verify_claim(args.issue, args.run_id, args.expect_state, cwd,
                            allow_closed_by_pr=args.allow_closed_by_pr)
 
 
-def _cmd_reclaim_legacy(args, config, cwd) -> dict:
+def cmd_reclaim(args, config, cwd) -> dict:
     """Atomically in timeline terms displace a holder and establish the new live owner."""
     now = utc_now_stamp()
     if args.horizon:
@@ -1650,7 +1543,6 @@ def _cmd_reclaim_legacy(args, config, cwd) -> dict:
                     "action": "nothing to reclaim on a closed issue"})
 
     comments = data.get("comments", [])
-    reject_legacy_writer(comments)
     before = reduce_ownership(comments, now)
     current = before["event"]
     reused = bool(current and current["run_id"] == args.run_id and current["kind"] == "reclaim")
@@ -1747,103 +1639,6 @@ def _cmd_reclaim_legacy(args, config, cwd) -> dict:
         "reused_existing_reclaim": reused,
         "next": "read what the dead run left on the issue — the work may be further along than the label",
     }
-
-
-def cmd_reclaim(args, config, cwd) -> dict:
-    """Discover the target without writing, then bind takeover and evidence to that exact epoch."""
-    if not hasattr(args, "operation_id"):
-        return _cmd_reclaim_legacy(args, config, cwd)
-    operation_id = require_operation_id(args.operation_id)
-    now = utc_now_stamp()
-    require_horizon(args.horizon)
-    if getattr(args, "reason_file", None) and not args.force:
-        raise Stop({"ok": False, "reason": "force-required-for-reason"})
-    data = issue_view(args.issue, "state,assignees,labels,comments", cwd=cwd)
-    if data.get("state") != "OPEN":
-        raise Stop({"ok": False, "reason": "issue-not-open"})
-    comments = data.get("comments", [])
-    reject_operation_kind_conflict(comments, operation_id, {"reclaim"})
-    expected = {"run-id": args.run_id, "runtime": args.runtime, "horizon": args.horizon,
-                "forced": "true" if args.force else None}
-    requested_target = getattr(args, "target_operation", None)
-    if requested_target:
-        expected["from-op"] = requested_target
-    existing = operation_marker(comments, operation_id, "reclaim", expected)
-    if existing:
-        if args.force and getattr(args, "reason_file", None):
-            reason = escape_control_input(
-                read_control_input(args.reason_file, "force-reason-invalid").strip())
-            digest = hashlib.sha256(reason.encode()).hexdigest()
-            if (not reason or existing.get("evidence-hash") != forced_reclaim_hash(
-                    operation_id, digest, args.run_id, args.runtime, args.horizon,
-                    existing.get("from"), existing.get("from-op"))):
-                raise Stop({"ok": False, "reason": "reclaim-metadata-mismatch"})
-        current = reduce_ownership(comments, now)["event"]
-        if not current or current.get("operation_id") != operation_id:
-            if current:
-                converge_ownership_projection(args.issue, current, cwd)
-            raise Stop({"ok": False, "reason": "reclaim-operation-no-longer-current",
-                        "winner": current["run_id"] if current else None})
-        converge_ownership_projection(args.issue, current, cwd)
-        return {"ok": True, "issue": args.issue, "reclaimed_from": existing["from"],
-                "run_id": args.run_id, "forced": current["forced"],
-                "reused_existing_reclaim": True}
-
-    require_horizon(args.horizon, now)
-    before = reduce_ownership(comments, now)
-    target = before["event"] or next(
-        (event for event in before["stale"] if event["run_id"] != args.run_id), None)
-    if not target:
-        reason = "stale-self-requires-claim" if before["stale"] else "nothing-to-reclaim"
-        raise Stop({"ok": False, "reason": reason})
-    if target["run_id"] == args.run_id:
-        raise Stop({"ok": False, "reason": "already-yours"})
-    if target not in before["stale"] and not args.force:
-        raise Stop({"ok": False, "reason": "holder-not-stale", "holder": target["run_id"]})
-    target_epoch = ownership_epoch(target)
-    if requested_target is None:
-        return {"ok": True, "issue": args.issue, "write_performed": False,
-                "target_operation": target_epoch, "holder": target["run_id"],
-                "next": "repeat reclaim with --target-operation and the same operation ID"}
-    if requested_target != target_epoch:
-        raise Stop({"ok": False, "reason": "target-operation-mismatch",
-                    "expected": target_epoch, "provided": requested_target})
-    force_reason = None
-    if args.force:
-        if not getattr(args, "reason_file", None):
-            raise Stop({"ok": False, "reason": "force-reason-required"})
-        force_reason = escape_control_input(
-            read_control_input(args.reason_file, "force-reason-invalid").strip())
-        if not force_reason:
-            raise Stop({"ok": False, "reason": "force-reason-required"})
-    evidence_hash = (forced_reclaim_hash(
-        operation_id, hashlib.sha256(force_reason.encode()).hexdigest(), args.run_id,
-        args.runtime, args.horizon, target["run_id"], target_epoch) if force_reason else None)
-    note = (f"\n\n{FORCED_EVIDENCE_HEADING}\n\n{force_reason}" if force_reason else "")
-    expected.update({"from": target["run_id"], "from-op": target_epoch,
-                     "evidence-hash": evidence_hash})
-    with body_file(
-        f"Reclaiming exact epoch `{target_epoch}` from `{target['run_id']}`.{note}\n\n"
-        f"{marker('reclaim', run_id=args.run_id, runtime=args.runtime, horizon=args.horizon, op_id=operation_id, from_op=target_epoch, evidence_hash=evidence_hash, forced='true' if args.force else None, evidence='required' if args.force else None, **{'from': target['run_id']})}\n"
-    ) as path:
-        run(["gh", "issue", "comment", str(args.issue), "--body-file", path],
-            cwd=cwd, writes=True)
-    data = wait_for_issue(
-        args.issue, "assignees,labels,comments",
-        lambda item: operation_marker(item.get("comments", []), operation_id,
-                                      "reclaim", expected) is not None,
-        cwd, "reclaim operation is not visible; retry with the same operation ID",
-        ambiguous_write=True)
-    current = reduce_ownership(data.get("comments", []), utc_now_stamp())["event"]
-    if not current or current.get("operation_id") != operation_id:
-        if current:
-            converge_ownership_projection(args.issue, current, cwd)
-        raise Stop({"ok": False, "reason": "lost-reclaim-race",
-                    "winner": current["run_id"] if current else None})
-    converge_ownership_projection(args.issue, current, cwd)
-    return {"ok": True, "issue": args.issue, "reclaimed_from": target["run_id"],
-            "run_id": args.run_id, "forced": current["forced"],
-            "reused_existing_reclaim": False}
 
 
 def cmd_transition(args, config, cwd) -> dict:
@@ -2520,10 +2315,9 @@ def cmd_changelog_notes(args, config, cwd) -> dict:
     }
 
 
-def _cmd_unassign_legacy(args, config, cwd) -> dict:
+def cmd_unassign(args, config, cwd) -> dict:
     """Release in the timeline first, then remove only projections no live holder needs."""
     data = issue_view(args.issue, "assignees,labels,comments", cwd=cwd)
-    reject_legacy_writer(data.get("comments", []))
     ownership = reduce_ownership(data.get("comments", []), utc_now_stamp())
     events = ownership["live"] + ownership["stale"]
     mine = next((event for event in events if event["run_id"] == args.run_id), None)
@@ -2578,70 +2372,6 @@ def _cmd_unassign_legacy(args, config, cwd) -> dict:
         "issue": args.issue,
         "assignee_kept": bool(ownership["holder"]),
     }
-
-
-def cmd_unassign(args, config, cwd) -> dict:
-    """Discover the target without writing, then release only that exact acquisition epoch."""
-    if not hasattr(args, "operation_id"):
-        return _cmd_unassign_legacy(args, config, cwd)
-    operation_id = require_operation_id(args.operation_id)
-    data = issue_view(args.issue, "assignees,labels,comments", cwd=cwd)
-    comments = data.get("comments", [])
-    reject_operation_kind_conflict(comments, operation_id, {"unassign"})
-    requested_target = getattr(args, "target_operation", None)
-    expected = {"run-id": args.run_id, "runtime": args.runtime}
-    if requested_target:
-        expected["target-op"] = requested_target
-    existing = operation_marker(comments, operation_id, "unassign", expected)
-    ownership = reduce_ownership(comments, utc_now_stamp())
-    if existing:
-        converge_ownership_projection(args.issue, ownership["event"], cwd)
-        if args.held_by_other and ownership["holder"] in {None, args.run_id}:
-            raise Stop({"ok": False, "reason": "held-by-other-holder-disappeared"})
-        return {"ok": True, "issue": args.issue,
-                "assignee_kept": bool(ownership["holder"])}
-    mine = next((event for event in ownership["live"] + ownership["stale"]
-                 if event["run_id"] == args.run_id), None)
-    if not mine:
-        raise Stop({"ok": False, "reason": "nothing-to-unassign"})
-    other_live = any(event["run_id"] != args.run_id for event in ownership["live"])
-    if args.held_by_other and not other_live:
-        raise Stop({"ok": False, "reason": "held-by-other-without-other-holder"})
-    projected = {name for name in label_names(data) if name.startswith("dev:")}
-    successor = next((event for event in ownership["live"] if event["run_id"] != args.run_id), None)
-    if mine is ownership["event"] and successor and not successor.get("runtime"):
-        if len({name[4:] for name in projected if holder_uses_runtime(successor, name[4:])}) != 1:
-            raise Stop({"ok": False, "reason": "holder-runtime-missing"})
-    if ((mine["runtime"] and mine["runtime"] != args.runtime)
-            or (not mine["runtime"] and projected != {f"dev:{args.runtime}"})):
-        raise Stop({"ok": False, "reason": "unassign-metadata-mismatch"})
-    target_epoch = ownership_epoch(mine)
-    if requested_target is None:
-        return {"ok": True, "issue": args.issue, "write_performed": False,
-                "target_operation": target_epoch,
-                "next": "repeat unassign with --target-operation and the same operation ID"}
-    if requested_target != target_epoch:
-        raise Stop({"ok": False, "reason": "target-operation-mismatch",
-                    "expected": target_epoch, "provided": requested_target})
-    expected["target-op"] = target_epoch
-    with body_file(
-        f"`{args.run_id}` releasing exact epoch `{target_epoch}`.\n\n"
-        f"{marker('unassign', run_id=args.run_id, runtime=args.runtime, op_id=operation_id, target_op=target_epoch)}\n"
-    ) as path:
-        run(["gh", "issue", "comment", str(args.issue), "--body-file", path],
-            cwd=cwd, writes=True)
-    data = wait_for_issue(
-        args.issue, "assignees,labels,comments",
-        lambda item: operation_marker(item.get("comments", []), operation_id,
-                                      "unassign", expected) is not None,
-        cwd, "unassign operation is not visible; retry with the same operation ID",
-        ambiguous_write=True)
-    ownership = reduce_ownership(data.get("comments", []), utc_now_stamp())
-    converge_ownership_projection(args.issue, ownership["event"], cwd)
-    if args.held_by_other and ownership["holder"] in {None, args.run_id}:
-        raise Stop({"ok": False, "reason": "held-by-other-holder-disappeared"})
-    return {"ok": True, "issue": args.issue,
-            "assignee_kept": bool(ownership["holder"])}
 
 
 def cmd_audit_board(args, config, cwd) -> dict:
@@ -2750,7 +2480,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-id", required=True)
     p.add_argument("--runtime", required=True)
     p.add_argument("--horizon", required=True, help="when you expect to report, e.g. 2026-07-25T23:00Z")
-    p.add_argument("--operation-id", required=True, help="fresh 32 lowercase hex chars; reuse on retry")
 
     p = sub.add_parser("verify-claim", help="the renewal: prove current live ownership and state")
     p.add_argument("--issue", type=int, required=True)
@@ -2764,9 +2493,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--issue", type=int, required=True)
     p.add_argument("--run-id", required=True)
     p.add_argument("--runtime", required=True)
-    p.add_argument("--operation-id", required=True, help="fresh 32 lowercase hex chars; reuse on retry")
-    p.add_argument("--target-operation", help="exact target returned by the read-only first call")
-    p.add_argument("--horizon", required=True, help="new ownership horizon")
+    p.add_argument("--horizon", help="new ownership horizon; defaults to four hours from now")
     p.add_argument("--force", action="store_true",
                    help="reclaim a holder who is not stale — needs a defensible reason")
     p.add_argument("--reason-file", help="evidence required when --force creates a new event")
@@ -2810,8 +2537,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--issue", type=int, required=True)
     p.add_argument("--runtime", required=True)
     p.add_argument("--run-id", required=True)
-    p.add_argument("--operation-id", required=True, help="fresh 32 lowercase hex chars; reuse on retry")
-    p.add_argument("--target-operation", help="exact target returned by the read-only first call")
     p.add_argument("--held-by-other", action="store_true",
                    help="assert that the reducer still has another live holder after this release")
 
@@ -2876,7 +2601,7 @@ def main(argv: list[str] | None = None) -> int:
         result = COMMANDS[args.command](args, load_config(), cwd)
     except Stop as stop:
         print(json.dumps(stop.payload, indent=2))
-        return 2 if stop.payload.get("reason") in {"invalid-operation-id", "invalid-horizon"} else 1
+        return 1
     except ReadFailure as failure:
         # The control surface answered NOTHING. "Nothing" is not a stand-down and not clearance.
         print(json.dumps({

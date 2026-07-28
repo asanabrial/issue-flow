@@ -104,7 +104,7 @@ either: **an identity field cannot adjudicate a race between runs that share tha
 `SKILL.md` warns that "parsing prose for the same answer is fragile — any rewording breaks it", and
 adjudication used to depend on exactly that. So every control comment the script writes carries a
 machine-readable trailer alongside the sentence a human reads. These first-generation examples are
-retained as historical syntax; current ownership writers also include runtime and operation fields:
+retained as historical syntax; current writers add runtime where available:
 
 ```
 <!-- issue-flow: claim run-id=claude-code-60fabae1 horizon=2026-07-25T23:00Z -->
@@ -157,15 +157,15 @@ ones.
 `<n>` is the issue number throughout. `SCRIPT` abbreviates
 `python <skill>/scripts/github.py --repo-dir <repo>`.
 
-Every ownership write uses a fresh lowercase 32-hex `--operation-id`, reused unchanged on retry. For `reclaim` and `unassign`, first omit `--target-operation`: the command succeeds without writing and returns the exact target; repeat with both IDs to authorize only that epoch. Identical hidden-write retries reduce to one event, while a conflicting later copy cannot erase the first. Unedited legacy markers remain readable until the issue's first operation-scoped marker; later legacy writes on that issue are inert, avoiding a deployment-time cutoff gap.
+The reducer preserves the first immutable copy of an operation and activates strict epoch semantics per issue at its first operation-scoped marker. Earlier unedited legacy history remains readable and later legacy writes reduce as inert. Current CLI commands still emit legacy markers, so normal issues do not activate until the operation-aware writer slice ships.
 
 | Operation | Command | What it guarantees beyond the obvious |
 |---|---|---|
 | `ensure_states` | `SCRIPT ensure-states` | idempotent; run it before your first write to an unfamiliar project |
 | `create` | `SCRIPT create --identity <id> --title <t> --body-file <f> --priority <scale:value> --domain <name> --runtime <rt> --run-id <id> [--state ready\|blocked]` | creates every label **before** attaching it, then mirrors the initial board column — the case everyone forgets, because no `transition` ever follows a fresh issue to correct an empty `Status` |
 | `list_state` | `SCRIPT list-state --state <s>` | unassigned only, `--limit 200` (the default cap is 30 and silently truncates the queue), partitioned by `domain:<name>`. It returns the raw labels and **refuses to rank across partitions** — ordering inside one needs the domain's scale contract, and manufacturing a global rank is forbidden |
-| `claim` | `SCRIPT claim --issue <n> --run-id <id> --runtime <rt> --horizon <UTC> --operation-id <32-hex>` | retries may duplicate transport, never the semantic event; renewals use a fresh operation ID |
-| `reclaim` | `SCRIPT reclaim --issue <n> --run-id <id> --runtime <rt> --horizon <UTC> --operation-id <32-hex> [--target-operation <epoch>] [--force --reason-file <f>]` | target discovery is read-only; the write binds target, evidence, privilege and metadata, then proves exact projections |
+| `claim` | `SCRIPT claim --issue <n> --run-id <id> --runtime <rt> --horizon <UTC>` | renews an expired self-claim, waits boundedly for visibility, then proves the exact sole assignee and `dev:*` set; stale foreign contenders route through `reclaim` |
+| `reclaim` | `SCRIPT reclaim --issue <n> --run-id <id> --runtime <rt> [--horizon <UTC>] [--force --reason-file <f>]` | waits boundedly for its event, adjudicates the winner, and proves exact projections; holder heartbeats extend liveness by at most one four-hour window |
 | `verify_claim` | `SCRIPT verify-claim --issue <n> --run-id <id> --expect-state <s> [--allow-closed-by-pr <pr>]` | proves the requested run is the reducer's current live winner and uses timeline position, not second-precision timestamps, as its control-message watermark |
 | `transition` | `SCRIPT transition --issue <n> --to <s> [--from <s>]` | mirrors the board **first**, swaps the label in **one** call, then reads **both** back and repairs a board that disagrees. Omitting `--from` removes whatever stale state labels it finds |
 | `comment` | `SCRIPT comment --issue <n> --body-file <f> [--run-id <id> --kind note\|blocker\|diagnosis]` | file-based body, always; `--run-id` and `--kind` are a pair. Every generic comment gets a non-control marker, and quoted issue-flow markers plus claim-shaped legacy prose are escaped, so generic text cannot become a control event or fall through to the prose parser |
@@ -174,7 +174,7 @@ Every ownership write uses a fresh lowercase 32-hex `--operation-id`, reused unc
 | `publish_review` | `SCRIPT publish-review --issue <n> --branch <b> --base <base> --run-id <id> --pr-title <t> --pr-body-file <f> [--worktree <p>]` | pushes, **reuses** the single open PR or creates one, refuses on more than one, scans for closing keywords, and records the PR URL with its exact head and base SHAs |
 | `changelog-notes` | `SCRIPT changelog-notes --version <x.y.z> --file <changelog> [--out <f>]` | read-only. Extracts the version's entry for its tag and Release, anchored on the version **opening** the heading. Fails closed on a missing or empty entry — a tag is immutable, so notes invented at tag time are permanent |
 | `check closing keywords` | `SCRIPT check-closing-keywords --issue <n>` | run again before merging: the branch's commit messages can introduce one after the body is already clean |
-| `unassign` | `SCRIPT unassign --issue <n> --runtime <rt> --run-id <id> --operation-id <32-hex> [--target-operation <epoch>] [--held-by-other]` | target discovery is read-only; retries cannot release a later acquisition |
+| `unassign` | `SCRIPT unassign --issue <n> --runtime <rt> --run-id <id> [--held-by-other]` | binds retries to landed runtime provenance, waits boundedly for release visibility, then proves exact projections |
 | board audit | `SCRIPT audit-board [--fix]` | compares every card's column against its own `status:*` label. **Zero cards is reported as a failed read, not a clean board** |
 | `review_status` | *(agent, not scripted)* | `gh pr view <pr> --json headRefOid,baseRefOid,latestReviews,reviewDecision,reviewRequests,mergeStateStatus`. The independent verdict artifact MUST contain `Reviewer-Run: <run-id>`, `Reviewed-Head: <full-head-sha>` and `Reviewed-Base: <full-base-sha>`; re-read both SHAs after review and reject the verdict if either differs. The verdict is mandatory even when every runtime authenticates as the PR author and GitHub cannot supply a distinct native approval |
 | `ci_status` | *(agent, not scripted)* | see *CI, merge and delivery* below |
