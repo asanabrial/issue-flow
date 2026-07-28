@@ -104,10 +104,10 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | K27 | Built but undeliverable work stays in review and is never bypassed. | `SKILL.md` | Preserve honest delivery state. | yes | no |
 | K28 | Merge only the reviewed/green head and verify delivered topology. | `SKILL.md` | Preserve reviewed history. | yes | no |
 | K29 | Version tags are immutable, remote-verified, and release-aware. | `SKILL.md` | Keep publication a delivery gate. | yes | no |
-| K30 | Base is read-only; each issue uses one branch and isolated worktree. | `references/repository-delivery.md` | Consolidate repository isolation. | yes | no |
-| K31 | Worktree paths cannot be shared; resume only the branch's registered checkout. | `references/repository-delivery.md` | Preserve collision safety. | yes | no |
-| K32 | Fresh worktrees restore required ignored inputs and reuse the established environment. | `references/repository-delivery.md` | Prevent checkout-only failures. | yes | no |
-| K33 | Integrate current base and merge rather than rebase by default. | `references/repository-delivery.md` | Preserve SHA-bound evidence. | yes | no |
+| K30 | Base is read-only; each issue uses one branch and isolated worktree. | `references/repository-delivery.md` | Consolidate repository isolation. | yes | yes |
+| K31 | Worktree paths cannot be shared; resume only the branch's registered checkout. | `references/repository-delivery.md` | Preserve collision safety. | yes | yes |
+| K32 | Fresh worktrees restore required ignored inputs and reuse the established environment. | `references/repository-delivery.md` | Prevent checkout-only failures. | yes | yes |
+| K33 | Integrate current base and merge rather than rebase by default. | `references/repository-delivery.md` | Preserve SHA-bound evidence. | yes | yes |
 | K34 | Horizons, read-before-write heartbeats, and reclaim retain prior work. | `references/safety-incidents.md` | Consolidate abandoned-work recovery. | yes | no |
 | K35 | Analysis, blocked, and review handoffs remain distinct and documented on the issue. | `references/safety-incidents.md` | Prevent recoverable work burial. | yes | no |
 | K36 | Acceptance criteria precede implementation; partial fixes never ship as complete. | `references/safety-incidents.md` | Preserve the done bar. | yes | no |

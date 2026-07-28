@@ -2203,23 +2203,42 @@ def cmd_start_branch(args, config, cwd) -> dict:
 
     _, repo_name = repo_identity(cwd)
     path = worktree_path(template, repo_name, args.branch, args.run_id, args.issue)
+    run_token = re.escape(str(args.run_id))
+    if "<run-id>" not in template and not re.search(
+            rf"(^|[/\\_.-]){run_token}($|[/\\_.-])", template):
+        raise Stop(
+            {
+                "ok": False,
+                "reason": "worktree-path-not-run-scoped",
+                "path": str(path),
+                "action": "include `<run-id>` in the worktree template so a displaced process "
+                          "cannot share this checkout",
+            }
+        )
 
     # An existing path means one of three different things, and they are not interchangeable.
     #
-    # This matters because the template is configurable. With `<run-id>` in it a path is unique per
-    # run, so ANY existing path is foreign. Without it — `<repo>/<branch>` — an existing path is
-    # usually your OWN branch's worktree, and refusing it would make every resume impossible while
-    # protecting against nothing: git already refuses a second checkout of a branch that is live
-    # elsewhere ("fatal: '<branch>' is already used by worktree at ..."), which is the collision
-    # that actually costs work.
-    #
-    # So the question is not "does it exist" but "is it MINE": a registered worktree for this exact
-    # branch is a resume; anything else is a stranger's tree or an orphan directory left by a dead
-    # run, and writing into either is the #58 failure.
+    # Git registration protects a branch, not a process: a reclaimer can otherwise enter the old
+    # run's registered checkout while that process is still writing. The run-scoped desired path is
+    # the identity boundary; the same branch anywhere else must be handed off and removed first.
     resuming = False
+    registered = registered_worktrees(cwd)
+    normalised = normalise_path(path)
+    branch_paths = [registered_path for registered_path, branch in registered.items()
+                    if branch == args.branch]
+    if branch_paths and normalised not in branch_paths:
+        raise Stop(
+            {
+                "ok": False,
+                "reason": "worktree-branch-in-use",
+                "path": str(path),
+                "registered_paths": branch_paths,
+                "action": "the branch is checked out by another run; preserve its work, prove the "
+                          "holder stopped, then remove that worktree before resuming",
+            }
+        )
     if path.exists():
-        registered = registered_worktrees(cwd)
-        owner_branch = registered.get(normalise_path(path))
+        owner_branch = registered.get(normalised)
         if owner_branch == args.branch:
             resuming = True
         else:
