@@ -686,10 +686,15 @@ conflicting_release = acquisitions[:1] + [comment(m.marker("standdown", run_id=M
 check("conflicting release copies invalidate their acquisition", m.reduce_ownership(conflicting_release, NOW)["holder"], None)
 forged_target = [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_A)), comment(m.marker("claim", run_id=OTHER, runtime="codex", horizon=FUTURE, op_id=OP_B), "2026-01-02T00:00:01Z"), comment(m.marker("standdown", run_id=OTHER, op_id=OP_B, target_op=OP_A), "2026-01-02T00:00:02Z")]
 check("a scoped control cannot release another run's acquisition", m.reduce_ownership(forged_target, NOW)["holder"], ME)
+check("empty operation syntax cannot downgrade to legacy", [m.reduce_ownership(items, NOW)["holder"] for items in ([comment(f"<!-- issue-flow: claim run-id={ME} runtime=opencode horizon={FUTURE} op-id= -->")], acquisitions[:1] + [comment(f"<!-- issue-flow: unassign run-id={ME} op-id= target-op= -->")])], [None, ME])
+check("modern acquisitions require complete metadata", m.reduce_ownership([comment(m.marker("claim", run_id=ME, horizon=FUTURE, op_id=OP_A))], NOW)["holder"], None)
+check("a standdown ID cannot be retargeted to a later same-run epoch", m.reduce_ownership(acquisitions + [comment(m.marker("standdown", run_id=ME, op_id=OP_A, target_op=OP_B), "2026-01-02T00:00:02Z")], NOW)["event"]["operation_id"], OP_B)
 evidence_digest = hashlib.sha256(b"reason").hexdigest()
-wrong_target_hash = m.forced_reclaim_hash(evidence_digest, OTHER, "codex", FUTURE, ME, OP_A)
+wrong_target_hash = m.forced_reclaim_hash(OP_C, evidence_digest, OTHER, "codex", FUTURE, ME, OP_A)
 edited_target = acquisitions + [comment(f"{m.FORCED_EVIDENCE_HEADING}\n\nreason\n\n{m.marker('reclaim', run_id=OTHER, runtime='codex', horizon=FUTURE, op_id=OP_C, from_op=OP_B, evidence_hash=wrong_target_hash, forced='true', evidence='required', **{'from': ME})}", "2026-01-02T00:00:03Z")]
 check("forced evidence binds the exact takeover metadata", m.reduce_ownership(edited_target, NOW)["holder"], ME)
+right_hash = m.forced_reclaim_hash(OP_C, evidence_digest, OTHER, "codex", FUTURE, ME, OP_B)
+check("forced evidence binds operation identity", [m.reduce_ownership(acquisitions + [comment(f"{m.FORCED_EVIDENCE_HEADING}\n\nreason\n\n{m.marker('reclaim', run_id=OTHER, runtime='codex', horizon=FUTURE, op_id=op, from_op=OP_B, evidence_hash=right_hash, forced='true', evidence='required', **{'from': ME})}", "2026-01-02T00:00:03Z")], NOW)["holder"] for op in (OP_C, "d" * 32)], [OTHER, ME])
 
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):

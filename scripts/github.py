@@ -377,6 +377,14 @@ def parse_markers(body: str) -> list[dict[str, str]]:
     return found
 
 
+def valid_acquisition_marker(mark: dict) -> bool:
+    if "op-id" not in mark:
+        return True
+    return bool(OPERATION_ID_RE.fullmatch(mark["op-id"]) and mark.get("runtime")
+                and HORIZON_RE.fullmatch(mark.get("horizon", ""))
+                and (mark["kind"] == "claim" or (mark.get("from") and mark.get("from-op"))))
+
+
 OPERATION_FIELDS = {
     "claim": ("run-id", "runtime", "horizon"),
     "reclaim": ("run-id", "runtime", "horizon", "from", "from-op", "forced", "evidence-hash"),
@@ -404,9 +412,10 @@ def forced_evidence_digest(comment: dict, marker_index: int | None) -> str | Non
     return hashlib.sha256(evidence.encode()).hexdigest()
 
 
-def forced_reclaim_hash(evidence: str, run_id: str, runtime: str, horizon: str,
+def forced_reclaim_hash(operation_id: str, evidence: str, run_id: str, runtime: str, horizon: str,
                         from_run: str, from_operation: str) -> str:
-    fields = [evidence, run_id, runtime, horizon, from_run, from_operation]
+    fields = ["forced-reclaim-v1", operation_id, True, evidence, run_id, runtime,
+              horizon, from_run, from_operation]
     return hashlib.sha256(json.dumps(fields, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -445,7 +454,7 @@ def claim_comments(comments: list[dict]) -> list[tuple[str, str, dict]]:
         has_claim_marker = any(mark.get("kind") == "claim" for mark in parsed)
         for mark in parsed:
             if (mark.get("kind") == "claim" and mark.get("run-id")
-                    and (not mark.get("op-id") or OPERATION_ID_RE.fullmatch(mark["op-id"]))):
+                    and valid_acquisition_marker(mark)):
                 run_id = mark["run-id"]
                 break
         if not run_id and not has_claim_marker:
@@ -471,7 +480,7 @@ def ownership_events(comments: list[dict]) -> list[dict]:
         parsed = parse_markers(comment.get("body", ""))
         selected = next(((index, mark) for index, mark in enumerate(parsed)
                          if mark.get("kind") in {"claim", "reclaim"} and mark.get("run-id")
-                         and (not mark.get("op-id") or OPERATION_ID_RE.fullmatch(mark["op-id"]))), None)
+                         and valid_acquisition_marker(mark)), None)
         marker_index, event = selected if selected else (None, None)
         if not event and id(comment) in claims:
             event = {"kind": "claim", "run-id": claims[id(comment)]}
@@ -648,12 +657,14 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
                 continue
             target_epoch = mark.get("from-op") if kind == "reclaim" else mark.get("target-op")
             operation_id = mark.get("op-id")
+            operation_scoped = any(key in mark for key in ("op-id", "target-op", "from-op"))
             if (kind in RELEASE_ATTRS_BY_KIND and kind in OPERATION_FIELDS and operation_id
                     and OPERATION_ID_RE.fullmatch(operation_id)):
                 target = event_by_epoch.get(target_epoch)
                 signature = (kind, *(mark.get(field) for field in OPERATION_FIELDS[kind]))
                 if (not target_epoch or (kind in {"standdown", "unassign"} and (
                         not target or target["run_id"] != mark.get("run-id")
+                        or (kind == "standdown" and operation_id != target_epoch)
                         or (kind == "unassign" and not holder_uses_runtime(target, mark.get("runtime")))))):
                     conflicts.add(operation_id)
                 elif operation_id in controls and controls[operation_id][0] != signature:
@@ -663,7 +674,7 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
                 if kind == "unassign" and operation_id in acquisition_ids:
                     conflicts.add(operation_id)
                 continue
-            if target_epoch or operation_id:
+            if operation_scoped:
                 # A malformed operation-scoped control must not downgrade into a broad legacy release.
                 continue
             for attr in RELEASE_ATTRS_BY_KIND.get(kind, ()):
@@ -683,8 +694,9 @@ def reduce_ownership(comments: list[dict], now: str) -> dict:
                        epoch_release_positions.get(ownership_epoch(event), -1))
         if event["position"] > released:
             previous = latest_by_run.get(event["run_id"])
-            if previous and all(previous[field] == event[field]
-                                for field in ("kind", "runtime", "horizon", "from", "forced")):
+            if (previous and previous.get("operation_id") == event.get("operation_id")
+                    and all(previous[field] == event[field]
+                            for field in ("kind", "runtime", "horizon", "from", "forced"))):
                 # A hidden first write may be retried. Identical acquisitions keep their earliest
                 # server timestamp so a duplicate cannot lose a race that its first write won.
                 continue
@@ -719,8 +731,9 @@ def valid_reclaim(event: dict, comments: list[dict]) -> bool:
         digest = event["evidence_body_hash"]
         if not digest:
             return False
-        bound = forced_reclaim_hash(digest, event["run_id"], event["runtime"], event["horizon"],
-                                    event["from"], event.get("from_operation"))
+        bound = forced_reclaim_hash(event.get("operation_id"), digest, event["run_id"],
+                                    event["runtime"], event["horizon"], event["from"],
+                                    event.get("from_operation"))
         if (event.get("operation_id") or event["comment"].get("includesCreatedEdit") is not False) and (
                 not event.get("evidence_hash") or bound != event["evidence_hash"]):
             return False
