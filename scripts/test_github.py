@@ -699,6 +699,96 @@ check("forced evidence binds the exact takeover metadata", m.reduce_ownership(ed
 right_hash = m.forced_reclaim_hash(OP_C, evidence_digest, OTHER, "codex", FUTURE, ME, OP_B)
 check("forced evidence binds operation identity", [m.reduce_ownership(acquisitions + [comment(f"{m.FORCED_EVIDENCE_HEADING}\n\nreason\n\n{m.marker('reclaim', run_id=OTHER, runtime='codex', horizon=FUTURE, op_id=op, from_op=OP_B, evidence_hash=right_hash, forced='true', evidence='required', **{'from': ME})}", "2026-01-02T00:00:03Z")], NOW)["holder"] for op in (OP_C, "d" * 32)], [OTHER, ME])
 
+writer_claim = FakeIssue(); writer_claim.delayed_reads = 9
+claim_args = SimpleNamespace(issue=1, run_id=ME, runtime="claude-code", horizon=FUTURE,
+                             operation_id=OP_A)
+with remote(writer_claim):
+    try:
+        m.cmd_claim(claim_args, {}, Path("."))
+    except m.WriteFailure:
+        pass
+    writer_claim.delayed_reads = 0; writer_claim.stale_reads = 1
+    claim_retry = m.cmd_claim(claim_args, {}, Path("."))
+check("claim retries reduce duplicate transport to one operation",
+      (claim_retry["ok"], len(writer_claim.comments),
+       len(m.ownership_events(writer_claim.comments))), (True, 2, 1))
+with remote(writer_claim):
+    try:
+        m.cmd_claim(SimpleNamespace(issue=1, run_id=ME, runtime="opencode", horizon=FUTURE,
+                                    operation_id=OP_A), {}, Path("."))
+    except m.Stop as exc:
+        claim_mismatch_reason = exc.payload["reason"]
+check("claim retries cannot alter operation metadata", claim_mismatch_reason,
+      "claim-metadata-mismatch")
+
+writer_reclaim = FakeIssue([comment(m.marker(
+    "claim", run_id="dead", runtime="codex", horizon="2026-01-01T01:00Z"))], ["dev:codex"])
+reclaim_args = SimpleNamespace(issue=1, run_id=ME, runtime="claude-code", horizon=FUTURE,
+                               operation_id=OP_C, target_operation=None, force=False)
+with remote(writer_reclaim):
+    try:
+        m.cmd_reclaim(reclaim_args, {}, Path("."))
+    except m.Stop as exc:
+        reclaim_target = exc.payload.get("target_operation")
+    reclaim_discovery_comments = len(writer_reclaim.comments)
+    reclaim_args.target_operation = reclaim_target
+    reclaimed = m.cmd_reclaim(reclaim_args, {}, Path("."))
+    reclaimed_retry = m.cmd_reclaim(reclaim_args, {}, Path("."))
+check("reclaim discovers then persists its exact target operation",
+      (reclaim_discovery_comments, reclaimed["ok"], reclaimed_retry["reused_existing_reclaim"],
+       len(m.ownership_events(writer_reclaim.comments)),
+       m.reduce_ownership(writer_reclaim.comments, NOW)["event"]["operation_id"]),
+      (1, True, True, 2, OP_C))
+
+writer_release = FakeIssue([comment(m.marker(
+    "claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_A))], ["dev:opencode"])
+writer_release.assigned = True
+release_args = SimpleNamespace(issue=1, run_id=ME, runtime="opencode", operation_id=OP_C,
+                               target_operation=None, held_by_other=False)
+with remote(writer_release):
+    try:
+        m.cmd_unassign(release_args, {}, Path("."))
+    except m.Stop as exc:
+        release_target = exc.payload.get("target_operation")
+    release_args.target_operation = release_target
+    m.cmd_unassign(release_args, {}, Path("."))
+    writer_release.comments.append(comment(m.marker(
+        "claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_B),
+        "2026-01-02T00:00:03Z"))
+    release_retry = m.cmd_unassign(release_args, {}, Path("."))
+check("an old release retry preserves a later reacquisition",
+      (release_retry["assignee_kept"], m.reduce_ownership(
+          writer_release.comments, NOW)["event"]["operation_id"]), (True, OP_B))
+with remote(writer_release):
+    try:
+        m.cmd_claim(SimpleNamespace(issue=1, run_id=ME, runtime="opencode", horizon=FUTURE,
+                                    operation_id=OP_C), {}, Path("."))
+    except m.Stop as exc:
+        kind_conflict_reason = exc.payload["reason"]
+check("operation IDs cannot cross writer kinds", kind_conflict_reason,
+      "operation-id-kind-conflict")
+
+rebind_release = FakeIssue([comment(m.marker(
+    "claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_A))], ["dev:opencode"])
+rebind_args = SimpleNamespace(issue=1, run_id=ME, runtime="opencode", operation_id=OP_C,
+                              target_operation=None, held_by_other=False)
+with remote(rebind_release):
+    try:
+        m.cmd_unassign(rebind_args, {}, Path("."))
+    except m.Stop as exc:
+        rebind_args.target_operation = exc.payload["target_operation"]
+    rebind_release.comments = [comment(m.marker(
+        "claim", run_id=ME, runtime="opencode", horizon=FUTURE, op_id=OP_B))]
+    try:
+        m.cmd_unassign(rebind_args, {}, Path("."))
+    except m.Stop as exc:
+        rebind_reason = exc.payload["reason"]
+check("an unlanded operation cannot rebind to a later epoch",
+      (rebind_reason, m.reduce_ownership(rebind_release.comments, NOW)["event"]["operation_id"]),
+      ("target-operation-mismatch", OP_B))
+post_cutover = "2026-07-28T00:35:04Z"
+check("legacy ownership writes are inert after activation", [m.reduce_ownership(items, NOW)["holder"] for items in ([comment("Claimed by old, expect to report by later.", post_cutover)], [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon=FUTURE)), comment(m.marker("unassign", run_id=ME, runtime="opencode"), post_cutover)])], [None, ME])
+
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):
         if getattr(self, "outage", False):
@@ -1000,9 +1090,9 @@ except m.Stop as exc:
 check("unassign cannot borrow mismatched runtime metadata",
       (wrong_runtime, len(wrong_runtime_release.comments)), ("unassign-metadata-mismatch", 1))
 
-unassign_parser = m.build_parser()._subparsers._group_actions[0].choices["unassign"]
-check("unassign requires run-id at the CLI boundary",
-      next(action for action in unassign_parser._actions if action.dest == "run_id").required, True)
+operation_parsers = m.build_parser()._subparsers._group_actions[0].choices
+check("ownership writers require operation identity at the CLI boundary", [next(a for a in operation_parsers[command]._actions if a.dest == "operation_id").required for command in ("claim", "reclaim", "unassign")], [True, True, True])
+check("target discovery remains a read-only first call", [next(a for a in operation_parsers[command]._actions if a.dest == "target_operation").required for command in ("reclaim", "unassign")], [False, False])
 git_commands, fetched = [], [False]
 def fake_git_run(argv, cwd=None, check=True, writes=False):
     git_commands.append(list(argv))
