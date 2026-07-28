@@ -213,8 +213,8 @@ up first, refuses a name that matches no row or more than one, and refuses a val
 which would split the cell and corrupt the table.
 
 `sync` makes the complete tracked installation match verified canonical `origin/main` while leaving
-ignored `operator.local.md` and local files untouched. The retired `--from` form fails before
-mutation; arbitrary local checkouts cannot become upgrade authority:
+ignored `operator.local.md` and local files untouched; bootstrap uses the same preflight. Retired
+`--from` fails before mutation, so arbitrary local checkouts cannot become upgrade authority:
 
 ```sh
 ./install.sh sync
@@ -222,8 +222,8 @@ mutation; arbitrary local checkouts cannot become upgrade authority:
 
 Sync requires a clean tracked `main`, verified runtime links, the canonical origin, and a target that
 still ignores local policy. Git performs a no-overwrite fast-forward and retains the prior HEAD in
-the reflog. The self-acquiring installer applies the same preflight before upgrading legacy clones.
-Never force-add `operator.local.md`: its values include publish and merge permissions.
+the reflog. After interruption, confirm no Git process remains, clear only a stale `index.lock`, run
+`git reset --hard HEAD`, then retry. Never force-add `operator.local.md`: it contains permissions.
 
 ## Status
 

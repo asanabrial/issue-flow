@@ -28,6 +28,39 @@ CANONICAL=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || CANONIC
 case ${0##*/} in sh|dash|bash|ksh|zsh) CANONICAL='' ;; esac
 RUNTIME_DIRS="$HOME/.claude/skills $HOME/.codex/skills"
 
+runtime_links_valid() {
+    repo=$1; root=''
+    for link in "$HOME/.claude/skills/$SKILL_NAME" "$HOME/.codex/skills/$SKILL_NAME"; do
+        [ ! -e "$link" ] && [ ! -L "$link" ] && continue
+        [ -n "$root" ] || root=$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null) || return 1
+        [ "$(git -C "$link" rev-parse --show-toplevel 2>/dev/null)" = "$root" ] || return 1
+    done
+}
+fetch_target() {
+    repo=$1; ref="refs/issue-flow-sync/$$"
+    git -C "$repo" -c core.hooksPath=/dev/null fetch -q --no-tags "$REPO" "+refs/heads/main:$ref" || return 1
+    target=$(git -C "$repo" rev-parse "$ref") || return 1
+    git -C "$repo" -c core.hooksPath=/dev/null update-ref -d "$ref" || return 1
+    printf '%s\n' "$target"
+}
+target_policy_safe() {
+    repo=$1; target=$2
+    paths=$(git -C "$repo" ls-tree -r --name-only "$target") || return 1
+    if printf '%s\n' "$paths" | grep -iE '^operator[.]local[.]md(/|$)' >/dev/null; then return 1; else [ "$?" -eq 1 ] || return 1; fi
+    entry=$(git -C "$repo" ls-tree "$target" -- .gitignore) || return 1
+    case "$entry" in 100644\ *|100755\ *) ;; *) return 1 ;; esac
+    tmp=$(mktemp -d) || return 1
+    git -C "$repo" show "${target}:.gitignore" > "$tmp/.gitignore" || { rm -rf -- "$tmp"; return 1; }
+    gitdir=$(git -C "$repo" rev-parse --absolute-git-dir) || { rm -rf -- "$tmp"; return 1; }
+    if git --git-dir="$gitdir" --work-tree="$tmp" -C "$tmp" -c core.excludesFile=/dev/null check-ignore --no-index -q "$CONFIG_FILE"; then result=0; else result=$?; fi
+    rm -rf -- "$tmp"; [ "$result" -eq 0 ]
+}
+safe_merge() {
+    repo=$1; target=$2
+    [ "$(git -C "$repo" symbolic-ref --quiet --short HEAD)" = main ] || return 1
+    git -C "$repo" -c core.hooksPath=/dev/null merge --ff-only --no-overwrite-ignore -q "$target"
+}
+
 # Piped (`curl | sh`) or run from outside a checkout, there is no skill next to this script.
 # Then the installer acquires itself - clone on first contact, upgrade after - and hands over to
 # the on-disk copy, so everything of substance always executes from files you can read.
@@ -36,33 +69,29 @@ if [ ! -f "$CANONICAL/SKILL.md" ] || [ ! -f "$CANONICAL/install.sh" ]; then
     command -v git >/dev/null 2>&1 || {
         printf 'error: git is required - install it and re-run.
 ' >&2; exit 1; }
+    BOOT_DRY=0
+    for arg in "$@"; do case "$arg" in --from|--from=*) printf 'error: --from is retired; sync from canonical origin/main.\n' >&2; exit 1;; --dry-run) BOOT_DRY=1;; esac; done
+    runtime_links_valid "$DEST" || { printf 'error: runtime paths do not target canonical skill.\n' >&2; exit 1; }
     if [ -e "$DEST" ] && [ ! -e "$DEST/.git" ]; then
         printf 'error: %s exists and is not a git clone - move it aside and re-run.
 ' "$DEST" >&2
         exit 1
     fi
     if [ ! -e "$DEST" ]; then
+        [ "$BOOT_DRY" -eq 0 ] || { printf 'would   install canonical issue-flow Git tree.\n'; exit 0; }
         printf 'installing into %s
 ' "$DEST"
         git clone -q --depth 1 "$REPO" "$DEST"
     else
         printf 'upgrading %s
 ' "$DEST"
-        for arg in "$@"; do case "$arg" in --from|--from=*) printf 'error: --from is retired; sync from canonical origin/main.\n' >&2; exit 1;; esac; done
-        for base in $RUNTIME_DIRS; do link="$base/$SKILL_NAME"; [ ! -e "$link" ] && [ ! -L "$link" ] && continue
-            resolved=$(CDPATH= cd -- "$link" 2>/dev/null && pwd -P) || { printf 'error: invalid runtime link %s.\n' "$link" >&2; exit 1; }
-            [ "$resolved" = "$DEST" ] || { printf 'error: runtime path %s does not target canonical skill.\n' "$link" >&2; exit 1; }; done
         [ "$(git -C "$DEST" remote get-url origin)" = "$REPO" ] || { printf 'error: origin is not the canonical issue-flow repository.\n' >&2; exit 1; }
         [ "$(git -C "$DEST" symbolic-ref --quiet --short HEAD)" = main ] &&
             git -C "$DEST" diff --quiet -- && git -C "$DEST" diff --cached --quiet -- || { printf 'error: upgrade requires clean main.\n' >&2; exit 1; }
-        git -C "$DEST" fetch -q --no-tags origin refs/heads/main:refs/remotes/origin/main
-        target=$(git -C "$DEST" rev-parse refs/remotes/origin/main)
-        paths=$(git -C "$DEST" ls-tree -r --name-only "$target") || exit 1
-        printf '%s\n' "$paths" | grep -iFx "$CONFIG_FILE" >/dev/null && { printf 'error: target tracks local operator policy.\n' >&2; exit 1; }
-        ignore=$(git -C "$DEST" show "${target}:.gitignore") || { printf 'error: target has no readable .gitignore.\n' >&2; exit 1; }
-        printf '%s\n' "$ignore" | grep -Fx "$CONFIG_FILE" >/dev/null || { printf 'error: target does not ignore local operator policy.\n' >&2; exit 1; }
-        for arg in "$@"; do [ "$arg" != --dry-run ] || { printf 'would   upgrade Git tree to %s\n' "$target"; exit 0; }; done
-        git -C "$DEST" merge --ff-only --no-overwrite-ignore -q "$target" || { printf 'error: Git refused the safe fast-forward; installation is unchanged.\n' >&2; exit 1; }
+        target=$(fetch_target "$DEST") || { printf 'error: canonical target fetch failed.\n' >&2; exit 1; }
+        target_policy_safe "$DEST" "$target" || { printf 'error: target does not safely ignore local operator policy.\n' >&2; exit 1; }
+        [ "$BOOT_DRY" -eq 0 ] || { printf 'would   upgrade Git tree to %s\n' "$target"; exit 0; }
+        safe_merge "$DEST" "$target" || { printf 'error: Git fast-forward failed; inspect status and recover tracked files from HEAD before retrying.\n' >&2; exit 1; }
     fi
     exec sh "$DEST/install.sh" "$@"
 fi
@@ -200,28 +229,20 @@ cmd_sync() {
     git -C "$CANONICAL" rev-parse --git-dir >/dev/null 2>&1 || die "$CANONICAL is not a Git checkout."
     branch=$(git -C "$CANONICAL" symbolic-ref --quiet --short HEAD) || die 'sync requires the main branch, not detached HEAD.'
     [ "$branch" = main ] || die "sync requires main; current branch is $branch."
-    for base in $RUNTIME_DIRS; do
-        link="$base/$SKILL_NAME"; [ "$(link_kind "$link")" = absent ] && continue
-        resolved=$(CDPATH= cd -- "$link" 2>/dev/null && pwd -P) || die "invalid runtime link $link."
-        [ "$resolved" = "$CANONICAL" ] || die "runtime path $link does not target canonical skill."
-    done
+    runtime_links_valid "$CANONICAL" || die 'runtime paths do not target canonical skill.'
     git -C "$CANONICAL" diff --quiet -- && git -C "$CANONICAL" diff --cached --quiet -- ||
         die 'tracked files are dirty; preserve or revert them before sync.'
     destination_origin=$(git -C "$CANONICAL" remote get-url origin) || die 'origin is not configured.'
     [ "$destination_origin" = "$REPO" ] || die 'origin is not the canonical issue-flow repository.'
-    git -C "$CANONICAL" fetch -q --no-tags origin refs/heads/main:refs/remotes/origin/main
-    target=$(git -C "$CANONICAL" rev-parse refs/remotes/origin/main) || die 'fetched target is not a commit.'
+    target=$(fetch_target "$CANONICAL") || die 'canonical target fetch failed.'
     old=$(git -C "$CANONICAL" rev-parse HEAD)
     git -C "$CANONICAL" merge-base --is-ancestor "$old" "$target" || die 'target would discard or diverge from local commits.'
-    paths=$(git -C "$CANONICAL" ls-tree -r --name-only "$target") || die 'cannot inspect target policy.'
-    printf '%s\n' "$paths" | grep -iFx "$CONFIG_FILE" >/dev/null && die "$CONFIG_FILE is tracked by the target; refusing to overwrite local policy."
-    ignore=$(git -C "$CANONICAL" show "${target}:.gitignore") || die 'target has no readable .gitignore.'
-    printf '%s\n' "$ignore" | grep -Fx "$CONFIG_FILE" >/dev/null || die 'target does not ignore local operator policy.'
+    target_policy_safe "$CANONICAL" "$target" || die 'target does not safely ignore local operator policy.'
     if [ "$DRY_RUN" -eq 1 ]; then printf 'would   sync Git tree %s -> %s\n' "$old" "$target"; return 0; fi
 
     # Fast-forward merge keeps HEAD comparison and checkout under Git's index lock; refusing ignored
     # overwrites delegates case folding and unusual path handling to Git instead of shell text scans.
-    git -C "$CANONICAL" merge --ff-only --no-overwrite-ignore -q "$target" || die 'Git refused the safe fast-forward; installation is unchanged.'
+    safe_merge "$CANONICAL" "$target" || die 'Git fast-forward failed; inspect status and recover tracked files from HEAD before retrying.'
     [ "$(git -C "$CANONICAL" rev-parse HEAD)" = "$target" ] || die 'Git tree did not reach target commit.'
     printf 'synced  Git tree at %s  (previous HEAD remains in git reflog)\n' "$target"
 }
