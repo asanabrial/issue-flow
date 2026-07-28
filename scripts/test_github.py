@@ -229,7 +229,6 @@ try:
 except m.Stop:
     check("a `..` component is refused", True, True)
 
-
 # --------------------------------------------------------------------------------------
 # Closing keywords. The defect: the check reported the SYMPTOM (a live close reference) as the
 # CAUSE (a keyword), sending runs to edit prose that never contained one.
@@ -1133,11 +1132,107 @@ check("unassign cannot borrow mismatched runtime metadata",
 operation_parsers = m.build_parser()._subparsers._group_actions[0].choices
 check("ownership writers require operation identity", [next(a for a in operation_parsers[command]._actions if a.dest == "operation_id").required for command in ("claim", "reclaim", "unassign")], [True, True, True])
 check("target discovery remains a read-only first call", [next(a for a in operation_parsers[command]._actions if a.dest == "target_operation").required for command in ("reclaim", "unassign")], [False, False])
+registry_failure = None
+with patch.object(m, "run", return_value=SimpleNamespace(returncode=128, stdout="", stderr="locked")):
+    try:
+        m.registered_worktrees(Path("."))
+    except m.ReadFailure:
+        registry_failure = "read-failed"
+check("worktree registry failure is not an empty registry", registry_failure, "read-failed")
+
+malformed_registry = None
+try:
+    m.parse_worktree_registry("worktree /tmp/a\nbranch refs/heads/main\n\n"
+                              "worktree /tmp/a\nbranch refs/heads/other\n")
+except m.ReadFailure:
+    malformed_registry = "read-failed"
+check("malformed worktree registry fails closed", malformed_registry, "read-failed")
+
+held_commands, held_reason = [], None
+with __import__("tempfile").TemporaryDirectory() as root:
+    held_path = Path(root) / "legacy-fix-26"
+    def held_worktree_run(argv, cwd=None, check=True, writes=False):
+        held_commands.append(list(argv))
+        stdout = ""
+        if argv == ["git", "worktree", "list", "--porcelain"]:
+            stdout = f"worktree {held_path}\nHEAD deadbeef\nbranch refs/heads/fix/26\n"
+        elif argv[:2] == ["git", "rev-parse"]:
+            stdout = "deadbeef\n"
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+    with patch.multiple(m, run=held_worktree_run, do_verify_claim=lambda *_args: {},
+                        repo_identity=lambda _cwd: ("owner", "repo")):
+        try:
+            m.cmd_start_branch(SimpleNamespace(issue=26, run_id="run-new",
+                                               expect_state="in-progress",
+                                               worktree_root=f"{root}/<branch>-<run-id>",
+                                               branch="fix/26", base="main"), {}, Path("."))
+        except m.Stop as exc:
+            held_reason = exc.payload["reason"]
+check("a branch registered elsewhere stops before GitHub mutation",
+      (held_reason, any(command[:3] == ["gh", "issue", "develop"]
+                        for command in held_commands)),
+      ("worktree-branch-in-use", False))
+
+resume_commands, resumed = [], None
+with __import__("tempfile").TemporaryDirectory() as root:
+    resume_path = Path(root) / "fix-26"
+    resume_path.mkdir()
+    def resume_worktree_run(argv, cwd=None, check=True, writes=False):
+        resume_commands.append(list(argv))
+        if argv == ["git", "worktree", "list", "--porcelain"]:
+            return SimpleNamespace(returncode=0,
+                                   stdout=f"worktree {resume_path}\nHEAD head\nbranch refs/heads/fix/26\n",
+                                   stderr="")
+        if argv[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        stdout = "head\n" if argv[:2] == ["git", "rev-parse"] else ""
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+    with patch.multiple(m, run=resume_worktree_run, do_verify_claim=lambda *_args: {},
+                        repo_identity=lambda _cwd: ("owner", "repo")):
+        resumed = m.cmd_start_branch(SimpleNamespace(issue=26, run_id="run-a",
+                                                     expect_state="in-progress",
+                                                     worktree_root=str(resume_path),
+                                                     branch="fix/26", base="main"), {}, Path("."))
+check("the exact registered checkout remains resumable",
+      (resumed["resumed_existing_worktree"],
+       any(command[:3] == ["git", "worktree", "add"] for command in resume_commands)),
+      (True, False))
+
+race_commands, race_reason = [], None
+with __import__("tempfile").TemporaryDirectory() as root:
+    def race_worktree_run(argv, cwd=None, check=True, writes=False):
+        race_commands.append(list(argv))
+        if argv == ["git", "worktree", "list", "--porcelain"]:
+            return SimpleNamespace(returncode=0,
+                                   stdout=f"worktree {Path('.').resolve()}\nHEAD base\nbranch refs/heads/main\n",
+                                   stderr="")
+        if argv[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        if argv[:3] == ["git", "worktree", "add"]:
+            raise m.WriteFailure("branch became registered elsewhere")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    with patch.multiple(m, run=race_worktree_run, do_verify_claim=lambda *_args: {},
+                        repo_identity=lambda _cwd: ("owner", "repo")):
+        try:
+            m.cmd_start_branch(SimpleNamespace(issue=26, run_id="run-a",
+                                               expect_state="in-progress",
+                                               worktree_root=f"{root}/<branch>-<run-id>",
+                                               branch="fix/26", base="main"), {}, Path("."))
+        except m.WriteFailure:
+            race_reason = "write-failed"
+check("a worktree-add race fails before GitHub mutation",
+      (race_reason, any(command[:3] == ["gh", "issue", "develop"] for command in race_commands)),
+      ("write-failed", False))
+
 git_commands, fetched = [], [False]
 def fake_git_run(argv, cwd=None, check=True, writes=False):
     git_commands.append(list(argv))
     if argv[:3] == ["gh", "issue", "develop"]:
         return SimpleNamespace(returncode=1, stdout="", stderr="exists")
+    if argv == ["git", "worktree", "list", "--porcelain"]:
+        return SimpleNamespace(returncode=0,
+                               stdout=f"worktree {Path('.').resolve()}\nHEAD deadbeef\nbranch refs/heads/main\n",
+                               stderr="")
     if argv == ["git", "fetch", "origin"]:
         fetched[0] = True
     if argv[:4] == ["git", "rev-parse", "--verify", "--quiet"]:

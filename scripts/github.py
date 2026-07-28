@@ -2160,6 +2160,43 @@ def branch_start_point(*, exists_local: bool, exists_remote: bool, branch: str, 
     return f"origin/{branch}" if exists_remote else f"origin/{base}"
 
 
+def parse_worktree_registry(text: str) -> dict[str, str | None]:
+    if not text.strip():
+        raise ReadFailure("git worktree registry was empty")
+    trees: dict[str, str | None] = {}
+    current = None
+    branch_seen = False
+    for line in text.splitlines():
+        if not line:
+            current = None
+            branch_seen = False
+        elif line.startswith("worktree "):
+            raw_path = line[len("worktree "):].strip()
+            if not raw_path:
+                raise ReadFailure("git worktree registry contained an empty path")
+            current = normalise_path(raw_path)
+            if current in trees:
+                raise ReadFailure(f"git worktree registry repeated path {raw_path}")
+            trees[current] = None
+            branch_seen = False
+        elif line.startswith("branch "):
+            value = line[len("branch "):].strip()
+            if current is None or branch_seen or not value.startswith("refs/heads/"):
+                raise ReadFailure(f"malformed git worktree branch record: {line}")
+            branch = value[len("refs/heads/"):]
+            if not branch:
+                raise ReadFailure("git worktree registry contained an empty branch")
+            trees[current] = branch
+            branch_seen = True
+        elif (line.startswith("HEAD ") or line == "detached" or line == "bare"
+              or line.startswith("locked") or line.startswith("prunable")):
+            if current is None:
+                raise ReadFailure(f"git worktree registry field preceded its path: {line}")
+        else:
+            raise ReadFailure(f"unknown git worktree registry field: {line}")
+    return trees
+
+
 def registered_worktrees(cwd: Path) -> dict[str, str | None]:
     """Every worktree git knows about, as {normalised path: branch or None if detached}.
 
@@ -2167,30 +2204,20 @@ def registered_worktrees(cwd: Path) -> dict[str, str | None]:
     the difference decides whether writing there is a resume or a collision.
     """
     proc = run(["git", "worktree", "list", "--porcelain"], cwd=cwd, check=False)
-    trees: dict[str, str | None] = {}
-    current = None
-    for line in proc.stdout.splitlines():
-        if line.startswith("worktree "):
-            current = normalise_path(line[len("worktree "):].strip())
-            trees[current] = None
-        elif line.startswith("branch ") and current:
-            trees[current] = line[len("branch refs/heads/"):].strip()
-    return trees
+    if proc.returncode != 0:
+        raise ReadFailure(
+            f"git worktree list failed ({proc.returncode}): {(proc.stderr or '').strip()}"
+        )
+    return parse_worktree_registry(proc.stdout)
 
 
 def cmd_start_branch(args, config, cwd) -> dict:
-    """Create the branch server-side (already linked to the issue), then an isolated worktree.
+    """Reserve an isolated local checkout, then create/link the branch server-side.
 
-    `gh issue develop` is one command that replaces branch creation AND recording: it branches
-    from the fresh base and links it in the issue's Development sidebar. A branch nobody can find
-    from the issue is work nobody can follow.
+    Local reservation precedes `gh issue develop` so its irreversible branch/link write cannot land
+    before Git has proved that this run owns the branch checkout. A branch nobody can find from the
+    issue is still work nobody can follow, so the durable comment records fallback branches.
     """
-    # A claim binds only what the tracker can see, so renew it before the first thing it cannot.
-    # Nothing has been created yet, so standing down here costs one comment.
-    do_verify_claim(args.issue, args.run_id, args.expect_state, cwd)
-    # Invalid protocol values must fail before `gh issue develop` can create remote state.
-    marker("branch", run_id=args.run_id, branch=args.branch, base=args.base)
-
     template = args.worktree_root or cfg(config, "worktree location")
     if not template or template.lower() == "unset":
         raise Stop(
@@ -2201,25 +2228,37 @@ def cmd_start_branch(args, config, cwd) -> dict:
             }
         )
 
+    # A claim binds only what the tracker can see, so renew it before the first thing it cannot.
+    # Nothing has been created yet, so standing down here costs one comment.
+    do_verify_claim(args.issue, args.run_id, args.expect_state, cwd)
+    # Invalid protocol values must fail before `gh issue develop` can create remote state.
+    marker("branch", run_id=args.run_id, branch=args.branch, base=args.base)
+
     _, repo_name = repo_identity(cwd)
     path = worktree_path(template, repo_name, args.branch, args.run_id, args.issue)
 
-    # An existing path means one of three different things, and they are not interchangeable.
-    #
-    # This matters because the template is configurable. With `<run-id>` in it a path is unique per
-    # run, so ANY existing path is foreign. Without it — `<repo>/<branch>` — an existing path is
-    # usually your OWN branch's worktree, and refusing it would make every resume impossible while
-    # protecting against nothing: git already refuses a second checkout of a branch that is live
-    # elsewhere ("fatal: '<branch>' is already used by worktree at ..."), which is the collision
-    # that actually costs work.
-    #
-    # So the question is not "does it exist" but "is it MINE": a registered worktree for this exact
-    # branch is a resume; anything else is a stranger's tree or an orphan directory left by a dead
-    # run, and writing into either is the #58 failure.
+    # A same-branch registration elsewhere is an unresolved handoff. Detect it before GitHub can
+    # create or link remote state; adopting it here would bypass inspection of unpublished work.
     resuming = False
+    registered = registered_worktrees(cwd)
+    normalised = normalise_path(path)
+    branch_paths = [registered_path for registered_path, branch in registered.items()
+                    if branch == args.branch]
+    foreign_branch_paths = [registered_path for registered_path in branch_paths
+                            if registered_path != normalised]
+    if foreign_branch_paths:
+        raise Stop(
+            {
+                "ok": False,
+                "reason": "worktree-branch-in-use",
+                "path": str(path),
+                "registered_paths": foreign_branch_paths,
+                "action": "inspect and preserve unpublished work, prove the previous process has "
+                          "stopped, remove its worktree registration outside that checkout, then retry",
+            }
+        )
     if path.exists():
-        registered = registered_worktrees(cwd)
-        owner_branch = registered.get(normalise_path(path))
+        owner_branch = registered.get(normalised)
         if owner_branch == args.branch:
             resuming = True
         else:
@@ -2234,44 +2273,50 @@ def cmd_start_branch(args, config, cwd) -> dict:
                               "verify the holder, or remove the orphan first",
                 }
             )
+    elif normalised in registered:
+        raise Stop(
+            {
+                "ok": False,
+                "reason": "worktree-registration-stale",
+                "path": str(path),
+                "action": "inspect the missing registered checkout, preserve its branch, run git "
+                          "worktree prune only after proving the path is gone, then retry",
+            }
+        )
+
+    # Reserve the branch and checkout locally before `gh issue develop`. Git's worktree lock is the
+    # atomic concurrency gate: if another run wins after our registry read, `worktree add` fails and
+    # no remote branch/link has been mutated. Creating the GitHub link first would leave remote state
+    # behind whenever this final isolation step lost the race.
+    run(["git", "fetch", "origin"], cwd=cwd)
+    exists_local = run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{args.branch}"],
+        cwd=cwd, check=False,
+    ).returncode == 0
+    exists_remote = run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{args.branch}"],
+        cwd=cwd, check=False,
+    ).returncode == 0
+    start_point = branch_start_point(
+        exists_local=exists_local, exists_remote=exists_remote,
+        branch=args.branch, base=args.base,
+    )
+    if start_point is not None:
+        # `--` closes option parsing; a branch beginning with `-` must never become a git flag.
+        run(["git", "branch", "--", args.branch, start_point], cwd=cwd, writes=True)
+    if not resuming:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        run(["git", "worktree", "add", "--", str(path), args.branch], cwd=cwd, writes=True)
 
     developed = run(
         ["gh", "issue", "develop", str(args.issue), "--name", args.branch, "--base", args.base],
         cwd=cwd,
         check=False,
+        writes=True,
     )
     linked = developed.returncode == 0
-    if not linked:
-        # Discover every remote branch before deciding this one is absent. Fetching only the base
-        # leaves a remote-only resumed branch invisible and restarts it from the base.
-        #
-        # `--` closes option parsing. Without it a branch name beginning with `-` is read as a
-        # flag: `git branch --force -D origin/main` deletes the branch literally named
-        # `origin/main` instead of creating one called `-D`. Nothing upstream validates the value,
-        # and this call runs with check=False, so the damage would be silent.
-        run(["git", "fetch", "origin"], cwd=cwd)
-
-        exists_local = run(
-            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{args.branch}"],
-            cwd=cwd, check=False,
-        ).returncode == 0
-        exists_remote = run(
-            ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{args.branch}"],
-            cwd=cwd, check=False,
-        ).returncode == 0
-        start_point = branch_start_point(
-            exists_local=exists_local, exists_remote=exists_remote,
-            branch=args.branch, base=args.base,
-        )
-        if start_point is not None:
-            run(["git", "branch", "--", args.branch, start_point],
-                cwd=cwd, writes=True)
-
     if linked:
         run(["git", "fetch", "origin"], cwd=cwd)
-    if not resuming:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        run(["git", "worktree", "add", "--", str(path), args.branch], cwd=cwd, writes=True)
 
     head = run(["git", "rev-parse", "HEAD"], cwd=path).stdout.strip()
     base_sha = run(["git", "rev-parse", f"origin/{args.base}"], cwd=cwd).stdout.strip()

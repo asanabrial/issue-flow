@@ -273,12 +273,12 @@ comment.
 
 ## Branch, worktree and the linked issue
 
-`gh issue develop <n> --name <branch> --base <base>` creates the branch **server-side, from the fresh
-base, already linked** in the issue's Development sidebar — one command replacing branch creation AND
-recording. `start-branch` uses it, then fetches and resumes an existing local or remote-only branch
-when it fails; only a branch absent everywhere starts from the fetched base. It records branch, base SHA, worktree
-path and holding run-id on the issue either way. A branch nobody can find from the issue is work
-nobody can follow.
+`start-branch` fetches and reserves the local branch plus worktree before it calls
+`gh issue develop <n> --name <branch> --base <base>`. Git's worktree lock is therefore the concurrency
+gate: a competing checkout fails before GitHub can create or link remote state. Existing local or
+remote-only branches retain their heads, and the durable issue comment records branch, base SHA,
+worktree path and holding run-id when the native link cannot be created. A branch nobody can find from
+the issue is work nobody can follow.
 
 The worktree path comes from the `Worktree location` configuration row, with `<repo>`, `<branch>`,
 `<issue>` and `<run-id>` substituted; every component is flattened, so a `docs/113-…` branch does not
@@ -303,6 +303,7 @@ worktree for this exact branch is a resume: it is reused and reported as `resume
 Anything else — a stranger's checkout, or an orphan left by a dead run — is refused, because writing
 into either is the failure above. Merely refusing every existing path would make resume impossible
 under a run-id-free template while protecting against nothing git had not already caught.
+An unreadable or malformed worktree registry fails closed before `gh issue develop`.
 
 **A fresh worktree does not have the files git never tracked.** Everything gitignored — environment
 files, secrets, credentials, local settings — is simply absent, and the failure it produces is
