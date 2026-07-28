@@ -811,6 +811,23 @@ edited_late = comment(m.marker("claim", run_id=ME, runtime="codex", horizon=FUTU
 check("edited late copies cannot poison operation retry", (m.operation_marker(acquisitions[:1] + [edited_late], OP_A, "claim")["runtime"], m.reject_operation_kind_conflict(acquisitions[:1] + [edited_late], OP_A, {"claim", "standdown"})), ("opencode", None))
 forced_stale_hash = m.forced_reclaim_hash(OP_C, evidence_digest, "taker", "codex", FUTURE, ME, OP_A); forced_stale = [comment(m.marker("claim", run_id=ME, runtime="opencode", horizon="2026-01-01T01:00Z", op_id=OP_A)), comment(m.marker("claim", run_id=OTHER, runtime="codex", horizon=FUTURE, op_id=OP_B), "2026-01-02T00:00:01Z"), comment(f"{m.FORCED_EVIDENCE_HEADING}\n\nreason\n\n{m.marker('reclaim', run_id='taker', runtime='codex', horizon=FUTURE, op_id=OP_C, from_op=OP_A, evidence_hash=forced_stale_hash, forced='true', evidence='required', **{'from': ME})}", "2026-01-02T00:00:02Z")]
 check("forced reclaim cannot skip a different live holder", m.reduce_ownership(forced_stale, NOW)["holder"], OTHER)
+release_context = [comment(m.marker("claim", run_id="x", runtime="opencode", horizon="2000-01-02T00:00Z", op_id="1" * 32), "2000-01-01T00:00:00Z"), comment(m.marker("reclaim", run_id="y", runtime="codex", horizon="2001-01-02T00:00Z", op_id="2" * 32, from_op="1" * 32, **{"from": "x"}), "2001-01-01T00:00:00Z"), comment(m.marker("reclaim", run_id="x", runtime="opencode", horizon="2002-01-02T00:00Z", op_id="3" * 32, from_op="2" * 32, **{"from": "y"}) + m.marker("unassign", run_id="x", runtime="opencode"), "2002-01-01T00:00:00Z"), comment(m.marker("reclaim", run_id="z", runtime="codex", horizon="2003-01-02T00:00Z", op_id="4" * 32, from_op="3" * 32, **{"from": "x"}), "2003-01-01T00:00:00Z")]
+check("epoch windows retain prior modern release context", m.reduce_ownership(release_context, "2003-01-01T00:00:01Z")["holder"], "z")
+mutated_reclaim = m.ownership_events(release_context)[1].copy(); mutated_reclaim["from"] = "forged"
+check("valid_reclaim validates supplied metadata", m.valid_reclaim(mutated_reclaim, release_context), False)
+nonchron_hash = m.forced_reclaim_hash("7" * 32, evidence_digest, "c", "codex", "2001-01-02T00:00Z", "b", "6" * 32)
+nonchron_reclaims = [comment(m.marker("claim", run_id="a", runtime="opencode", horizon="2000-01-02T00:00Z", op_id="5" * 32), "2000-01-01T00:00:00Z"), comment(m.marker("reclaim", run_id="b", runtime="codex", horizon="2002-01-02T00:00Z", op_id="6" * 32, from_op="5" * 32, **{"from": "a"}), "2002-01-01T00:00:00Z"), comment(f"{m.FORCED_EVIDENCE_HEADING}\n\nreason\n\n{m.marker('reclaim', run_id='c', runtime='codex', horizon='2001-01-02T00:00Z', op_id='7' * 32, from_op='6' * 32, evidence_hash=nonchron_hash, forced='true', evidence='required', **{'from': 'b'})}", "2001-01-01T00:00:00Z"), comment(m.marker("reclaim", run_id="d", runtime="opencode", horizon="2003-01-02T00:00Z", op_id="8" * 32, from_op="7" * 32, **{"from": "c"}), "2003-01-01T00:00:00Z")]
+nonchron_final = next(event for event in m.ownership_events(nonchron_reclaims) if event["operation_id"] == "8" * 32)
+check("nonchronological fallback preserves canonical event order", m.valid_reclaim(nonchron_final, nonchron_reclaims), False)
+deep_reclaims = [comment(m.marker("claim", run_id="run-0", runtime="opencode", horizon="2000-01-02T00:00Z", op_id=f"{0:032x}"), "2000-01-01T00:00:00Z")]
+for index in range(1, 80):
+    deep_reclaims.append(comment(m.marker("reclaim", run_id=f"run-{index}", runtime="opencode", horizon=f"{2000 + index}-01-02T00:00Z", op_id=f"{index:032x}", from_op=f"{index - 1:032x}", **{"from": f"run-{index - 1}"}), f"{2000 + index}-01-01T00:00:00Z"))
+deep_reclaims.append(comment(m.marker("note", run_id="observer"), "1999-01-01T00:00:00Z"))
+with patch.object(m, "_valid_reclaim", wraps=m._valid_reclaim) as reclaim_validations, patch.object(m, "_reduce_ownership", wraps=m._reduce_ownership) as prefix_reductions:
+    deep_result = m.reduce_ownership(deep_reclaims, "2079-01-01T00:00:01Z")
+scanned_comments = sum(len(call.args[0]) - (call.args[3] if len(call.args) > 3 else 0) for call in prefix_reductions.call_args_list)
+scanned_events = sum(len(call.args[2]) for call in prefix_reductions.call_args_list)
+check("deep reclaim reduction performs bounded epoch work", (deep_result["holder"], reclaim_validations.call_count, scanned_comments <= 2 * len(deep_reclaims), scanned_events <= 2 * len(deep_reclaims)), ("run-79", 79, True, True))
 
 class ProjectionOutage(FakeIssue):
     def view(self, issue, fields, cwd=None):
