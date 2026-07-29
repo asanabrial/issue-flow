@@ -106,7 +106,8 @@ without reopening a replaceable helper path. Standard proxy variables remain ava
 Git-specific authority and caller-controlled CA override variables do not, so TLS identity comes
 from the host's system trust store. Quarantine cleanup clears Git's read-only pack attributes and
 fails if its bootstrap path remains; a later bootstrap removes owner-marked quarantines only when
-their lifetime lock is no longer held. Every Python entrypoint forces UTF-8 mode so non-ASCII operator
+their lifetime lock is no longer held, while a stable guard serializes owner-file publication.
+Every Python entrypoint forces UTF-8 mode so non-ASCII operator
 homes survive shell/native-process boundaries. Installed wrappers likewise reverify the local helper against
 its Git blob in the same Python process that executes those bytes; the absolute Git executable
 selected by the wrapper is propagated through every helper subprocess instead of being reselected
@@ -154,7 +155,8 @@ including when canonical GitHub is temporarily unavailable and the command start
 journal endpoint. Top-level ignored state and empty directories move intact; untracked state nested
 inside a tracked contract directory fails closed because Git cannot inventory an empty nested path.
 Reserved installer names, linked operator policy and partial/promisor Git object authority are
-rejected before migration publishes attachment state or reads tracked objects.
+rejected before migration publishes attachment state or reads tracked objects; legacy Git config
+includes are rejected because they could hide that authority outside the inspected config.
 On Windows, read-only local files are rejected before attachment publication because safely deleting
 one hardlink must not change the attributes of another operator-owned link.
 Run the one-time directory move between agent sessions because it has a brief availability gap.
@@ -275,7 +277,8 @@ The installer matches a setting **by its name** and carries no setting list of i
 row added to the skill is settable immediately. It verifies every destination, publishes the new
 content-addressed generation through a fsynced temporary file, then atomically changes each bundle
 hard link while keeping the editable stable file independent. Recovery removes abandoned link
-temporaries before finishing the journal. It refuses a
+temporaries and completes an authorized visible-edit transaction even when an in-place Windows edit
+changed the predecessor generation inode before the journaled relink. It refuses a
 name that matches no row or more than one, and refuses a value containing `|`, which would split the
 cell and corrupt the table.
 
@@ -303,6 +306,7 @@ After two immutable
 generations exist, the previous complete bundle remains available through `rollback`; `recover`
 restores the standalone clone or reconciles the bundle journal when an operation was interrupted;
 `recover --dry-run` validates the same journal, authority, provenance and cleanup ownership without mutation.
+An existing operating-system lock must also pass the same private-file identity checks as live recovery.
 Never force-add `operator.local.md`: its values are permissions, including whether an agent may
 publish or merge without asking.
 

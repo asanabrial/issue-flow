@@ -1169,9 +1169,13 @@ for kind, executable in shells():
         partial_legacy = partial_legacy_home / ".agents/skills/issue-flow"
         clone_legacy(remote, partial_legacy, legacy)
         lazy_fetch_sentinel = root / "lazy-fetch-sentinel"
-        git(partial_legacy, "config", "remote.origin.promisor", "true")
-        git(partial_legacy, "config", "remote.origin.partialclonefilter", "blob:none")
-        git(partial_legacy, "config", "remote.origin.url", f"ext::touch {lazy_fetch_sentinel.as_posix()}")
+        (partial_legacy / ".git/promisor.inc").write_text(
+            "[protocol \"ext\"]\n\tallow = always\n"
+            "[remote \"origin\"]\n\tpromisor = true\n\tpartialCloneFilter = blob:none\n"
+            f"\turl = ext::touch {lazy_fetch_sentinel.as_posix()}\n",
+            encoding="utf-8",
+        )
+        git(partial_legacy, "config", "include.path", "promisor.inc")
         result = command(kind, executable, external, shell_args(kind, "install"), partial_legacy_home)
         check(
             f"{kind} rejects legacy promisor authority before object reads",
@@ -1491,8 +1495,11 @@ for kind, executable in shells():
             b"| Tracker | trello | github |",
         )
         configured_generation_name = hashlib.sha256(configured_policy).hexdigest()
+        if os.name == "nt":
+            (installed / "operator.local.md").write_bytes(interrupted_policy)
+        else:
+            fixture_paths.config.write_bytes(interrupted_policy)
         interrupted_generation = policy_generation(fixture_paths, interrupted_policy)
-        fixture_paths.config.write_bytes(interrupted_policy)
         fixture_paths.policy_transaction.write_text(
             json.dumps(
                 {
@@ -2251,10 +2258,13 @@ for kind, executable in shells():
         lock_victim = root / "lock-victim"
         lock_victim.write_bytes(b"must-survive")
         os.link(lock_victim, lock_path)
+        dry_result = command(kind, executable, active_script, shell_args(kind, "recover", "--dry-run"), home)
         result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
         check(
             f"{kind} lock refuses an external hard link without truncating it",
-            result.returncode != 0 and lock_victim.read_bytes() == b"must-survive",
+            dry_result.returncode != 0
+            and result.returncode != 0
+            and lock_victim.read_bytes() == b"must-survive",
             result,
         )
         lock_path.unlink()

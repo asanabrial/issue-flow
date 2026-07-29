@@ -294,6 +294,25 @@ def remove_bootstrap(path):
     if path.exists():
         raise RuntimeError(f"bootstrap quarantine cleanup did not complete: {path}")
 
+guard_path = home / ".issue-flow-bootstrap.lock"
+if os.path.lexists(guard_path) and guard_path.is_symlink():
+    raise RuntimeError(f"bootstrap guard may not be a link: {guard_path}")
+guard_flags = os.O_RDWR | os.O_CREAT
+if hasattr(os, "O_NOFOLLOW"):
+    guard_flags |= os.O_NOFOLLOW
+guard_descriptor = os.open(guard_path, guard_flags, 0o600)
+guard_details = os.fstat(guard_descriptor)
+if not stat.S_ISREG(guard_details.st_mode) or guard_details.st_nlink != 1:
+    os.close(guard_descriptor)
+    raise RuntimeError(f"bootstrap guard is not a private regular file: {guard_path}")
+bootstrap_guard = os.fdopen(guard_descriptor, "r+b")
+if guard_details.st_size == 0:
+    bootstrap_guard.write(b"\0")
+    bootstrap_guard.flush()
+    os.fsync(bootstrap_guard.fileno())
+if not lock_owner(bootstrap_guard, blocking=True):
+    raise RuntimeError(f"could not acquire bootstrap guard: {guard_path}")
+
 for candidate in home.iterdir():
     if not re.fullmatch(r"\.issue-flow-bootstrap-[0-9a-f]{32}", candidate.name):
         continue
@@ -301,7 +320,10 @@ for candidate in home.iterdir():
         raise RuntimeError(f"installer-shaped bootstrap path is not a real directory: {candidate}")
     owner = candidate / ".issue-flow-bootstrap-owner"
     if not owner.exists():
-        continue
+        if not any(candidate.iterdir()):
+            candidate.rmdir()
+            continue
+        raise RuntimeError(f"non-empty bootstrap quarantine has no owner marker: {candidate}")
     details = os.lstat(owner)
     if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
         raise RuntimeError(f"bootstrap owner marker is not private: {owner}")
@@ -339,6 +361,7 @@ if os.name != "nt":
         os.fsync(directory)
     finally:
         os.close(directory)
+bootstrap_guard.close()
 bare = bootstrap / "repository.git"
 environment = os.environ.copy()
 for name in tuple(environment):

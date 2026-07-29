@@ -1451,9 +1451,32 @@ def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> None:
     previous_name = str(previous_value) if previous_value else None
     if previous_name and not re.fullmatch(r"[0-9a-f]{64}", previous_name):
         fail(f"invalid previous policy generation in {paths.policy_transaction}")
-    current = current_policy_generation(paths)
-    if (current.name if current else None) not in {previous_name, generation_name}:
+    stable_details = os.lstat(paths.config) if path_exists(paths.config) else None
+    if not stable_details or not stat.S_ISREG(stable_details.st_mode) or stable_details.st_nlink != 1:
+        fail(f"stable policy is not a private regular file during recovery: {paths.config}")
+    stable_content = paths.config.read_bytes()
+    stable_name = hashlib.sha256(stable_content).hexdigest()
+    if stable_name not in {previous_name, generation_name}:
         fail(f"stable policy is outside transaction endpoints: {paths.policy_transaction}")
+    previous = paths.policies / previous_name if previous_name else None
+    if previous:
+        previous_details = os.lstat(previous) if path_exists(previous) else None
+        if not previous_details or not stat.S_ISREG(previous_details.st_mode):
+            fail(f"previous policy transaction generation is missing or invalid: {previous}")
+        previous_digest = hashlib.sha256(previous.read_bytes()).hexdigest()
+        predecessor_was_edited = previous_digest != previous_name
+        if predecessor_was_edited and not (
+            stable_name == previous_name and previous.read_bytes() == generation.read_bytes()
+        ):
+            fail(f"previous policy generation is corrupt outside the authorized visible edit: {previous}")
+        if previous_details.st_nlink != known_policy_link_count(paths, previous):
+            fail(f"previous policy generation has an external hard link: {previous}")
+    for destination in policy_destinations(paths):
+        if not (
+            is_regular_hardlink(destination, generation)
+            or (previous is not None and is_regular_hardlink(destination, previous))
+        ):
+            fail(f"bundle policy is outside transaction endpoints: {destination}")
     if not dry_run:
         complete_policy_switch(paths, generation)
         remove_state_file(paths.policy_transaction)
@@ -1775,6 +1798,8 @@ def validate_legacy_repository(root: Path) -> None:
         parser.read_string(config.read_text(encoding="utf-8"))
     except (configparser.Error, UnicodeError, OSError) as error:
         fail(f"legacy Git config is invalid: {error}")
+    if any(section.casefold() == "include" or section.casefold().startswith('includeif "') for section in parser.sections()):
+        fail("legacy migration refuses Git config includes that can hide executable authority")
     if parser.has_option("extensions", "partialclone"):
         fail("legacy migration refuses a partial-clone object authority")
     for section in parser.sections():
@@ -2748,6 +2773,9 @@ def rollback(paths: Paths, dry_run: bool) -> None:
 
 def recover(paths: Paths, dry_run: bool) -> None:
     if dry_run:
+        if path_exists(paths.lock):
+            lock = open_safe_lock(paths.lock)
+            lock.close()
         print(f"would   acquire operating-system lock {paths.lock}")
         if path_exists(paths.state):
             if is_pointer(paths.state) or not paths.state.is_dir():
