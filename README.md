@@ -106,7 +106,8 @@ without reopening a replaceable helper path. Standard proxy variables remain ava
 Git-specific authority and caller-controlled CA override variables do not, so TLS identity comes
 from the host's system trust store. Quarantine cleanup clears Git's read-only pack attributes and
 fails if its bootstrap path remains; a later bootstrap removes owner-marked quarantines only when
-their lifetime lock is no longer held, while a stable guard serializes owner-file publication.
+their lifetime lock is no longer held, while a stable guard serializes owner-file publication
+through final quarantine deletion.
 Every Python entrypoint forces UTF-8 mode so non-ASCII operator
 homes survive shell/native-process boundaries. Installed wrappers likewise reverify the local helper against
 its Git blob in the same Python process that executes those bytes; the absolute Git executable
@@ -278,7 +279,9 @@ row added to the skill is settable immediately. It verifies every destination, p
 content-addressed generation through a fsynced temporary file, then atomically changes each bundle
 hard link while keeping the editable stable file independent. Recovery removes abandoned link
 temporaries and completes an authorized visible-edit transaction even when an in-place Windows edit
-changed the predecessor generation inode before the journaled relink. It refuses a
+changed the predecessor generation inode before the journaled relink or the stable copy already
+advanced before journal deletion. First policy publication is also recoverable before the stable
+copy exists. It refuses a
 name that matches no row or more than one, and refuses a value containing `|`, which would split the
 cell and corrupt the table.
 
@@ -306,7 +309,8 @@ After two immutable
 generations exist, the previous complete bundle remains available through `rollback`; `recover`
 restores the standalone clone or reconciles the bundle journal when an operation was interrupted;
 `recover --dry-run` validates the same journal, authority, provenance and cleanup ownership without mutation.
-An existing operating-system lock must also pass the same private-file identity checks as live recovery.
+An existing operating-system lock and both pre-switch and post-switch activation refs must also pass
+the same identity checks as live recovery.
 Never force-add `operator.local.md`: its values are permissions, including whether an agent may
 publish or merge without asking.
 

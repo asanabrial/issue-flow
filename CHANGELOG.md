@@ -21,7 +21,7 @@ All notable changes to Issue Flow are documented here.
   required for reference fsync support, Windows POSIX layers require native Windows Python, and the
   wrapper-selected absolute Git identity is reused after every directory change. Python runs in
   UTF-8 mode, and later bootstraps recover owner-marked quarantines only after acquiring their
-  released lifetime lock; a stable guard closes the owner-publication race. Bare repositories
+  released lifetime lock; a stable guard serializes owner publication through final quarantine deletion. Bare repositories
   reject redirected common directories, alternates, linked reference authority and symbolic refs;
   installer refs use no-dereference compare-and-swap updates.
 - Publish Git objects, policy generations and migrated local files through durable atomic
@@ -36,8 +36,9 @@ All notable changes to Issue Flow are documented here.
   recovers private stale Git ref lockfiles and rejects read-only Windows attachment sources.
 - Keep `operator.local.md` as an independently editable private file while bundles expose immutable
   content-addressed snapshots. `config` adopts arbitrary manual instructions, and recovery dry-run
-  validates journals, cleanup ownership and existing lock identity without mutation. Policy recovery
-  accepts only journal endpoints while repairing an authorized in-place visible edit. Legacy migration rejects reserved
+  validates journals, cleanup ownership, existing lock identity and activation refs without mutation.
+  Policy recovery accepts only journal endpoints while repairing first publication and both sides of
+  an authorized in-place visible edit. Legacy migration rejects reserved
   attachment names, linked policy, config includes and promisor/partial-clone authority before publishing state.
 - Retain every activated bundle for resolved readers, verify retained bytes and attachments in
   `status`, atomically tombstone never-activated targets for crash-resumable cleanup, and report

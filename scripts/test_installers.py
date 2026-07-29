@@ -470,6 +470,15 @@ def shell_args(kind: str, command_name: str, *extra: str) -> list[str]:
     return [command_name, *(translated.get(item, item) for item in extra)]
 
 
+for wrapper_name in ("install.sh", "install.ps1"):
+    wrapper_source = (ROOT / wrapper_name).read_text(encoding="utf-8")
+    check(
+        f"{wrapper_name} holds the bootstrap guard through quarantine cleanup",
+        wrapper_source.count("bootstrap_guard.close()") == 1
+        and wrapper_source.index("bootstrap_guard.close()") > wrapper_source.rindex("remove_bootstrap(bootstrap)"),
+    )
+
+
 for kind, executable in shells():
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -767,6 +776,7 @@ for kind, executable in shells():
         )
         fresh_script = fresh_canonical / ("install.sh" if kind == "POSIX" else "install.ps1")
         fresh_state = fresh_install_home / ".agents/skills/.issue-flow"
+        fresh_paths = Paths.for_home(fresh_install_home)
         (fresh_state / "current.json").unlink()
         (fresh_state / "transaction.json").write_text(
             json.dumps(
@@ -846,6 +856,27 @@ for kind, executable in shells():
             result.returncode == 0 and "immutable bundle" in result.stdout and "healthy" in result.stdout,
             result,
         )
+        _, _, initial_policy_text = installer.config_block(
+            (fresh_canonical / "SKILL.md").read_text(encoding="utf-8"),
+            fresh_canonical / "SKILL.md",
+        )
+        initial_generation = policy_generation(fresh_paths, initial_policy_text.encode("utf-8"))
+        write_json(
+            fresh_paths.policy_transaction,
+            {"schema": 1, "generation": initial_generation.name, "previous": None},
+        )
+        result = command(kind, executable, fresh_script, shell_args(kind, "recover"), fresh_install_home)
+        check(
+            f"{kind} recovery completes an interrupted first policy publication",
+            result.returncode == 0
+            and not fresh_paths.policy_transaction.exists()
+            and fresh_paths.config.read_text(encoding="utf-8") == initial_policy_text
+            and os.path.samefile(fresh_canonical / "operator.local.md", initial_generation),
+            result,
+        )
+        (fresh_canonical / "operator.local.md").unlink()
+        fresh_paths.config.unlink()
+        initial_generation.unlink()
         if kind != "POSIX":
             divergent_profile = root / f"{kind} divergent profile"
             divergent_profile.mkdir()
@@ -953,7 +984,6 @@ for kind, executable in shells():
             result,
         )
         fresh_current.write_bytes(fresh_current_bytes)
-        fresh_paths = Paths.for_home(fresh_install_home)
         if kind == "PowerShell":
             failed_activation_home = root / "failed first activation home"
             failed_activation_paths = Paths.for_home(failed_activation_home)
@@ -972,6 +1002,36 @@ for kind, executable in shells():
                 installer.activate = original_activate
             protected_transaction = json.loads(failed_activation_paths.transaction.read_text(encoding="utf-8"))
             protected_target = str(protected_transaction["target"])
+            conflict_ref = f"refs/issue-flow/activated/{protected_target}"
+            git(
+                failed_activation_paths.state,
+                f"--git-dir={failed_activation_paths.repository}",
+                "update-ref",
+                "--no-deref",
+                conflict_ref,
+                legacy,
+            )
+            try:
+                try:
+                    installer.recover(failed_activation_paths, True)
+                except InstallError:
+                    first_activation_dry_rejected = True
+                else:
+                    first_activation_dry_rejected = False
+            finally:
+                git(
+                    failed_activation_paths.state,
+                    f"--git-dir={failed_activation_paths.repository}",
+                    "update-ref",
+                    "--no-deref",
+                    "-d",
+                    conflict_ref,
+                    legacy,
+                )
+            check(
+                "shared recovery dry-run rejects a conflicting first-activation ref",
+                first_activation_dry_rejected and failed_activation_paths.transaction.exists(),
+            )
             offline_remote = root / "failed-activation-remote-offline.git"
             remote.rename(offline_remote)
             try:
@@ -1510,6 +1570,8 @@ for kind, executable in shells():
             ),
             encoding="utf-8",
         )
+        if os.name == "nt":
+            installer.complete_policy_switch(fixture_paths, interrupted_generation)
         result = command(
             kind,
             executable,

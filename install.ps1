@@ -376,7 +376,6 @@ if os.name != "nt":
         os.fsync(directory)
     finally:
         os.close(directory)
-bootstrap_guard.close()
 bare = bootstrap / "repository.git"
 environment = os.environ.copy()
 for name in tuple(environment):
@@ -430,6 +429,7 @@ finally:
     owner_handle.close()
     if bootstrap.exists():
         remove_bootstrap(bootstrap)
+    bootstrap_guard.close()
 '@
     # Base64 keeps Windows PowerShell 5.1 from stripping quotes in the multiline `-c` argument.
     $encodedBootstrap = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootstrapCode))

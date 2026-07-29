@@ -1452,12 +1452,17 @@ def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> None:
     if previous_name and not re.fullmatch(r"[0-9a-f]{64}", previous_name):
         fail(f"invalid previous policy generation in {paths.policy_transaction}")
     stable_details = os.lstat(paths.config) if path_exists(paths.config) else None
-    if not stable_details or not stat.S_ISREG(stable_details.st_mode) or stable_details.st_nlink != 1:
-        fail(f"stable policy is not a private regular file during recovery: {paths.config}")
-    stable_content = paths.config.read_bytes()
-    stable_name = hashlib.sha256(stable_content).hexdigest()
-    if stable_name not in {previous_name, generation_name}:
-        fail(f"stable policy is outside transaction endpoints: {paths.policy_transaction}")
+    if stable_details:
+        if not stat.S_ISREG(stable_details.st_mode) or stable_details.st_nlink != 1:
+            fail(f"stable policy is not a private regular file during recovery: {paths.config}")
+        stable_content = paths.config.read_bytes()
+        stable_name = hashlib.sha256(stable_content).hexdigest()
+        if stable_name not in {previous_name, generation_name}:
+            fail(f"stable policy is outside transaction endpoints: {paths.policy_transaction}")
+    elif previous_name is None:
+        stable_name = None
+    else:
+        fail(f"stable policy disappeared during an existing-policy transaction: {paths.config}")
     previous = paths.policies / previous_name if previous_name else None
     if previous:
         previous_details = os.lstat(previous) if path_exists(previous) else None
@@ -1466,12 +1471,14 @@ def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> None:
         previous_digest = hashlib.sha256(previous.read_bytes()).hexdigest()
         predecessor_was_edited = previous_digest != previous_name
         if predecessor_was_edited and not (
-            stable_name == previous_name and previous.read_bytes() == generation.read_bytes()
+            stable_name in {previous_name, generation_name} and previous.read_bytes() == generation.read_bytes()
         ):
             fail(f"previous policy generation is corrupt outside the authorized visible edit: {previous}")
         if previous_details.st_nlink != known_policy_link_count(paths, previous):
             fail(f"previous policy generation has an external hard link: {previous}")
     for destination in policy_destinations(paths):
+        if not path_exists(destination) and previous is None:
+            continue
         if not (
             is_regular_hardlink(destination, generation)
             or (previous is not None and is_regular_hardlink(destination, previous))
@@ -2308,7 +2315,11 @@ def recover_transaction(paths: Paths, dry_run: bool = False) -> None:
     target_bundle = paths.bundles / target
     if previous is None and target_bundle.exists():
         verify_stored_bundle(paths, target_bundle)
-        if not dry_run:
+        if dry_run:
+            activated = direct_ref_target(paths, activation_ref(target))
+            if activated is not None and activated != target:
+                fail(f"activation ref for {target} resolves to conflicting commit {activated}")
+        else:
             attach_local(paths, target_bundle)
             activate(paths, target_bundle)
             record_current(paths, target, None)
