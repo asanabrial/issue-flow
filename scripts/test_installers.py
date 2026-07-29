@@ -20,11 +20,17 @@ from install_bundle import (
     activate,
     copy_object_database,
     create_directory_pointer,
+    fetch_target,
+    initialize_state,
     materialize_bundle,
     policy_generation,
+    pointer_targets,
     remove_directory_pointer,
     replace_hardlink,
+    replace_path,
+    tree_entries,
     validate_tree_path,
+    write_json,
 )
 
 
@@ -76,6 +82,22 @@ with tempfile.TemporaryDirectory() as object_test_directory:
         "shared installer heals a torn final Git object atomically",
         (object_destination / "aa/object").read_bytes() == b"complete object",
     )
+
+with tempfile.TemporaryDirectory() as home_alias_directory:
+    alias_root = Path(home_alias_directory)
+    physical_home = alias_root / "physical-home"
+    physical_canonical = physical_home / ".agents/skills/issue-flow"
+    physical_canonical.mkdir(parents=True)
+    alias_home = alias_root / "alias-home"
+    create_directory_pointer(alias_home, physical_home)
+    runtime_pointer = alias_root / "runtime-pointer"
+    create_directory_pointer(runtime_pointer, physical_canonical)
+    check(
+        "runtime ownership accepts a physical target through a symlinked home alias",
+        pointer_targets(runtime_pointer, alias_home / ".agents/skills/issue-flow"),
+    )
+    remove_directory_pointer(runtime_pointer)
+    remove_directory_pointer(alias_home)
 
 
 def run(
@@ -209,6 +231,7 @@ def clone_legacy(remote: Path, target: Path, revision: str) -> None:
     hook = target / "custom-hook.sh"
     hook.write_bytes(b"#!/bin/sh\nexit 0\n")
     os.chmod(hook, 0o755)
+    (target / (".cache." + "b" * 32 + ".tmp")).write_bytes(b"legitimate local temporary name\n")
 
 
 def external_installer(root: Path, kind: str, repository: str) -> Path:
@@ -282,6 +305,39 @@ def invoked_powershell(kind: str, executable: str, script: Path, home: Path) -> 
     env["HOME"] = str(home)
     env["USERPROFILE"] = str(home)
     return run(invocation, env=env)
+
+
+def outer_script_powershell(
+    kind: str,
+    executable: str,
+    script: Path,
+    home: Path,
+    root: Path,
+) -> tuple[subprocess.CompletedProcess, Path]:
+    outer = root / "outer caller"
+    (outer / "scripts").mkdir(parents=True)
+    sentinel = outer / "sentinel"
+    (outer / "scripts/install_bundle.py").write_text(
+        f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('executed')\n",
+        encoding="utf-8",
+    )
+    escaped = str(script).replace("'", "''")
+    runner = outer / "install.ps1"
+    runner.write_text(
+        f"try {{ Invoke-Expression (Get-Content -LiteralPath '{escaped}' -Raw) }} catch {{ 'caught' }}\n'after-outer-iex'\n",
+        encoding="utf-8",
+    )
+    invocation = [
+        executable,
+        "-NoProfile",
+        *(["-ExecutionPolicy", "Bypass"] if kind == "Windows PowerShell" else []),
+        "-File",
+        str(runner),
+    ]
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
+    return run(invocation, env=env), sentinel
 
 
 def current_revision(home: Path) -> str | None:
@@ -372,13 +428,18 @@ for kind, executable in shells():
             f"from pathlib import Path\nPath({str(python_sentinel)!r}).write_text('executed')\n",
             encoding="utf-8",
         )
+        hostile_environment = {"PYTHONPATH": str(hostile_python)}
+        wrong_profile = root / "wrong profile"
+        if kind == "POSIX":
+            wrong_profile.mkdir()
+            hostile_environment["USERPROFILE"] = str(wrong_profile)
         result = command(
             kind,
             executable,
             external,
             shell_args(kind, "install"),
             fresh_install_home,
-            {"PYTHONPATH": str(hostile_python)},
+            hostile_environment,
         )
         check(
             f"{kind} isolated Python ignores hostile PYTHONPATH",
@@ -390,6 +451,7 @@ for kind, executable in shells():
             f"{kind} fresh install activates one complete tree and runtime links",
             result.returncode == 0
             and current_revision(fresh_install_home) == candidate
+            and (kind != "POSIX" or not (wrong_profile / ".agents").exists())
             and all(
                 (fresh_install_home / runtime / "skills/issue-flow").resolve(strict=True)
                 == fresh_canonical.resolve(strict=True)
@@ -412,9 +474,9 @@ for kind, executable in shells():
             ),
             encoding="utf-8",
         )
-        result = command(kind, executable, fresh_script, shell_args(kind, "recover"), fresh_install_home)
+        result = command(kind, executable, fresh_script, shell_args(kind, "install"), fresh_install_home)
         check(
-            f"{kind} recovers first activation after pointer publication",
+            f"{kind} install retry recovers first activation after pointer publication",
             result.returncode == 0
             and current_revision(fresh_install_home) == candidate
             and not (fresh_state / "transaction.json").exists(),
@@ -445,6 +507,10 @@ for kind, executable in shells():
         )
         repository_config = fresh_state / "repository.git/config"
         repository_config_bytes = repository_config.read_bytes()
+        check(
+            f"{kind} repository config durably fsyncs activation references",
+            b"fsync = reference" in repository_config_bytes and b"fsyncmethod = fsync" in repository_config_bytes,
+        )
         repository_config.write_bytes(
             repository_config_bytes.replace(b"[core]\n", b"[core]\n\tprecomposeunicode = true\n")
         )
@@ -469,6 +535,52 @@ for kind, executable in shells():
             result.returncode == 0 and "immutable bundle" in result.stdout and "healthy" in result.stdout,
             result,
         )
+        local_helper = fresh_canonical / "scripts/install_bundle.py"
+        local_helper_bytes = local_helper.read_bytes()
+        helper_sentinel = root / "helper-sentinel"
+        local_helper.write_text(
+            f"from pathlib import Path\nPath({str(helper_sentinel)!r}).write_text('executed')\n",
+            encoding="utf-8",
+        )
+        result = command(kind, executable, fresh_script, shell_args(kind, "status"), fresh_install_home)
+        check(
+            f"{kind} wrapper never executes a helper that differs from its Git blob",
+            result.returncode != 0 and not helper_sentinel.exists(),
+            result,
+        )
+        local_helper.write_bytes(local_helper_bytes)
+        fresh_receipt = fresh_canonical / ".issue-flow-bundle.json"
+        fresh_receipt_bytes = fresh_receipt.read_bytes()
+        git(remote, "update-ref", "refs/heads/helper-substitution", new)
+        git(
+            fresh_state,
+            f"--git-dir={fresh_state / 'repository.git'}",
+            "fetch",
+            remote.as_uri(),
+            "refs/heads/helper-substitution:refs/issue-flow/test-helper-substitution",
+        )
+        substituted_helper = subprocess.check_output(
+            [
+                "git",
+                f"--git-dir={fresh_state / 'repository.git'}",
+                "cat-file",
+                "blob",
+                f"{new}:scripts/install_bundle.py",
+            ]
+        )
+        substituted_receipt = json.loads(fresh_receipt_bytes)
+        substituted_receipt["commit"] = new
+        local_helper.write_bytes(substituted_helper)
+        fresh_receipt.write_text(json.dumps(substituted_receipt), encoding="utf-8")
+        result = command(kind, executable, fresh_script, shell_args(kind, "status"), fresh_install_home)
+        check(
+            f"{kind} wrapper binds helper verification to the active bundle identity",
+            result.returncode != 0,
+            result,
+        )
+        local_helper.write_bytes(local_helper_bytes)
+        fresh_receipt.write_bytes(fresh_receipt_bytes)
+        git(remote, "update-ref", "-d", "refs/heads/helper-substitution")
         result = command(kind, executable, fresh_script, shell_args(kind, "uninstall"), fresh_install_home)
         check(
             f"{kind} uninstall removes only runtime links",
@@ -494,6 +606,67 @@ for kind, executable in shells():
                 result.returncode == 0 and "after-iex" in result.stdout,
                 result,
             )
+            result, outer_sentinel = outer_script_powershell(kind, executable, external, blocked_home, root)
+            check(
+                f"{kind} IEX ignores an outer script's adjacent helper",
+                result.returncode == 0 and "after-outer-iex" in result.stdout and not outer_sentinel.exists(),
+                result,
+            )
+
+        hostile_legacy_home = root / "hostile legacy home"
+        hostile_legacy = hostile_legacy_home / ".agents/skills/issue-flow"
+        clone_legacy(remote, hostile_legacy, legacy)
+        diff_sentinel = root / "diff-sentinel"
+        diff_driver = root / "diff-driver.sh"
+        diff_driver.write_text(
+            f"#!/bin/sh\nprintf executed > '{diff_sentinel.as_posix()}'\nexit 0\n",
+            encoding="utf-8",
+        )
+        os.chmod(diff_driver, 0o755)
+        git(hostile_legacy, "config", "diff.external", diff_driver.as_posix())
+        git(hostile_legacy, "config", "diff.trustExitCode", "true")
+        with (hostile_legacy / "SKILL.md").open("a", encoding="utf-8") as handle:
+            handle.write("dirty\n")
+        result = command(kind, executable, external, shell_args(kind, "install"), hostile_legacy_home)
+        check(
+            f"{kind} legacy migration disables external diff execution",
+            result.returncode != 0 and not diff_sentinel.exists() and git(hostile_legacy, "status", "--short"),
+            result,
+        )
+
+        legacy_recovery_home = root / "legacy recovery home"
+        legacy_recovery = legacy_recovery_home / ".agents/skills/issue-flow"
+        clone_legacy(remote, legacy_recovery, legacy)
+        for runtime_root in (".claude", ".codex"):
+            runtime_parent = legacy_recovery_home / runtime_root / "skills"
+            runtime_parent.mkdir(parents=True)
+            create_directory_pointer(runtime_parent / "issue-flow", legacy_recovery.resolve())
+        recovery_paths = Paths.for_home(legacy_recovery_home)
+        initialize_state(recovery_paths)
+        recovery_target = fetch_target(recovery_paths)
+        tree_entries(recovery_paths, recovery_target)
+        recovery_bundle = materialize_bundle(recovery_paths, recovery_target)
+        recovery_backup = recovery_paths.legacy / f"{legacy}-recovery-test"
+        write_json(
+            recovery_paths.transaction,
+            {
+                "schema": 1,
+                "phase": "moved",
+                "backup": str(recovery_backup),
+                "previous": legacy,
+                "target": recovery_target,
+            },
+        )
+        replace_path(legacy_recovery, recovery_backup)
+        recovery_script = recovery_bundle / ("install.sh" if kind == "POSIX" else "install.ps1")
+        result = command(kind, executable, recovery_script, shell_args(kind, "install"), legacy_recovery_home)
+        check(
+            f"{kind} install retry restores and resumes an interrupted legacy migration",
+            result.returncode == 0
+            and current_revision(legacy_recovery_home) == candidate
+            and not recovery_paths.transaction.exists(),
+            result,
+        )
 
         clone_legacy(remote, installed, legacy)
         (home / ".claude").mkdir()
@@ -521,7 +694,21 @@ for kind, executable in shells():
             and (installed / "custom-hook.sh").read_bytes() == b"#!/bin/sh\nexit 0\n"
             and stat.S_IMODE((installed / "custom-hook.sh").stat().st_mode)
             == stat.S_IMODE((home / ".agents/skills/.issue-flow/local/custom-hook.sh").stat().st_mode)
-            and (os.name == "nt" or stat.S_IMODE((installed / "custom-hook.sh").stat().st_mode) == 0o755),
+            and (os.name == "nt" or stat.S_IMODE((installed / "custom-hook.sh").stat().st_mode) == 0o755)
+            and (installed / (".cache." + "b" * 32 + ".tmp")).read_bytes()
+            == b"legitimate local temporary name\n",
+            result,
+        )
+        result = command(
+            kind,
+            executable,
+            installed / ("install.sh" if kind == "POSIX" else "install.ps1"),
+            shell_args(kind, "rollback"),
+            home,
+        )
+        check(
+            f"{kind} migration does not expose the in-place legacy installer as rollback",
+            result.returncode != 0 and current_revision(home) == candidate,
             result,
         )
 
@@ -546,7 +733,9 @@ for kind, executable in shells():
             and os.path.samefile(
                 installed / "operator.local.md",
                 home / ".agents/skills/.issue-flow/operator.local.md",
-            ),
+            )
+            and (installed / (".cache." + "b" * 32 + ".tmp")).read_bytes()
+            == b"legitimate local temporary name\n",
             result,
         )
 
@@ -581,10 +770,17 @@ for kind, executable in shells():
             b"| Tracker | linear | github |",
             b"| Tracker | trello | github |",
         )
+        configured_generation_name = hashlib.sha256(configured_policy).hexdigest()
         interrupted_generation = policy_generation(fixture_paths, interrupted_policy)
         replace_hardlink(fixture_paths.config, interrupted_generation)
         fixture_paths.policy_transaction.write_text(
-            json.dumps({"schema": 1, "generation": interrupted_generation.name}),
+            json.dumps(
+                {
+                    "schema": 1,
+                    "generation": interrupted_generation.name,
+                    "previous": configured_generation_name,
+                }
+            ),
             encoding="utf-8",
         )
         result = command(
@@ -610,7 +806,13 @@ for kind, executable in shells():
             interrupted_generation.unlink()
             interrupted_generation.symlink_to(external_policy)
             fixture_paths.policy_transaction.write_text(
-                json.dumps({"schema": 1, "generation": interrupted_generation.name}),
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "generation": interrupted_generation.name,
+                        "previous": configured_generation_name,
+                    }
+                ),
                 encoding="utf-8",
             )
             result = command(
@@ -632,6 +834,18 @@ for kind, executable in shells():
         direct_runtime = home / ".claude/skills/issue-flow"
         remove_directory_pointer(direct_runtime)
         create_directory_pointer(direct_runtime, installed.resolve(strict=True))
+        result = command(
+            kind,
+            executable,
+            installed / ("install.sh" if kind == "POSIX" else "install.ps1"),
+            shell_args(kind, "uninstall", "--dry-run"),
+            home,
+        )
+        check(
+            f"{kind} uninstall preserves a direct non-owned bundle pointer",
+            result.returncode == 0 and os.path.lexists(direct_runtime) and "SKIP" in result.stdout,
+            result,
+        )
         result = command(
             kind,
             executable,
@@ -758,6 +972,9 @@ for kind, executable in shells():
         )
         git(state_root, f"--git-dir={object_store}", "update-ref", "-d", "refs/issue-flow/test-unactivated")
 
+        legacy_bundle = materialize_bundle(fixture_paths, legacy, require_entrypoints=False)
+        remove_directory_pointer(fixture_paths.canonical)
+        create_directory_pointer(fixture_paths.canonical, legacy_bundle)
         (state_root / "transaction.json").write_text(
             json.dumps(
                 {
@@ -765,13 +982,13 @@ for kind, executable in shells():
                     "phase": "prepared",
                     "previous": candidate,
                     "target": new,
-                    "prior_previous": legacy,
+                    "prior_previous": None,
                 }
             ),
             encoding="utf-8",
         )
-        activate(fixture_paths, state_root / "bundles" / legacy)
-        result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
+        retained_script = state_root / "bundles" / new / ("install.sh" if kind == "POSIX" else "install.ps1")
+        result = command(kind, executable, retained_script, shell_args(kind, "recover"), home)
         check(
             f"{kind} recovery rejects an active bundle outside journal endpoints",
             result.returncode != 0
@@ -782,8 +999,22 @@ for kind, executable in shells():
         (state_root / "transaction.json").unlink()
         activate(fixture_paths, state_root / "bundles" / new)
         (state_root / "current.json").write_bytes(state_before_dry_rollback)
+        shutil.rmtree(legacy_bundle)
+        git(
+            state_root,
+            f"--git-dir={object_store}",
+            "update-ref",
+            "-d",
+            f"refs/issue-flow/bundles/{legacy}",
+        )
 
         remove_directory_pointer(fixture_paths.canonical)
+        result = command(kind, executable, retained_script, shell_args(kind, "uninstall", "--dry-run"), home)
+        check(
+            f"{kind} uninstall recognizes a lexically owned link when canonical is broken",
+            result.returncode == 0 and "would" in result.stdout,
+            result,
+        )
         fixture_paths.canonical.mkdir()
         (state_root / "transaction.json").write_text(
             json.dumps(
@@ -792,7 +1023,7 @@ for kind, executable in shells():
                     "phase": "prepared",
                     "previous": candidate,
                     "target": new,
-                    "prior_previous": legacy,
+                    "prior_previous": None,
                 }
             ),
             encoding="utf-8",
@@ -817,7 +1048,7 @@ for kind, executable in shells():
                     "phase": "prepared",
                     "previous": candidate,
                     "target": new,
-                    "prior_previous": legacy,
+                    "prior_previous": None,
                 }
             ),
             encoding="utf-8",
@@ -829,7 +1060,7 @@ for kind, executable in shells():
             f"{kind} interrupted activation restores the pre-transaction rollback chain",
             result.returncode == 0
             and current_revision(home) == candidate
-            and recovered_state["previous"] == legacy,
+            and recovered_state["previous"] is None,
             result,
         )
         result = command(kind, executable, installed / recovery_script.name, shell_args(kind, "sync"), home)
@@ -957,28 +1188,28 @@ for kind, executable in shells():
             f"{kind} can reactivate the published target and retains resolved bundles",
             result.returncode == 0
             and current_revision(home) == new
-            and len([path for path in (state_root / "bundles").iterdir() if path.is_dir()]) == 3,
+            and len([path for path in (state_root / "bundles").iterdir() if path.is_dir()]) == 2,
             result,
         )
 
-        obsolete_file = state_root / "bundles" / legacy / "removed.md"
+        obsolete_file = state_root / "bundles" / candidate / "references/runtime-notes.md"
         obsolete_bytes = obsolete_file.read_bytes()
         obsolete_file.write_bytes(b"obsolete local damage\n")
         result = command(kind, executable, active_script, shell_args(kind, "sync"), home)
         check(
-            f"{kind} obsolete bundle damage does not wedge active sync",
+            f"{kind} retained bundle damage does not wedge active sync",
             result.returncode == 0 and current_revision(home) == new,
             result,
         )
         result = command(kind, executable, active_script, shell_args(kind, "status"), home)
         check(
-            f"{kind} status reports obsolete bundle damage without failing",
+            f"{kind} status reports retained bundle damage without failing",
             result.returncode == 0 and "corrupt=1" in result.stdout,
             result,
         )
         obsolete_file.write_bytes(obsolete_bytes)
 
-        obsolete_receipt = state_root / "bundles" / legacy / ".issue-flow-bundle.json"
+        obsolete_receipt = state_root / "bundles" / candidate / ".issue-flow-bundle.json"
         obsolete_receipt_bytes = obsolete_receipt.read_bytes()
         obsolete_receipt.write_bytes(b"\xff\xfe")
         wrong_type_bundle = state_root / "bundles" / ("f" * 40)
@@ -1020,7 +1251,7 @@ for kind, executable in shells():
         bundle_store.unlink()
         saved_bundle_store.rename(bundle_store)
 
-        inactive_policy = state_root / "bundles" / legacy / "operator.local.md"
+        inactive_policy = state_root / "bundles" / candidate / "operator.local.md"
         inactive_policy.unlink()
         inactive_policy.mkdir()
         result = command(kind, executable, active_script, shell_args(kind, "status"), home)
@@ -1062,7 +1293,7 @@ for kind, executable in shells():
                     "schema": 1,
                     "repository": remote.as_uri(),
                     "current": candidate,
-                    "previous": legacy,
+                    "previous": None,
                     "activated_at": 0,
                 }
             ),
@@ -1241,7 +1472,7 @@ for kind, executable in shells():
             result.returncode == 0
             and current_revision(home) == third
             and retained_reader.read_text(encoding="utf-8") == "candidate companion\n"
-            and len([path for path in (state_root / "bundles").iterdir() if path.is_dir()]) == 4,
+            and len([path for path in (state_root / "bundles").iterdir() if path.is_dir()]) == 3,
             result,
         )
 

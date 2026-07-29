@@ -82,7 +82,7 @@ workflow already demands).
 
 ## Install
 
-The installer needs Git and Python 3.10 or newer, the same Python runtime used by the GitHub binding. One line
+The installer needs Git 2.36 or newer and Python 3.10 or newer, the same Python runtime used by the GitHub binding. One line
 acquires the current commit into quarantine, materializes its complete Git tree as a new immutable
 bundle, and points `~/.agents/skills/issue-flow` at that bundle:
 
@@ -98,7 +98,8 @@ irm https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.ps1 | i
 
 **The piped script is only a bootstrap.** It runs Python in isolated mode, disables inherited Git
 configuration and hooks, acquires canonical `main` into a temporary bare repository, extracts only
-the commit's shared installer, and hands over to it. The
+the commit's shared installer, and hands over to it. Standard proxy and CA variables remain available
+to Git; Git-specific authority variables do not. The
 installer reads blobs directly from the fetched Git objects, rejects unsafe paths and broken local
 Markdown links, verifies every materialized byte against the commit tree, and activates only after
 the complete bundle is durable. Prefer to inspect the files first? The legacy clone layout is a
@@ -116,17 +117,22 @@ POSIX atomically replaces the public symlink; Windows atomically retargets its d
 which needs no elevation. Runtime paths under `~/.claude/skills/` and `~/.codex/skills/` point at the
 stable public path. Independent copies are refused because they would remain on stale policy.
 
-The store retains every activated bundle so an already-running load can keep using the immutable path
+The store retains every activated immutable bundle so an already-running load can keep using the immutable path
 it resolved at activation across any number of later upgrades. Materialization and activation have
-separate Git refs: `rollback` accepts the recorded previous generation only when a completed
+separate Git refs, and the installer requires Git reference fsync before removing a recovery journal:
+`rollback` accepts the recorded previous generation only when a completed
 post-switch activation marker exists. `status` verifies tracked bytes and local attachments for every
 retained bundle, reports corrupt generations, and measures all deduplicated installer-state storage
 for deliberate operator cleanup. A new load sees one complete generation and must not reopen
-companions through the stable alias. The one-time legacy directory move has a brief availability gap,
-so run that migration between agent sessions; its journal makes an interruption recoverable.
+companions through the stable alias. The byte-exact v1.11 clone is not an immutable rollback target:
+its old installer performs in-place writes that are unsafe against the new store. A successful first
+migration therefore has no `rollback` target until the next immutable upgrade. If migration is
+interrupted before activation, recovery validates and restores the original standalone clone instead.
+Run the one-time directory move between agent sessions because it has a brief availability gap.
 
 Run `status` to verify the active commit, tree, runtime targets and pending recovery state; `rollback`
-reactivates the retained previous bundle, and `recover` completes an interrupted transaction only
+fetches canonical `main`, proves the retained activated predecessor is still in its history, then
+reactivates it. `recover` completes an interrupted transaction only
 when the pointer is one of that journal's declared endpoints. Unexplained pointer/state drift fails
 closed instead of being normalized. `uninstall`
 removes only installer-owned runtime links; it never removes bundles, policy or rollback state.
@@ -251,9 +257,9 @@ Single-file `--from`/`-From` sync fails before mutation because it cannot prove 
 references and assets come from the same contract. Remote acquisition uses a one-shot bare clone
 before any destination-local config exists, disables executable hooks and protocols outside the
 configured transport, and atomically copies verified objects into real store directories. A failed
-fetch, validation or materialization leaves the active pointer unchanged. The previous complete
-bundle remains available through `rollback`; `recover` reconciles the journal if the one-time legacy
-directory move was interrupted.
+fetch, validation or materialization leaves the active pointer unchanged. After two immutable
+generations exist, the previous complete bundle remains available through `rollback`; `recover`
+restores the standalone clone or reconciles the bundle journal when an operation was interrupted.
 Never force-add `operator.local.md`: its values are permissions, including whether an agent may
 publish or merge without asking.
 
@@ -266,5 +272,11 @@ something. The installer acceptance suite runs the same bootstrap, migration, up
 authority, crash-recovery, rollback and policy-preservation cases through PowerShell 7, Windows
 PowerShell 5.1 and Git Bash. The POSIX adapter
 has not yet run on a native Linux or macOS shell.
+
+The Python and Git executables selected from the operator's `PATH` are trust roots, as is canonical
+GitHub `main`. Local receipts, refs and journals detect partial drift and interrupted writes; they are
+not signatures against a fully compromised account that can coherently rewrite every object, bundle,
+pointer and state file. That stronger threat requires OS account isolation or signed upstream
+artifacts rather than another unsigned local marker.
 
 Licensed GPL-2.0. Issues and corrections welcome, preferably filed through the workflow itself.

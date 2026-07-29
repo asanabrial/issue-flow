@@ -42,6 +42,8 @@ TEMPORARY_NAME = re.compile(r"^\..+\.[0-9a-f]{32}\.tmp$")
 WINDOWS_RESERVED = frozenset(
     {"CON", "PRN", "AUX", "NUL", *(f"COM{index}" for index in range(1, 10)), *(f"LPT{index}" for index in range(1, 10))}
 )
+MINIMUM_GIT_VERSION = (2, 36)
+_VERIFIED_GIT_EXECUTABLE: str | None = None
 
 
 class InstallError(RuntimeError):
@@ -413,6 +415,28 @@ def disabled_hooks_path() -> str:
     return "NUL" if os.name == "nt" else "/dev/null"
 
 
+def git_executable() -> str:
+    global _VERIFIED_GIT_EXECUTABLE
+    if _VERIFIED_GIT_EXECUTABLE:
+        return _VERIFIED_GIT_EXECUTABLE
+    executable = shutil.which("git")
+    if not executable:
+        fail("git is required; install Git 2.36 or newer and retry")
+    result = subprocess.run(
+        [executable, "--version"],
+        env=clean_git_environment(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    match = re.search(r"\b(\d+)\.(\d+)(?:\.\d+)?\b", result.stdout)
+    if result.returncode or not match or tuple(map(int, match.groups())) < MINIMUM_GIT_VERSION:
+        fail(f"Git 2.36 or newer is required, got {result.stdout.strip() or 'an unreadable version'}")
+    _VERIFIED_GIT_EXECUTABLE = executable
+    return executable
+
+
 def git(
     paths: Paths,
     *arguments: str,
@@ -421,9 +445,7 @@ def git(
     text: bool = True,
     check: bool = True,
 ) -> subprocess.CompletedProcess:
-    executable = shutil.which("git")
-    if not executable:
-        fail("git is required; install it and retry")
+    executable = git_executable()
     if repository:
         validate_repository_config(repository)
     command = [
@@ -486,10 +508,16 @@ def validate_repository_config(repository: Path) -> None:
         "symlinks",
         "ignorecase",
         "precomposeunicode",
+        "fsync",
+        "fsyncmethod",
     }
     unexpected = set(parser["core"]) - allowed
     if unexpected or parser["core"].get("bare", "").casefold() != "true":
         fail(f"bare repository config is not installer-owned: unexpected={sorted(unexpected)}")
+    if parser["core"].get("fsync", "").casefold() != "reference" or parser["core"].get(
+        "fsyncmethod", ""
+    ).casefold() != "fsync":
+        fail(f"bare repository does not durably fsync references: {config_path}")
     if (repository / "objects" / "info" / "alternates").exists():
         fail(f"bare repository must not use an alternate object database: {repository}")
 
@@ -499,6 +527,7 @@ def initialize_repository(paths: Paths) -> None:
         staging = paths.state / f".repository-{uuid.uuid4().hex}"
         try:
             git(paths, "init", "--bare", f"--template={paths.template}", str(staging))
+            replace_repository_config(staging)
             validate_repository_config(staging)
             replace_path(staging, paths.repository)
             fsync_directory(paths.state)
@@ -571,6 +600,8 @@ def replace_repository_config(repository: Path) -> None:
         f"\tfilemode = {'false' if os.name == 'nt' else 'true'}\n"
         "\tbare = true\n"
         "\tlogallrefupdates = false\n"
+        "\tfsync = reference\n"
+        "\tfsyncmethod = fsync\n"
     ).encode("ascii")
     write_bytes_atomic(repository / "config", content)
 
@@ -1190,10 +1221,15 @@ def validate_policy_destinations(paths: Paths) -> None:
 
 def switch_policy(paths: Paths, content: bytes) -> None:
     validate_policy_destinations(paths)
+    previous = current_policy_generation(paths)
     generation = policy_generation(paths, content)
     write_json(
         paths.policy_transaction,
-        {"schema": STATE_SCHEMA, "generation": generation.name},
+        {
+            "schema": STATE_SCHEMA,
+            "generation": generation.name,
+            "previous": previous.name if previous else None,
+        },
     )
     complete_policy_switch(paths, generation)
     remove_state_file(paths.policy_transaction)
@@ -1207,6 +1243,8 @@ def recover_policy_transaction(paths: Paths) -> None:
     if not paths.policy_transaction.exists():
         return
     transaction = read_json(paths.policy_transaction)
+    if set(transaction) != {"schema", "generation", "previous"} or transaction.get("schema") != STATE_SCHEMA:
+        fail(f"invalid policy transaction shape: {paths.policy_transaction}")
     generation_name = str(transaction.get("generation", ""))
     if not re.fullmatch(r"[0-9a-f]{64}", generation_name):
         fail(f"invalid policy transaction: {paths.policy_transaction}")
@@ -1219,11 +1257,22 @@ def recover_policy_transaction(paths: Paths) -> None:
         or details.st_nlink != known_policy_link_count(paths, generation)
     ):
         fail(f"policy transaction generation is missing or corrupt: {generation}")
+    previous_value = transaction.get("previous")
+    previous_name = str(previous_value) if previous_value else None
+    if previous_name and not re.fullmatch(r"[0-9a-f]{64}", previous_name):
+        fail(f"invalid previous policy generation in {paths.policy_transaction}")
+    current = current_policy_generation(paths)
+    if (current.name if current else None) not in {previous_name, generation_name}:
+        fail(f"stable policy is outside transaction endpoints: {paths.policy_transaction}")
     complete_policy_switch(paths, generation)
     remove_state_file(paths.policy_transaction)
 
 
-def generated_temporaries(root: Path, recursive: bool = False) -> list[Path]:
+def generated_temporaries(
+    root: Path,
+    recursive: bool = False,
+    excluded_names: frozenset[str] = frozenset(),
+) -> list[Path]:
     if not root.is_dir() or is_pointer(root):
         return []
     matches: list[Path] = []
@@ -1231,7 +1280,7 @@ def generated_temporaries(root: Path, recursive: bool = False) -> list[Path]:
     while stack:
         directory = stack.pop()
         for item in directory.iterdir():
-            if TEMPORARY_NAME.fullmatch(item.name):
+            if TEMPORARY_NAME.fullmatch(item.name) and item.name not in excluded_names:
                 matches.append(item)
             elif recursive and item.is_dir() and not is_pointer(item):
                 stack.append(item)
@@ -1240,6 +1289,7 @@ def generated_temporaries(root: Path, recursive: bool = False) -> list[Path]:
 
 def abandoned_paths(paths: Paths) -> list[Path]:
     candidates: list[Path] = []
+    attachment_names = frozenset(record["name"] for record in attachment_records(paths))
     if paths.bundles.exists():
         candidates.extend(paths.bundles.glob(".staging-*-" + "?" * 32))
         for bundle in paths.bundles.iterdir():
@@ -1256,14 +1306,18 @@ def abandoned_paths(paths: Paths) -> list[Path]:
             candidates.extend(
                 item
                 for item in bundle.iterdir()
-                if TEMPORARY_NAME.fullmatch(item.name) and item.name not in tracked
+                if (
+                    TEMPORARY_NAME.fullmatch(item.name)
+                    and item.name not in tracked
+                    and item.name not in attachment_names
+                )
             )
     if paths.state.exists():
         candidates.extend(paths.state.glob(".repository-" + "?" * 32))
         candidates.extend(paths.state.glob(".fetch-" + "?" * 32))
         candidates.extend(generated_temporaries(paths.state))
     candidates.extend(generated_temporaries(paths.policies))
-    candidates.extend(generated_temporaries(paths.local))
+    candidates.extend(generated_temporaries(paths.local, excluded_names=attachment_names))
     candidates.extend(generated_temporaries(paths.repository))
     candidates.extend(generated_temporaries(paths.repository / "objects", recursive=True))
     if paths.skills.exists():
@@ -1371,32 +1425,78 @@ def pointer_targets(pointer: Path, expected: Path) -> bool:
     target = Path(raw)
     if not target.is_absolute():
         target = pointer.parent / target
-    return os.path.normcase(os.path.abspath(target)) == os.path.normcase(os.path.abspath(expected))
+    target_alias = Path(os.path.realpath(target.parent)) / target.name
+    expected_alias = Path(os.path.realpath(expected.parent)) / expected.name
+    return os.path.normcase(os.path.abspath(target_alias)) == os.path.normcase(os.path.abspath(expected_alias))
 
 
-def legacy_git(paths: Paths, *arguments: str, check: bool = True) -> subprocess.CompletedProcess:
-    return git(paths, *arguments, cwd=paths.canonical, check=check)
+def legacy_git(
+    paths: Paths,
+    *arguments: str,
+    checkout: Path | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess:
+    return git(paths, *arguments, cwd=checkout or paths.canonical, check=check)
 
 
-def inspect_legacy(paths: Paths, target_entries: list[dict[str, str | int]]) -> dict:
-    if is_pointer(paths.canonical) or not (paths.canonical / ".git").exists():
-        fail(f"{paths.canonical} is neither a legacy Git clone nor a bundle pointer")
-    top = Path(legacy_git(paths, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
-    if top != paths.canonical.resolve():
-        fail(f"legacy checkout root is {top}, expected {paths.canonical}")
-    branch = legacy_git(paths, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+def legacy_tracked_files(paths: Paths, root: Path, current: str) -> set[str]:
+    tree_result = git(paths, "ls-tree", "-r", "-z", "--full-tree", current, cwd=root, text=False)
+    tree: dict[str, tuple[str, str]] = {}
+    for record in tree_result.stdout.split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_name = record.split(b"\t", 1)
+        mode, kind, object_id = metadata.decode("ascii").split(" ", 2)
+        name = raw_name.decode("utf-8", "strict")
+        if kind != "blob" or mode not in ("100644", "100755"):
+            fail(f"legacy tracked entry is not a regular runtime file: {mode} {kind} {name}")
+        tree[name] = (mode, object_id)
+
+    index_result = git(paths, "ls-files", "--stage", "-z", cwd=root, text=False)
+    index: dict[str, tuple[str, str]] = {}
+    for record in index_result.stdout.split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_name = record.split(b"\t", 1)
+        mode, object_id, stage = metadata.decode("ascii").split(" ", 2)
+        name = raw_name.decode("utf-8", "strict")
+        if stage != "0":
+            fail(f"legacy index has an unresolved stage for {name}")
+        index[name] = (mode, object_id)
+    if index != tree:
+        fail("legacy migration requires its index to match HEAD exactly")
+
+    for name, (_, expected_object) in tree.items():
+        path = root.joinpath(*PurePosixPath(name).parts)
+        if is_pointer(path) or not path.is_file():
+            fail(f"legacy tracked file changed type: {path}")
+        content = path.read_bytes()
+        header = f"blob {len(content)}\0".encode("ascii")
+        algorithm = hashlib.sha1 if len(expected_object) == 40 else hashlib.sha256
+        if algorithm(header + content).hexdigest() != expected_object:
+            fail(f"legacy migration requires clean tracked bytes: {name}")
+    return set(tree)
+
+
+def inspect_legacy(
+    paths: Paths,
+    target_entries: list[dict[str, str | int]],
+    checkout: Path | None = None,
+) -> dict:
+    root = checkout or paths.canonical
+    if is_pointer(root) or not (root / ".git").exists():
+        fail(f"{root} is not a real legacy Git clone")
+    top = Path(legacy_git(paths, "rev-parse", "--show-toplevel", checkout=root).stdout.strip()).resolve()
+    if top != root.resolve():
+        fail(f"legacy checkout root is {top}, expected {root}")
+    branch = legacy_git(paths, "symbolic-ref", "--quiet", "--short", "HEAD", checkout=root).stdout.strip()
     if branch != "main":
         fail(f"legacy migration requires main, current branch is {branch}")
-    if legacy_git(paths, "diff", "--quiet", "--", check=False).returncode or legacy_git(
-        paths, "diff", "--cached", "--quiet", "--", check=False
-    ).returncode:
-        fail("legacy migration requires clean tracked files; preserve local edits before retrying")
-    origin = legacy_git(paths, "config", "--local", "--get", "remote.origin.url").stdout.strip()
+    origin = legacy_git(paths, "config", "--local", "--get", "remote.origin.url", checkout=root).stdout.strip()
     if origin.rstrip("/") != REPOSITORY_URL.rstrip("/"):
         fail("legacy origin is not the canonical repository; its value is redacted because URLs can contain credentials")
-    current = legacy_git(paths, "rev-parse", "HEAD^{commit}").stdout.strip()
-    tracked_raw = legacy_git(paths, "ls-files", "-z").stdout
-    tracked = {name for name in tracked_raw.split("\0") if name}
+    current = legacy_git(paths, "rev-parse", "HEAD^{commit}", checkout=root).stdout.strip()
+    tracked = legacy_tracked_files(paths, root, current)
     tracked_top = {PurePosixPath(name).parts[0].casefold() for name in tracked}
     target_top = {PurePosixPath(str(entry["path"])).parts[0].casefold() for entry in target_entries}
     local_names: set[str] = set()
@@ -1404,7 +1504,7 @@ def inspect_legacy(paths: Paths, target_entries: list[dict[str, str | int]]) -> 
         ("ls-files", "--others", "--exclude-standard", "-z"),
         ("ls-files", "--others", "--ignored", "--exclude-standard", "-z"),
     ):
-        for name in legacy_git(paths, *arguments).stdout.split("\0"):
+        for name in legacy_git(paths, *arguments, checkout=root).stdout.split("\0"):
             if not name:
                 continue
             first = PurePosixPath(name).parts[0]
@@ -1413,7 +1513,7 @@ def inspect_legacy(paths: Paths, target_entries: list[dict[str, str | int]]) -> 
             local_names.add(first)
     local_names.discard(CONFIG_FILE)
     for name in local_names:
-        source = paths.canonical / name
+        source = root / name
         if name.casefold() in target_top:
             fail(f"local state collides with the target contract tree: {name}")
         if is_pointer(source) or not (source.is_file() or source.is_dir()):
@@ -1550,7 +1650,6 @@ def migrate_legacy(paths: Paths, target: str, target_entries: list[dict[str, str
     legacy = inspect_legacy(paths, target_entries)
     current = str(legacy["commit"])
     ensure_ancestor(paths, current, target)
-    current_bundle = materialize_bundle(paths, current, require_entrypoints=False)
     target_bundle = materialize_bundle(paths, target)
     if (paths.canonical / CONFIG_FILE).exists():
         config = (paths.canonical / CONFIG_FILE).read_bytes()
@@ -1564,13 +1663,9 @@ def migrate_legacy(paths: Paths, target: str, target_entries: list[dict[str, str
         paths,
         backup,
         list(legacy["local_names"]),
-        [current_bundle, target_bundle],
+        [target_bundle],
     )
-    attach_local(paths, current_bundle, allow_dangling=True)
     attach_local(paths, target_bundle, allow_dangling=True)
-    # The legacy checkout is the proven active predecessor; mark it before moving its path so
-    # recovery can distinguish it from a target that was only materialized.
-    mark_activated(paths, current)
     write_json(
         paths.transaction,
         {
@@ -1595,7 +1690,7 @@ def migrate_legacy(paths: Paths, target: str, target_entries: list[dict[str, str
         )
         activate(paths, target_bundle)
         verify_attachments(paths, target_bundle)
-        record_current(paths, target, current)
+        record_current(paths, target, None)
         remove_state_file(paths.transaction, missing_ok=True)
     except Exception:
         if not path_exists(paths.canonical) and backup.exists():
@@ -1634,7 +1729,7 @@ def recover_transaction(paths: Paths) -> None:
         if current == target:
             # Activation may have switched the pointer immediately before interruption.
             mark_activated(paths, target)
-            record_current(paths, target, previous)
+            record_current(paths, target, None if backup else previous)
         elif previous and current == previous:
             require_activated(paths, previous)
             record_current(paths, previous, prior_previous)
@@ -1651,6 +1746,13 @@ def recover_transaction(paths: Paths) -> None:
         legacy = inspect_legacy(paths, tree_entries(paths, target))
         if legacy["commit"] != previous:
             fail(f"legacy canonical path is outside transaction predecessor {previous}: {legacy['commit']}")
+        remove_state_file(paths.transaction)
+        return
+    if backup and backup.exists():
+        legacy = inspect_legacy(paths, tree_entries(paths, target), checkout=backup)
+        if legacy["commit"] != previous:
+            fail(f"legacy backup is outside transaction predecessor {previous}: {legacy['commit']}")
+        replace_path(backup, paths.canonical)
         remove_state_file(paths.transaction)
         return
     previous_bundle = paths.bundles / previous if previous else None
@@ -1796,17 +1898,27 @@ def runtime_paths(paths: Paths) -> tuple[Path, Path]:
 
 
 def install_runtime_links(paths: Paths, dry_run: bool) -> None:
-    validate_runtime_paths(paths)
-    ensure_layout(paths, dry_run)
+    if dry_run or (
+        not (path_exists(paths.canonical) and is_pointer(paths.canonical))
+        and not paths.transaction.exists()
+    ):
+        validate_runtime_paths(paths)
+    if dry_run or not (path_exists(paths.canonical) and is_pointer(paths.canonical)):
+        ensure_layout(paths, dry_run)
     if dry_run and (not path_exists(paths.canonical) or not is_pointer(paths.canonical)):
         for runtime in runtime_paths(paths):
             if runtime.parent.parent.exists():
                 print(f"would   link {runtime} -> {paths.canonical} after bundle activation")
         return
+    if not dry_run:
+        initialize_directories(paths)
     context = nullcontext() if dry_run else InstallerLock(paths)
     with context:
         if not dry_run:
+            initialize_repository(paths)
             cleanup_abandoned(paths)
+            recover_policy_transaction(paths)
+            recover_transaction(paths)
             validate_runtime_paths(paths)
         active_bundle(paths)
         for runtime in runtime_paths(paths):
@@ -1845,11 +1957,10 @@ def remove_runtime_links(paths: Paths, dry_run: bool) -> None:
     with context:
         if not dry_run and paths.state.is_dir():
             cleanup_abandoned(paths)
-        target = paths.canonical.resolve(strict=True) if path_exists(paths.canonical) else None
         for runtime in runtime_paths(paths):
             if not path_exists(runtime):
                 continue
-            if not is_pointer(runtime) or target is None or runtime.resolve(strict=True) != target:
+            if not is_pointer(runtime) or not pointer_targets(runtime, paths.canonical):
                 print(f"SKIP    {runtime} is not an installer-owned link")
                 continue
             if dry_run:
@@ -1955,6 +2066,11 @@ def rollback(paths: Paths, dry_run: bool) -> None:
         if not isinstance(previous, str) or not previous:
             fail("no retained previous bundle is recorded")
         require_activated(paths, previous)
+        canonical_target = fetch_target(paths)
+        try:
+            ensure_ancestor(paths, previous, canonical_target)
+        finally:
+            finish_target(paths, canonical_target, keep=False)
         previous_bundle = paths.bundles / previous
         if not previous_bundle.is_dir():
             fail(f"recorded rollback bundle was never activated: {previous}")
@@ -2040,7 +2156,7 @@ def directory_usage(root: Path) -> int:
 
 def status(paths: Paths) -> None:
     print(f"canonical  {paths.canonical}")
-    if paths.state.exists():
+    if path_exists(paths.state):
         if is_pointer(paths.state) or not paths.state.is_dir():
             fail(f"installer state is not a real directory: {paths.state}")
         if path_exists(paths.bundles) and (is_pointer(paths.bundles) or not paths.bundles.is_dir()):

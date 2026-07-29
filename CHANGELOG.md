@@ -12,15 +12,19 @@ All notable changes to Issue Flow are documented here.
 - Retire `sync --from <SKILL.md>` because one file cannot prove its required references and assets.
   Both shell entrypoints now delegate to one Python transaction implementation.
 - Preserve operator policy and ignored top-level runtime state during the journaled legacy-clone
-  migration, retain the previous bundle for `rollback`, and provide explicit `recover` handling.
+  migration, restoring that standalone clone after an interrupted move without exposing its old
+  in-place installer as an immutable rollback target.
 - Harden bootstrap and recovery authority with portable path rejection, operating-system locks,
   isolated Python imports, disabled Git hooks, core-only repository config, Git-bound rollback
-  verification and post-switch activation provenance.
+  verification, verified local-helper loading and fsynced post-switch activation provenance. Git
+  2.36 or newer is now required for reference fsync support.
 - Publish Git objects, policy generations and migrated local files through durable atomic
   replacements; recover abandoned attachment temporaries and reject linked object-store parents,
   symlinked policy generations and unexplained pointer/state drift.
 - Retain every activated bundle for resolved readers, verify retained bytes and attachments in
   `status`, and report deduplicated storage including corrupt and auxiliary installer state.
+- Revalidate rollback targets against canonical `main`; rollback becomes available after the first
+  subsequent immutable upgrade creates a safe predecessor.
 
 ## [1.11.0] - 2026-07-28
 
