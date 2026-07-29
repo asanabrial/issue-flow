@@ -105,8 +105,8 @@ operator home, extracts the commit's shared installer into memory, and executes 
 without reopening a replaceable helper path. Standard proxy variables remain available to Git;
 Git-specific authority and caller-controlled CA override variables do not, so TLS identity comes
 from the host's system trust store. Quarantine cleanup clears Git's read-only pack attributes and
-fails if its bootstrap path remains; a later bootstrap removes owner-marked quarantines whose
-creating process no longer exists. Every Python entrypoint forces UTF-8 mode so non-ASCII operator
+fails if its bootstrap path remains; a later bootstrap removes owner-marked quarantines only when
+their lifetime lock is no longer held. Every Python entrypoint forces UTF-8 mode so non-ASCII operator
 homes survive shell/native-process boundaries. Installed wrappers likewise reverify the local helper against
 its Git blob in the same Python process that executes those bytes; the absolute Git executable
 selected by the wrapper is propagated through every helper subprocess instead of being reselected
@@ -253,8 +253,8 @@ write deaf, and it never collapses the two.
 ## Configuration
 
 Settings appear as the ignored `operator.local.md` beside `SKILL.md` and persist across bundle
-switches. The stable file is a private editable copy; each bundle exposes a content-addressed,
-immutable local generation under `~/.agents/skills/.issue-flow/`. Settings include tracker, delivery route, merge
+switches. Edit that visible file; `config` adopts it into a private stable copy and each bundle then
+exposes a content-addressed immutable generation under `~/.agents/skills/.issue-flow/`. Settings include tracker, delivery route, merge
 strategy, worktree location, and whether delivery is pre-authorised. The `config` command creates
 the file from the marked defaults in `SKILL.md` when needed. A pull-request route publishes the branch
 for independent review, waits for required CI on the latest head, and then merges using the selected
@@ -263,8 +263,8 @@ immutable tag on the delivered commit and pushes it to the remote before closing
 Releases remain a separate publication layer and follow the repository's existing convention. The
 configuration is a table with the defaults written next to each value, so it reads on its own.
 
-Read or update it through the installer. Manual edits may add arbitrary local instructions; run
-`config` afterward to validate the markers and atomically publish those exact bytes to every bundle:
+Read or update it through the installer. Manual edits beside `SKILL.md` may add arbitrary local
+instructions; run `config` afterward to validate the markers and atomically publish those exact bytes to every bundle:
 
 ```sh
 ./install.sh config                                              # print the table

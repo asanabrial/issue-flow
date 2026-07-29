@@ -20,7 +20,8 @@ All notable changes to Issue Flow are documented here.
   system-only CA trust and fsynced post-switch activation provenance. Git 2.36 or newer is now
   required for reference fsync support, Windows POSIX layers require native Windows Python, and the
   wrapper-selected absolute Git identity is reused after every directory change. Python runs in
-  UTF-8 mode, and later bootstraps recover owner-marked quarantines left by dead processes. Bare repositories
+  UTF-8 mode, and later bootstraps recover owner-marked quarantines only after acquiring their
+  released lifetime lock. Bare repositories
   reject redirected common directories, alternates, linked reference authority and symbolic refs;
   installer refs use no-dereference compare-and-swap updates.
 - Publish Git objects, policy generations and migrated local files through durable atomic

@@ -9,6 +9,7 @@ import json
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -191,6 +192,14 @@ def run(
     if check_result and result.returncode:
         raise RuntimeError(f"{command} failed: {result.stderr}\n{result.stdout}")
     return result
+
+
+help_result = run([sys.executable, str(ROOT / "scripts/install_bundle.py"), "--help"])
+check(
+    "shared installer help marks single-file sync as retired",
+    help_result.returncode == 0 and "retired" in help_result.stdout and "--from" in help_result.stdout,
+    help_result,
+)
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -716,10 +725,7 @@ for kind, executable in shells():
         (fresh_install_home / ".codex").mkdir()
         stale_bootstrap = fresh_install_home / (".issue-flow-bootstrap-" + "d" * 32)
         (stale_bootstrap / "repository.git").mkdir(parents=True)
-        (stale_bootstrap / ".issue-flow-bootstrap-owner").write_text(
-            json.dumps({"schema": 1, "path": stale_bootstrap.name, "pid": 2_147_483_647}),
-            encoding="ascii",
-        )
+        (stale_bootstrap / ".issue-flow-bootstrap-owner").write_bytes(b"\0")
         hostile_python = root / "hostile python"
         hostile_python.mkdir()
         python_sentinel = root / "python-sentinel"
@@ -1429,7 +1435,10 @@ for kind, executable in shells():
         )
 
         manual_policy = configured_policy + b"\r\nLocal-only instruction: preserve this exact text.\r\n"
-        fixture_paths.config.write_bytes(manual_policy)
+        visible_policy = installed / "operator.local.md"
+        if os.name != "nt":
+            visible_policy.unlink()
+        visible_policy.write_bytes(manual_policy)
         result = command(
             kind,
             executable,
@@ -1828,6 +1837,45 @@ for kind, executable in shells():
             "-d",
             f"refs/issue-flow/bundles/{legacy}",
         )
+
+        (state_root / "transaction.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "phase": "prepared",
+                    "previous": candidate,
+                    "target": new,
+                    "prior_previous": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        activation_reference = f"refs/issue-flow/activated/{new}"
+        git(
+            state_root,
+            f"--git-dir={object_store}",
+            "update-ref",
+            "--no-deref",
+            activation_reference,
+            candidate,
+            new,
+        )
+        result = command(kind, executable, retained_script, shell_args(kind, "recover", "--dry-run"), home)
+        check(
+            f"{kind} recovery dry-run rejects a conflicting post-switch activation ref",
+            result.returncode != 0 and (state_root / "transaction.json").exists(),
+            result,
+        )
+        git(
+            state_root,
+            f"--git-dir={object_store}",
+            "update-ref",
+            "--no-deref",
+            activation_reference,
+            new,
+            candidate,
+        )
+        (state_root / "transaction.json").unlink()
 
         state_before_missing_canonical = (state_root / "current.json").read_bytes()
         remove_directory_pointer(fixture_paths.canonical)

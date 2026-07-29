@@ -1344,30 +1344,58 @@ def complete_policy_switch(paths: Paths, generation: Path) -> None:
         write_bytes_atomic(paths.config, content, mode=stat.S_IRUSR | stat.S_IWUSR)
 
 
-def retained_policy_generation(paths: Paths) -> Path | None:
-    generations: dict[str, Path] = {}
-    for destination in policy_destinations(paths):
+def retained_policy_generation(paths: Paths, edited_destination: Path | None = None) -> Path | None:
+    generations: set[Path] = set()
+    destinations = policy_destinations(paths)
+    stable_content = paths.config.read_bytes() if paths.config.exists() else None
+    if stable_content is not None:
+        stable_generation = paths.policies / hashlib.sha256(stable_content).hexdigest()
+        if path_exists(stable_generation):
+            generations.add(stable_generation)
+    for destination in destinations:
         if not path_exists(destination):
             continue
         details = os.lstat(destination)
         if not stat.S_ISREG(details.st_mode):
             fail(f"bundle policy is not a regular file: {destination}")
-        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
-        generation = paths.policies / digest
-        if not is_regular_hardlink(destination, generation):
+        linked = [candidate for candidate in paths.policies.iterdir() if is_regular_hardlink(destination, candidate)]
+        if len(linked) > 1:
+            fail(f"bundle policy links multiple generation names: {destination}")
+        if linked:
+            generations.add(linked[0])
+        elif destination != edited_destination:
             fail(f"bundle policy is not linked to an immutable generation: {destination}")
-        generations[digest] = generation
     if len(generations) > 1:
-        fail(f"retained bundles disagree about operator policy generations: {sorted(generations)}")
+        fail(f"retained bundles disagree about operator policy generations: {sorted(map(str, generations))}")
     if not generations:
         return None
-    generation = next(iter(generations.values()))
+    generation = next(iter(generations))
+    if not re.fullmatch(r"[0-9a-f]{64}", generation.name):
+        fail(f"retained policy generation has an invalid name: {generation}")
+    if hashlib.sha256(generation.read_bytes()).hexdigest() != generation.name:
+        if edited_destination is None or not is_regular_hardlink(edited_destination, generation):
+            fail(f"retained policy generation content disagrees with its identity: {generation}")
+        if stable_content is None or hashlib.sha256(stable_content).hexdigest() != generation.name:
+            fail(f"edited visible policy has no unchanged stable predecessor: {edited_destination}")
     if generation.stat().st_nlink != known_policy_link_count(paths, generation):
         fail(f"policy generation has an external hard link: {generation}")
+    for destination in destinations:
+        if destination == edited_destination:
+            details = os.lstat(destination)
+            if not stat.S_ISREG(details.st_mode):
+                fail(f"edited visible policy is not a regular file: {destination}")
+            if not is_regular_hardlink(destination, generation) and details.st_nlink != 1:
+                fail(f"edited visible policy has an external hard link: {destination}")
+        elif not is_regular_hardlink(destination, generation):
+            fail(f"bundle policy is not linked to the retained generation: {destination}")
     return generation
 
 
-def validate_policy_destinations(paths: Paths, generation: Path | None = None) -> None:
+def validate_policy_destinations(
+    paths: Paths,
+    generation: Path | None = None,
+    edited_destination: Path | None = None,
+) -> None:
     expected = generation if generation is not None else current_policy_generation(paths)
     for candidate in paths.bundles.iterdir():
         if not candidate.is_dir() or is_pointer(candidate) or candidate.name.startswith(".staging-"):
@@ -1375,15 +1403,15 @@ def validate_policy_destinations(paths: Paths, generation: Path | None = None) -
         verify_stored_bundle(paths, candidate)
         verify_attachments(paths, candidate, verify_policy=False)
         destination = candidate / CONFIG_FILE
-        if expected and not is_regular_hardlink(destination, expected):
+        if expected and destination != edited_destination and not is_regular_hardlink(destination, expected):
             fail(f"bundle policy is not linked to the retained generation: {destination}")
         if expected is None and path_exists(destination):
             fail(f"bundle contains operator policy without a retained generation: {destination}")
 
 
-def switch_policy(paths: Paths, content: bytes) -> None:
-    previous = retained_policy_generation(paths)
-    validate_policy_destinations(paths, previous)
+def switch_policy(paths: Paths, content: bytes, edited_destination: Path | None = None) -> None:
+    previous = retained_policy_generation(paths, edited_destination=edited_destination)
+    validate_policy_destinations(paths, previous, edited_destination=edited_destination)
     generation = policy_generation(paths, content)
     write_json(
         paths.policy_transaction,
@@ -2202,7 +2230,11 @@ def recover_transaction(paths: Paths, dry_run: bool = False) -> None:
         current = str(receipt["commit"])
         if current == target:
             # Activation may have switched the pointer immediately before interruption.
-            if not dry_run:
+            if dry_run:
+                activated = direct_ref_target(paths, activation_ref(target))
+                if activated is not None and activated != target:
+                    fail(f"activation ref for {target} resolves to conflicting commit {activated}")
+            else:
                 mark_activated(paths, target)
                 record_current(paths, target, None if backup else previous)
         elif previous and current == previous:
@@ -2634,16 +2666,25 @@ def configure(paths: Paths, assignment: str | None, dry_run: bool) -> None:
         template = (bundle / "SKILL.md").read_bytes().decode("utf-8")
         _, _, defaults = config_block(template, bundle / "SKILL.md")
         config_exists = paths.config.exists()
+        origin = paths.config if config_exists else bundle / "SKILL.md"
         text = paths.config.read_bytes().decode("utf-8") if config_exists else defaults
-        text = merge_missing_config_rows(text, defaults, paths.config if config_exists else bundle / "SKILL.md")
-        text = apply_config_assignment(text, assignment, paths.config if config_exists else bundle / "SKILL.md")
+        edited_destination: Path | None = None
+        visible_policy = bundle / CONFIG_FILE
+        if config_exists and visible_policy.exists():
+            visible_text = visible_policy.read_bytes().decode("utf-8")
+            if visible_text != text:
+                text = visible_text
+                origin = visible_policy
+                edited_destination = visible_policy
+        text = merge_missing_config_rows(text, defaults, origin)
+        text = apply_config_assignment(text, assignment, origin)
         if dry_run:
-            retained = retained_policy_generation(paths)
-            validate_policy_destinations(paths, retained)
+            retained = retained_policy_generation(paths, edited_destination=edited_destination)
+            validate_policy_destinations(paths, retained, edited_destination=edited_destination)
             if assignment is None:
-                print(config_block(text, paths.config if config_exists else bundle / "SKILL.md")[2])
+                print(config_block(text, origin)[2])
             return
-        switch_policy(paths, text.encode("utf-8"))
+        switch_policy(paths, text.encode("utf-8"), edited_destination=edited_destination)
         if assignment is None:
             print(config_block(text, paths.config)[2])
 
@@ -2872,7 +2913,11 @@ def parse_args(arguments: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--set")
-    parser.add_argument("--from", dest="source")
+    parser.add_argument(
+        "--from",
+        dest="source",
+        help="retired; always fails because one file cannot prove a complete runtime bundle",
+    )
     options = parser.parse_args(arguments)
     if options.source is not None:
         fail(

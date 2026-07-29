@@ -8,6 +8,9 @@
     .\install.ps1 rollback
     .\install.ps1 recover
     .\install.ps1 config -Set 'Tracker=linear'
+
+.PARAMETER From
+    Retired. This option always fails because one file cannot prove a complete runtime bundle.
 #>
 
 [CmdletBinding()]
@@ -278,21 +281,21 @@ repository, git_executable, home_value, *installer_arguments = sys.argv[1:]
 git_executable = os.path.realpath(git_executable)
 home = Path(home_value).resolve(strict=True)
 
-def process_exists(pid):
+def lock_owner(handle, blocking):
+    handle.seek(0)
     if os.name == "nt":
-        kernel32 = __import__("ctypes").WinDLL("kernel32", use_last_error=True)
-        handle = kernel32.OpenProcess(0x1000, False, pid)
-        if handle:
-            kernel32.CloseHandle(handle)
+        import msvcrt
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
             return True
-        return False
+        except OSError:
+            return False
+    import fcntl
     try:
-        os.kill(pid, 0)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         return True
-    except ProcessLookupError:
+    except BlockingIOError:
         return False
-    except PermissionError:
-        return True
 
 def make_writable(function, target, _error):
     details = os.lstat(target)
@@ -317,10 +320,15 @@ for candidate in home.iterdir():
     details = os.lstat(owner)
     if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
         raise RuntimeError(f"bootstrap owner marker is not private: {owner}")
-    marker = json.loads(owner.read_text(encoding="ascii"))
-    if marker.get("schema") != 1 or marker.get("path") != candidate.name or not isinstance(marker.get("pid"), int):
-        raise RuntimeError(f"invalid bootstrap owner marker: {owner}")
-    if not process_exists(marker["pid"]):
+    owner_probe = owner.open("r+b")
+    if not lock_owner(owner_probe, blocking=False):
+        owner_probe.close()
+        continue
+    unexpected = {item.name for item in candidate.iterdir()} - {owner.name, "repository.git"}
+    owner_probe.close()
+    if unexpected:
+        raise RuntimeError(f"bootstrap quarantine contains unowned entries: {candidate}: {sorted(unexpected)}")
+    if candidate.exists():
         remove_bootstrap(candidate)
 
 bootstrap = home / f".issue-flow-bootstrap-{uuid.uuid4().hex}"
@@ -328,9 +336,24 @@ os.mkdir(bootstrap, 0o700)
 details = os.lstat(bootstrap)
 if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
     raise RuntimeError(f"bootstrap quarantine is not a private directory: {bootstrap}")
-(bootstrap / ".issue-flow-bootstrap-owner").write_text(
-    json.dumps({"schema": 1, "path": bootstrap.name, "pid": os.getpid()}), encoding="ascii"
-)
+owner_path = bootstrap / ".issue-flow-bootstrap-owner"
+owner_handle = owner_path.open("x+b")
+owner_handle.write(b"\0")
+owner_handle.flush()
+os.fsync(owner_handle.fileno())
+if not lock_owner(owner_handle, blocking=True):
+    raise RuntimeError(f"could not lock bootstrap owner marker: {owner_path}")
+owner_handle.seek(0)
+owner_handle.write(b"issue-flow-bootstrap-v1\n")
+owner_handle.truncate()
+owner_handle.flush()
+os.fsync(owner_handle.fileno())
+if os.name != "nt":
+    directory = os.open(bootstrap, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 bare = bootstrap / "repository.git"
 environment = os.environ.copy()
 for name in tuple(environment):
@@ -381,6 +404,7 @@ try:
     namespace = {"__name__": "__main__", "__file__": sys.argv[0]}
     exec(compile(helper, sys.argv[0], "exec"), namespace)
 finally:
+    owner_handle.close()
     if bootstrap.exists():
         remove_bootstrap(bootstrap)
 '@
