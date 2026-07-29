@@ -109,20 +109,37 @@ finally:
         else:
             os.environ[name] = value
 
-with tempfile.TemporaryDirectory() as durable_directory:
-    durable_root = Path(durable_directory)
-    durable_target = durable_root / "first" / "second"
-    fsynced_parents: list[Path] = []
-    original_fsync_directory = installer.fsync_directory
-    installer.fsync_directory = fsynced_parents.append
-    try:
-        ensure_real_directory(durable_target)
-    finally:
-        installer.fsync_directory = original_fsync_directory
-    check(
-        "directory creation fsyncs every newly published parent entry",
-        fsynced_parents == [durable_root, durable_root / "first"],
-    )
+if os.name != "nt":
+    with tempfile.TemporaryDirectory() as durable_directory:
+        durable_root = Path(durable_directory)
+        durable_target = durable_root / "first" / "second"
+        fsynced_parents: list[Path] = []
+        original_fsync_directory = installer.fsync_directory
+        installer.fsync_directory = fsynced_parents.append
+        try:
+            ensure_real_directory(durable_target)
+        finally:
+            installer.fsync_directory = original_fsync_directory
+        check(
+            "POSIX directory creation requests durability for every published parent entry",
+            fsynced_parents == [durable_root, durable_root / "first"],
+        )
+        source_parent = durable_root / "source"
+        destination_parent = durable_root / "destination"
+        source_parent.mkdir()
+        destination_parent.mkdir()
+        source = source_parent / "entry"
+        source.write_bytes(b"durable move")
+        fsynced_parents.clear()
+        installer.fsync_directory = fsynced_parents.append
+        try:
+            replace_path(source, destination_parent / "entry")
+        finally:
+            installer.fsync_directory = original_fsync_directory
+        check(
+            "cross-directory replace persists the destination before source deletion",
+            fsynced_parents == [destination_parent, source_parent],
+        )
 
 
 with tempfile.TemporaryDirectory() as object_test_directory:
@@ -181,11 +198,15 @@ def git(cwd: Path, *args: str) -> str:
 
 
 def shells() -> list[tuple[str, str]]:
-    pwsh = shutil.which("pwsh")
     posix = shutil.which("sh")
     if not posix and os.name == "nt":
         candidate = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/sh.exe"
         posix = str(candidate) if candidate.is_file() else None
+    if os.environ.get("ISSUE_FLOW_TEST_SHELL") == "POSIX":
+        if not posix:
+            raise RuntimeError("native POSIX sh is required for the requested lane")
+        return [("POSIX", posix)]
+    pwsh = shutil.which("pwsh")
     if not pwsh or not posix:
         raise RuntimeError(f"pwsh and POSIX sh are required: pwsh={pwsh!r}, sh={posix!r}")
     windows_powershell = shutil.which("powershell")
@@ -690,9 +711,15 @@ for kind, executable in shells():
             result.returncode != 0 and not (malformed_config_home / ".agents").exists(),
             result,
         )
-        fresh_install_home = root / "fresh install home"
+        fresh_install_home = root / "fresh install home \u00f1"
         (fresh_install_home / ".claude").mkdir(parents=True)
         (fresh_install_home / ".codex").mkdir()
+        stale_bootstrap = fresh_install_home / (".issue-flow-bootstrap-" + "d" * 32)
+        (stale_bootstrap / "repository.git").mkdir(parents=True)
+        (stale_bootstrap / ".issue-flow-bootstrap-owner").write_text(
+            json.dumps({"schema": 1, "path": stale_bootstrap.name, "pid": 2_147_483_647}),
+            encoding="ascii",
+        )
         hostile_python = root / "hostile python"
         hostile_python.mkdir()
         python_sentinel = root / "python-sentinel"
@@ -715,7 +742,7 @@ for kind, executable in shells():
         )
         check(
             f"{kind} isolated Python ignores hostile PYTHONPATH",
-            result.returncode == 0 and not python_sentinel.exists(),
+            result.returncode == 0 and not python_sentinel.exists() and not stale_bootstrap.exists(),
             result,
         )
         fresh_canonical = fresh_install_home / ".agents/skills/issue-flow"
@@ -1132,6 +1159,20 @@ for kind, executable in shells():
             result,
         )
 
+        partial_legacy_home = root / "partial legacy home"
+        partial_legacy = partial_legacy_home / ".agents/skills/issue-flow"
+        clone_legacy(remote, partial_legacy, legacy)
+        lazy_fetch_sentinel = root / "lazy-fetch-sentinel"
+        git(partial_legacy, "config", "remote.origin.promisor", "true")
+        git(partial_legacy, "config", "remote.origin.partialclonefilter", "blob:none")
+        git(partial_legacy, "config", "remote.origin.url", f"ext::touch {lazy_fetch_sentinel.as_posix()}")
+        result = command(kind, executable, external, shell_args(kind, "install"), partial_legacy_home)
+        check(
+            f"{kind} rejects legacy promisor authority before object reads",
+            result.returncode != 0 and not lazy_fetch_sentinel.exists() and (partial_legacy / ".git").exists(),
+            result,
+        )
+
         nested_legacy_home = root / "nested empty legacy home"
         nested_legacy = nested_legacy_home / ".agents/skills/issue-flow"
         clone_legacy(remote, nested_legacy, legacy)
@@ -1145,6 +1186,36 @@ for kind, executable in shells():
             and (nested_legacy / ".git").exists(),
             result,
         )
+        reserved_legacy_home = root / "reserved attachment legacy home"
+        reserved_legacy = reserved_legacy_home / ".agents/skills/issue-flow"
+        clone_legacy(remote, reserved_legacy, legacy)
+        (reserved_legacy / ".issue-flow-bundle.json").write_bytes(b"operator collision")
+        reserved_paths = Paths.for_home(reserved_legacy_home)
+        result = command(kind, executable, external, shell_args(kind, "install"), reserved_legacy_home)
+        check(
+            f"{kind} validates reserved legacy attachment names before publishing state",
+            result.returncode != 0
+            and (reserved_legacy / ".git").exists()
+            and not reserved_paths.attachments.exists(),
+            result,
+        )
+        if os.name != "nt":
+            linked_policy_home = root / "linked legacy policy home"
+            linked_policy = linked_policy_home / ".agents/skills/issue-flow"
+            clone_legacy(remote, linked_policy, legacy)
+            linked_policy_target = root / "external legacy policy"
+            linked_policy_target.write_bytes(LOCAL_POLICY)
+            (linked_policy / "operator.local.md").unlink()
+            (linked_policy / "operator.local.md").symlink_to(linked_policy_target)
+            linked_policy_paths = Paths.for_home(linked_policy_home)
+            result = command(kind, executable, external, shell_args(kind, "install"), linked_policy_home)
+            check(
+                f"{kind} refuses linked legacy operator policy before promotion",
+                result.returncode != 0
+                and (linked_policy / ".git").exists()
+                and not linked_policy_paths.config.exists(),
+                result,
+            )
         if os.name == "nt":
             nested_pointer_home = root / "nested pointer legacy home"
             nested_pointer_legacy = nested_pointer_home / ".agents/skills/issue-flow"
@@ -1330,6 +1401,7 @@ for kind, executable in shells():
             result,
         )
 
+        fixture_paths = Paths.for_home(home)
         policy_inode = (home / ".agents/skills/.issue-flow/operator.local.md").stat().st_ino
         result = command(
             kind,
@@ -1341,19 +1413,41 @@ for kind, executable in shells():
         configured_policy = (installed / "operator.local.md").read_bytes()
         policy_files = list((home / ".agents/skills/.issue-flow/policies").iterdir())
         check(
-            f"{kind} updates stable policy through the active hard link",
+            f"{kind} updates stable policy through an immutable bundle generation",
             result.returncode == 0
             and b"| Tracker | linear | github |" in configured_policy
             and configured_policy.endswith(b"\r\n")
             and len(policy_files) == 1
             and policy_files[0].read_bytes() == configured_policy
             and (home / ".agents/skills/.issue-flow/operator.local.md").stat().st_ino != policy_inode
-            and os.path.samefile(
-                installed / "operator.local.md",
-                home / ".agents/skills/.issue-flow/operator.local.md",
-            )
+            and not os.path.samefile(installed / "operator.local.md", fixture_paths.config)
+            and fixture_paths.config.stat().st_nlink == 1
+            and os.path.samefile(installed / "operator.local.md", policy_files[0])
             and (installed / (".cache." + "b" * 32 + ".tmp")).read_bytes()
             == b"legitimate local temporary name\n",
+            result,
+        )
+
+        manual_policy = configured_policy + b"\r\nLocal-only instruction: preserve this exact text.\r\n"
+        fixture_paths.config.write_bytes(manual_policy)
+        result = command(
+            kind,
+            executable,
+            installed / ("install.sh" if kind == "POSIX" else "install.ps1"),
+            shell_args(kind, "config"),
+            home,
+        )
+        configured_policy = (installed / "operator.local.md").read_bytes()
+        policy_files = list(fixture_paths.policies.iterdir())
+        check(
+            f"{kind} config adopts arbitrary manual local-policy instructions",
+            result.returncode == 0
+            and configured_policy == manual_policy
+            and fixture_paths.config.read_bytes() == manual_policy
+            and fixture_paths.config.stat().st_nlink == 1
+            and len(policy_files) == 1
+            and os.path.samefile(installed / "operator.local.md", policy_files[0])
+            and not os.path.samefile(installed / "operator.local.md", fixture_paths.config),
             result,
         )
 
@@ -1373,7 +1467,6 @@ for kind, executable in shells():
         )
         external_policy_link.unlink()
 
-        fixture_paths = Paths.for_home(home)
         torn_policy = configured_policy + b"<!-- retry -->\n"
         torn_generation = fixture_paths.policies / hashlib.sha256(torn_policy).hexdigest()
         torn_generation.write_bytes(b"partial")
@@ -1390,7 +1483,7 @@ for kind, executable in shells():
         )
         configured_generation_name = hashlib.sha256(configured_policy).hexdigest()
         interrupted_generation = policy_generation(fixture_paths, interrupted_policy)
-        replace_hardlink(fixture_paths.config, interrupted_generation)
+        fixture_paths.config.write_bytes(interrupted_policy)
         fixture_paths.policy_transaction.write_text(
             json.dumps(
                 {
@@ -1414,7 +1507,8 @@ for kind, executable in shells():
             result.returncode == 0
             and configured_policy == interrupted_policy
             and not fixture_paths.policy_transaction.exists()
-            and os.path.samefile(installed / "operator.local.md", fixture_paths.config),
+            and not os.path.samefile(installed / "operator.local.md", fixture_paths.config)
+            and os.path.samefile(installed / "operator.local.md", interrupted_generation),
             result,
         )
 
@@ -1446,7 +1540,7 @@ for kind, executable in shells():
                 result,
             )
             interrupted_generation.unlink()
-            os.link(fixture_paths.config, interrupted_generation)
+            installer.complete_policy_switch(fixture_paths, policy_generation(fixture_paths, configured_policy))
             fixture_paths.policy_transaction.unlink()
 
         direct_runtime = home / ".claude/skills/issue-flow"
@@ -2020,7 +2114,7 @@ for kind, executable in shells():
             result,
         )
         inactive_policy.rmdir()
-        replace_hardlink(inactive_policy, fixture_paths.config)
+        replace_hardlink(inactive_policy, policy_generation(fixture_paths, fixture_paths.config.read_bytes()))
 
         attachments_bytes = fixture_paths.attachments.read_bytes()
         fixture_paths.attachments.write_bytes(b"not json")
@@ -2032,13 +2126,25 @@ for kind, executable in shells():
         )
         fixture_paths.attachments.write_bytes(attachments_bytes)
 
+        fixture_paths.transaction.write_text(json.dumps({"schema": 999, "phase": "prepared"}), encoding="utf-8")
+        result = command(kind, executable, active_script, shell_args(kind, "recover", "--dry-run"), home)
+        check(
+            f"{kind} recovery dry-run rejects a malformed activation journal",
+            result.returncode != 0 and fixture_paths.transaction.exists(),
+            result,
+        )
+        fixture_paths.transaction.unlink()
+
         shaped_id = "f" * 32
         unowned_activation_file = fixture_paths.skills / f".issue-flow.activate-{shaped_id}"
         unowned_activation_file.write_bytes(b"operator data")
+        dry_result = command(kind, executable, active_script, shell_args(kind, "recover", "--dry-run"), home)
         result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
         check(
             f"{kind} cleanup refuses an installer-shaped regular file it does not own",
-            result.returncode != 0 and unowned_activation_file.read_bytes() == b"operator data",
+            dry_result.returncode != 0
+            and result.returncode != 0
+            and unowned_activation_file.read_bytes() == b"operator data",
             result,
         )
         unowned_activation_file.unlink()

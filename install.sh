@@ -7,10 +7,10 @@ REPOSITORY_URL='https://github.com/asanabrial/issue-flow.git'
 
 find_python() {
     candidate=$(command -v python3 2>/dev/null || :)
-    if [ -n "$candidate" ] && "$candidate" -I -c 'import sys; raise SystemExit(sys.version_info < (3, 10) or sys.platform.startswith(("cygwin", "msys")))' >/dev/null 2>&1; then printf '%s\n' "$candidate"
+    if [ -n "$candidate" ] && "$candidate" -X utf8 -I -c 'import sys; raise SystemExit(sys.version_info < (3, 10) or sys.platform.startswith(("cygwin", "msys")))' >/dev/null 2>&1; then printf '%s\n' "$candidate"
     else
         candidate=$(command -v python 2>/dev/null || :)
-        if [ -n "$candidate" ] && "$candidate" -I -c 'import sys; raise SystemExit(sys.version_info < (3, 10) or sys.platform.startswith(("cygwin", "msys")))' >/dev/null 2>&1; then printf '%s\n' "$candidate"
+        if [ -n "$candidate" ] && "$candidate" -X utf8 -I -c 'import sys; raise SystemExit(sys.version_info < (3, 10) or sys.platform.startswith(("cygwin", "msys")))' >/dev/null 2>&1; then printf '%s\n' "$candidate"
         else
             printf 'error: native Python 3.10 or newer is required; Cygwin/MSYS Python cannot create Windows-native pointers.\n' >&2
             return 1
@@ -21,10 +21,11 @@ find_python() {
 find_git() {
     candidate=$(command -v git 2>/dev/null || :)
     [ -n "$candidate" ] || return 1
-    "$PYTHON" -I -c 'import os,re,subprocess,sys; executable=os.path.realpath(sys.argv[1]); environment={name:value for name,value in os.environ.items() if not name.startswith("GIT_")}; environment.update({"GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_SYSTEM":os.devnull,"GIT_CONFIG_GLOBAL":os.devnull,"GIT_CONFIG_COUNT":"0"}); out=subprocess.check_output([executable, "--version"], env=environment, text=True); m=re.search(r"\b(\d+)\.(\d+)", out); bad=not m or tuple(map(int, m.groups())) < (2, 36); print(executable.replace("\\", "/")) if not bad else sys.exit(1)' "$candidate" || return 1
+    "$PYTHON" -X utf8 -I -c 'import os,re,subprocess,sys; executable=os.path.realpath(sys.argv[1]); environment={name:value for name,value in os.environ.items() if not name.startswith("GIT_")}; environment.update({"GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_SYSTEM":os.devnull,"GIT_CONFIG_GLOBAL":os.devnull,"GIT_CONFIG_COUNT":"0"}); out=subprocess.check_output([executable, "--version"], env=environment, text=True); m=re.search(r"\b(\d+)\.(\d+)", out); bad=not m or tuple(map(int, m.groups())) < (2, 36); print(executable.replace("\\", "/")) if not bad else sys.exit(1)' "$candidate" || return 1
 }
 
-LOCAL_VERIFIER='import json
+LOCAL_VERIFIER='import configparser
+import json
 import os
 import re
 import subprocess
@@ -65,6 +66,13 @@ def validate_repository(path):
     for name in ("alternates", "http-alternates"):
         if os.path.lexists(os.path.join(path, "objects", "info", name)):
             raise ValueError("alternate object database")
+    parser = configparser.RawConfigParser(interpolation=None, strict=True)
+    parser.read(os.path.join(path, "config"), encoding="utf-8")
+    allowed = {"repositoryformatversion", "filemode", "bare", "logallrefupdates", "symlinks", "ignorecase", "precomposeunicode", "fsync", "fsyncmethod"}
+    if parser.sections() != ["core"] or set(parser["core"]) - allowed:
+        raise ValueError("repository config authority")
+    if parser["core"].get("bare", "").casefold() != "true" or parser["core"].get("fsync", "").casefold() != "reference" or parser["core"].get("fsyncmethod", "").casefold() != "fsync":
+        raise ValueError("repository config durability")
 
 try:
     validate_repository(repository)
@@ -82,6 +90,7 @@ try:
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_COUNT": "0",
         "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
     })
     authoritative = subprocess.check_output([
         git,
@@ -125,19 +134,19 @@ namespace = {"__name__": "__main__", "__file__": helper}
 exec(compile(actual, helper, "exec"), namespace)'
 
 verify_local_helper() {
-    "$PYTHON" -I -c "$LOCAL_VERIFIER" check "$HELPER" "$SCRIPT_DIR/.issue-flow-bundle.json" \
+    "$PYTHON" -X utf8 -I -c "$LOCAL_VERIFIER" check "$HELPER" "$SCRIPT_DIR/.issue-flow-bundle.json" \
         "$HOME/.agents/skills/.issue-flow/repository.git" \
         "$HOME/.agents/skills/.issue-flow/current.json" \
         "$HOME/.agents/skills/.issue-flow/transaction.json" "$GIT" "$@"
 }
 
 PYTHON=$(find_python) || exit 1
-PYTHON_PLATFORM=$("$PYTHON" -I -c 'import sys; print(sys.platform)')
+PYTHON_PLATFORM=$("$PYTHON" -X utf8 -I -c 'import sys; print(sys.platform)')
 if [ "$PYTHON_PLATFORM" = win32 ] && [ -z "${MSYSTEM-}" ]; then
     printf 'error: Cygwin is not supported; use Git Bash with native Windows Python.\n' >&2
     exit 1
 fi
-HOME=$("$PYTHON" -I -c '
+HOME=$("$PYTHON" -X utf8 -I -c '
 import os
 import sys
 
@@ -158,7 +167,7 @@ print(path.replace("\\", "/"))
     exit 1
 }
 USERPROFILE=$HOME; ISSUE_FLOW_HOME=$HOME; export HOME USERPROFILE ISSUE_FLOW_HOME
-SCRIPT_PATH=$("$PYTHON" -I -c 'import os,sys; print(os.path.realpath(sys.argv[1]).replace("\\", "/"))' "$0" 2>/dev/null || :)
+SCRIPT_PATH=$("$PYTHON" -X utf8 -I -c 'import os,sys; print(os.path.realpath(sys.argv[1]).replace("\\", "/"))' "$0" 2>/dev/null || :)
 SCRIPT_PARENT=${SCRIPT_PATH%/*}
 [ "$SCRIPT_PARENT" = "$SCRIPT_PATH" ] && SCRIPT_PARENT=.
 SCRIPT_DIR=$(CDPATH= cd -- "$SCRIPT_PARENT" 2>/dev/null && pwd -P) || SCRIPT_DIR=''
@@ -172,7 +181,7 @@ if [ -f "$HELPER" ]; then
     }
     ISSUE_FLOW_GIT=$GIT; export ISSUE_FLOW_GIT
     if verify_local_helper "$@"; then
-        exec "$PYTHON" -I -c "$LOCAL_VERIFIER" execute "$HELPER" "$SCRIPT_DIR/.issue-flow-bundle.json" \
+        exec "$PYTHON" -X utf8 -I -c "$LOCAL_VERIFIER" execute "$HELPER" "$SCRIPT_DIR/.issue-flow-bundle.json" \
             "$HOME/.agents/skills/.issue-flow/repository.git" \
             "$HOME/.agents/skills/.issue-flow/current.json" \
             "$HOME/.agents/skills/.issue-flow/transaction.json" "$GIT" "$@"
@@ -185,7 +194,7 @@ fi
 
 # A raw/piped script has no companion files. Refuse unsafe legacy arguments and a fresh dry-run
 # before network or filesystem mutation, then acquire the complete current bootstrap in quarantine.
-"$PYTHON" -I - "$@" <<'PY'
+"$PYTHON" -X utf8 -I - "$@" <<'PY'
 import argparse
 import sys
 
@@ -241,7 +250,8 @@ GIT=$(find_git) || {
 ISSUE_FLOW_GIT=$GIT; export ISSUE_FLOW_GIT
 
 USERPROFILE=$HOME; ISSUE_FLOW_HOME=$HOME; export USERPROFILE ISSUE_FLOW_HOME
-exec "$PYTHON" -I - "$REPOSITORY_URL" "$GIT" "$@" <<'PY'
+exec "$PYTHON" -X utf8 -I - "$REPOSITORY_URL" "$GIT" "$@" <<'PY'
+import json
 import os
 import re
 import shutil
@@ -255,11 +265,60 @@ repository, git, *installer_arguments = sys.argv[1:]
 home = Path.home().resolve(strict=True)
 if os.name != "nt" and home.stat().st_uid != os.geteuid():
     raise RuntimeError(f"installer HOME is not owned by the current user: {home}")
+
+def process_exists(pid):
+    if os.name == "nt":
+        kernel32 = __import__("ctypes").WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+def make_writable(function, target, _error):
+    details = os.lstat(target)
+    if stat.S_ISREG(details.st_mode) and details.st_nlink != 1:
+        raise RuntimeError(f"refusing to chmod externally hard-linked bootstrap state: {target}")
+    os.chmod(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    function(target)
+
+def remove_bootstrap(path):
+    shutil.rmtree(path, onerror=make_writable)
+    if path.exists():
+        raise RuntimeError(f"bootstrap quarantine cleanup did not complete: {path}")
+
+for candidate in home.iterdir():
+    if not re.fullmatch(r"\.issue-flow-bootstrap-[0-9a-f]{32}", candidate.name):
+        continue
+    if candidate.is_symlink() or not candidate.is_dir():
+        raise RuntimeError(f"installer-shaped bootstrap path is not a real directory: {candidate}")
+    owner = candidate / ".issue-flow-bootstrap-owner"
+    if not owner.exists():
+        continue
+    details = os.lstat(owner)
+    if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+        raise RuntimeError(f"bootstrap owner marker is not private: {owner}")
+    marker = json.loads(owner.read_text(encoding="ascii"))
+    if marker.get("schema") != 1 or marker.get("path") != candidate.name or not isinstance(marker.get("pid"), int):
+        raise RuntimeError(f"invalid bootstrap owner marker: {owner}")
+    if not process_exists(marker["pid"]):
+        remove_bootstrap(candidate)
+
 bootstrap = home / f".issue-flow-bootstrap-{uuid.uuid4().hex}"
 os.mkdir(bootstrap, 0o700)
 details = os.lstat(bootstrap)
 if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
     raise RuntimeError(f"bootstrap quarantine is not a private directory: {bootstrap}")
+(bootstrap / ".issue-flow-bootstrap-owner").write_text(
+    json.dumps({"schema": 1, "path": bootstrap.name, "pid": os.getpid()}), encoding="ascii"
+)
 bare = bootstrap / "repository.git"
 environment = os.environ.copy()
 for name in tuple(environment):
@@ -274,6 +333,7 @@ environment.update({
     "GIT_ASKPASS": "",
     "GIT_ATTR_NOSYSTEM": "1",
     "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_NO_LAZY_FETCH": "1",
 })
 file_protocol = "always" if repository.lower().startswith("file:") else "never"
 hooks = "NUL" if os.name == "nt" else "/dev/null"
@@ -304,12 +364,6 @@ try:
     namespace = {"__name__": "__main__", "__file__": sys.argv[0]}
     exec(compile(helper, sys.argv[0], "exec"), namespace)
 finally:
-    def make_writable(function, target, _error) -> None:
-        os.chmod(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-        function(target)
-
     if bootstrap.exists():
-        shutil.rmtree(bootstrap, onerror=make_writable)
-    if bootstrap.exists():
-        raise RuntimeError(f"bootstrap quarantine cleanup did not complete: {bootstrap}")
+        remove_bootstrap(bootstrap)
 PY

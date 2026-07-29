@@ -217,9 +217,9 @@ def replace_path(source: Path, destination: Path) -> None:
             )
     else:
         os.replace(source, destination)
-        fsync_directory(source_parent)
         if destination_parent != source_parent:
             fsync_directory(destination_parent)
+        fsync_directory(source_parent)
 
 
 def remove_tree(path: Path, ignore_errors: bool = False) -> None:
@@ -437,6 +437,7 @@ def clean_git_environment() -> dict[str, str]:
             "GIT_ASKPASS": "",
             "GIT_CONFIG_COUNT": "0",
             "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_NO_LAZY_FETCH": "1",
             "GIT_ATTR_NOSYSTEM": "1",
         }
     )
@@ -1192,7 +1193,7 @@ def activate(paths: Paths, bundle: Path) -> None:
     mark_activated(paths, bundle.name)
 
 
-def active_bundle(paths: Paths) -> tuple[Path, dict]:
+def active_bundle(paths: Paths, verify_policy: bool = True) -> tuple[Path, dict]:
     if not is_pointer(paths.canonical):
         fail(f"{paths.canonical} is not an immutable-bundle pointer")
     try:
@@ -1202,12 +1203,12 @@ def active_bundle(paths: Paths) -> tuple[Path, dict]:
     if bundle.parent.resolve() != paths.bundles.resolve():
         fail(f"active skill points outside the installer bundle store: {bundle}")
     receipt = verify_stored_bundle(paths, bundle)
-    verify_attachments(paths, bundle)
+    verify_attachments(paths, bundle, verify_policy=verify_policy)
     return bundle, receipt
 
 
-def active_state(paths: Paths) -> tuple[Path, dict, dict]:
-    bundle, receipt = active_bundle(paths)
+def active_state(paths: Paths, verify_policy: bool = True) -> tuple[Path, dict, dict]:
+    bundle, receipt = active_bundle(paths, verify_policy=verify_policy)
     if not paths.current.exists():
         fail(f"active bundle has no activation state: {paths.current}")
     state = read_current_state(paths)
@@ -1272,9 +1273,10 @@ def current_policy_generation(paths: Paths) -> Path | None:
         fail(f"cannot inspect stable operator policy {paths.config}: {error}")
     if (
         not stat.S_ISREG(config_details.st_mode)
+        or config_details.st_nlink != 1
         or not generation_details
         or not stat.S_ISREG(generation_details.st_mode)
-        or not is_regular_hardlink(paths.config, generation)
+        or generation.read_bytes() != content
         or generation_details.st_nlink != known_policy_link_count(paths, generation)
     ):
         fail(f"stable operator policy is not an installer-owned immutable generation: {paths.config}")
@@ -1305,7 +1307,7 @@ def is_regular_hardlink(candidate: Path, target: Path) -> bool:
 
 
 def policy_destinations(paths: Paths) -> list[Path]:
-    destinations = [paths.config]
+    destinations: list[Path] = []
     active = paths.canonical.resolve(strict=True) if is_pointer(paths.canonical) else None
     inactive: list[Path] = []
     active_destination: Path | None = None
@@ -1336,19 +1338,52 @@ def complete_policy_switch(paths: Paths, generation: Path) -> None:
         if is_regular_hardlink(destination, generation):
             continue
         replace_hardlink(destination, generation)
+    content = generation.read_bytes()
+    details = os.lstat(paths.config) if path_exists(paths.config) else None
+    if not details or not stat.S_ISREG(details.st_mode) or details.st_nlink != 1 or paths.config.read_bytes() != content:
+        write_bytes_atomic(paths.config, content, mode=stat.S_IRUSR | stat.S_IWUSR)
 
 
-def validate_policy_destinations(paths: Paths) -> None:
+def retained_policy_generation(paths: Paths) -> Path | None:
+    generations: dict[str, Path] = {}
+    for destination in policy_destinations(paths):
+        if not path_exists(destination):
+            continue
+        details = os.lstat(destination)
+        if not stat.S_ISREG(details.st_mode):
+            fail(f"bundle policy is not a regular file: {destination}")
+        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+        generation = paths.policies / digest
+        if not is_regular_hardlink(destination, generation):
+            fail(f"bundle policy is not linked to an immutable generation: {destination}")
+        generations[digest] = generation
+    if len(generations) > 1:
+        fail(f"retained bundles disagree about operator policy generations: {sorted(generations)}")
+    if not generations:
+        return None
+    generation = next(iter(generations.values()))
+    if generation.stat().st_nlink != known_policy_link_count(paths, generation):
+        fail(f"policy generation has an external hard link: {generation}")
+    return generation
+
+
+def validate_policy_destinations(paths: Paths, generation: Path | None = None) -> None:
+    expected = generation if generation is not None else current_policy_generation(paths)
     for candidate in paths.bundles.iterdir():
         if not candidate.is_dir() or is_pointer(candidate) or candidate.name.startswith(".staging-"):
             continue
         verify_stored_bundle(paths, candidate)
-        verify_attachments(paths, candidate)
+        verify_attachments(paths, candidate, verify_policy=False)
+        destination = candidate / CONFIG_FILE
+        if expected and not is_regular_hardlink(destination, expected):
+            fail(f"bundle policy is not linked to the retained generation: {destination}")
+        if expected is None and path_exists(destination):
+            fail(f"bundle contains operator policy without a retained generation: {destination}")
 
 
 def switch_policy(paths: Paths, content: bytes) -> None:
-    validate_policy_destinations(paths)
-    previous = current_policy_generation(paths)
+    previous = retained_policy_generation(paths)
+    validate_policy_destinations(paths, previous)
     generation = policy_generation(paths, content)
     write_json(
         paths.policy_transaction,
@@ -1366,7 +1401,7 @@ def switch_policy(paths: Paths, content: bytes) -> None:
     fsync_directory(paths.policies)
 
 
-def recover_policy_transaction(paths: Paths) -> None:
+def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> None:
     if not paths.policy_transaction.exists():
         return
     transaction = read_json(paths.policy_transaction)
@@ -1391,8 +1426,9 @@ def recover_policy_transaction(paths: Paths) -> None:
     current = current_policy_generation(paths)
     if (current.name if current else None) not in {previous_name, generation_name}:
         fail(f"stable policy is outside transaction endpoints: {paths.policy_transaction}")
-    complete_policy_switch(paths, generation)
-    remove_state_file(paths.policy_transaction)
+    if not dry_run:
+        complete_policy_switch(paths, generation)
+        remove_state_file(paths.policy_transaction)
 
 
 def generated_temporaries(
@@ -1490,7 +1526,7 @@ def abandoned_paths(paths: Paths, strict_attachments: bool = True) -> list[Path]
     return sorted(set(candidates))
 
 
-def remove_pointer_temporary(paths: Paths, candidate: Path, activation: bool) -> None:
+def remove_pointer_temporary(paths: Paths, candidate: Path, activation: bool, dry_run: bool = False) -> None:
     if is_pointer(candidate):
         if activation:
             try:
@@ -1515,14 +1551,16 @@ def remove_pointer_temporary(paths: Paths, candidate: Path, activation: bool) ->
                 fail(f"activation temporary has no installer-owned target: {candidate}")
         elif not pointer_targets(candidate, paths.canonical):
             fail(f"runtime temporary does not target the canonical skill: {candidate}")
-        remove_directory_pointer(candidate)
+        if not dry_run:
+            remove_directory_pointer(candidate)
         return
     if os.name == "nt" and candidate.is_dir():
         try:
             next(candidate.iterdir())
         except StopIteration:
-            candidate.rmdir()
-            fsync_directory(candidate.parent)
+            if not dry_run:
+                candidate.rmdir()
+                fsync_directory(candidate.parent)
             return
     fail(f"refusing to delete an unowned installer-shaped temporary: {candidate}")
 
@@ -1551,6 +1589,34 @@ def cleanup_abandoned(paths: Paths) -> None:
         else:
             candidate.unlink(missing_ok=True)
             fsync_directory(candidate.parent)
+
+
+def validate_abandoned_paths(paths: Paths, candidates: list[Path]) -> None:
+    git_locks = set(git_ref_locks(paths))
+    runtime_parents = {runtime.parent for runtime in runtime_paths(paths)}
+    for candidate in candidates:
+        if candidate.parent == paths.skills and candidate.name.startswith(f".{SKILL_NAME}.activate-"):
+            remove_pointer_temporary(paths, candidate, activation=True, dry_run=True)
+            continue
+        if candidate.parent in runtime_parents and candidate.name.startswith(f".{SKILL_NAME}.runtime-"):
+            remove_pointer_temporary(paths, candidate, activation=False, dry_run=True)
+            continue
+        details = os.lstat(candidate)
+        if candidate in git_locks:
+            if is_pointer(candidate) or not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+                fail(f"stale Git ref lock is not a private regular file: {candidate}")
+            continue
+        if DISCARD_NAME.fullmatch(candidate.name):
+            commit = DISCARD_NAME.fullmatch(candidate.name).group(1)
+            if is_pointer(candidate) or not candidate.is_dir() or is_activated(paths, commit):
+                fail(f"bundle discard tombstone has no unactivated owned target: {candidate}")
+            continue
+        if is_pointer(candidate):
+            fail(f"abandoned installer path may not redirect cleanup: {candidate}")
+        if stat.S_ISREG(details.st_mode) and details.st_nlink != 1:
+            fail(f"abandoned installer file has an external hard link: {candidate}")
+        if not (stat.S_ISREG(details.st_mode) or stat.S_ISDIR(details.st_mode)):
+            fail(f"abandoned installer path has an unsupported type: {candidate}")
 
 
 def attach_local(paths: Paths, bundle: Path, allow_dangling: bool = False) -> None:
@@ -1589,14 +1655,15 @@ def attach_local(paths: Paths, bundle: Path, allow_dangling: bool = False) -> No
             fail(f"local attachment target is missing: {target}")
 
 
-def verify_attachments(paths: Paths, bundle: Path) -> None:
-    generation = current_policy_generation(paths)
-    if generation:
-        candidate = bundle / CONFIG_FILE
-        if not is_regular_hardlink(candidate, generation):
-            fail(f"active bundle does not expose the stable operator policy: {candidate}")
-    elif path_exists(bundle / CONFIG_FILE):
-        fail(f"bundle contains operator policy without stable installer state: {bundle / CONFIG_FILE}")
+def verify_attachments(paths: Paths, bundle: Path, verify_policy: bool = True) -> None:
+    if verify_policy:
+        generation = current_policy_generation(paths)
+        if generation:
+            candidate = bundle / CONFIG_FILE
+            if not is_regular_hardlink(candidate, generation):
+                fail(f"active bundle does not expose the stable operator policy: {candidate}")
+        elif path_exists(bundle / CONFIG_FILE):
+            fail(f"bundle contains operator policy without stable installer state: {bundle / CONFIG_FILE}")
     for record in attachment_records(paths):
         candidate = bundle / record["name"]
         target = Path(record["target"])
@@ -1658,6 +1725,38 @@ def legacy_git(
     return git(paths, *arguments, cwd=checkout or paths.canonical, check=check)
 
 
+def validate_legacy_repository(root: Path) -> None:
+    repository = root / ".git"
+    if is_pointer(repository) or not repository.is_dir() or path_exists(repository / "commondir"):
+        fail(f"legacy migration requires a standalone Git directory: {repository}")
+    for directory in (repository / "objects", repository / "refs"):
+        if is_pointer(directory) or not directory.is_dir():
+            fail(f"legacy Git control directory is missing or linked: {directory}")
+    for forbidden in (
+        repository / "objects" / "info" / "alternates",
+        repository / "objects" / "info" / "http-alternates",
+    ):
+        if path_exists(forbidden):
+            fail(f"legacy migration refuses alternate object storage: {forbidden}")
+    config = repository / "config"
+    details = os.lstat(config) if path_exists(config) else None
+    if not details or is_pointer(config) or not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+        fail(f"legacy Git config is not a private regular file: {config}")
+    parser = configparser.RawConfigParser(interpolation=None, strict=True)
+    try:
+        parser.read_string(config.read_text(encoding="utf-8"))
+    except (configparser.Error, UnicodeError, OSError) as error:
+        fail(f"legacy Git config is invalid: {error}")
+    if parser.has_option("extensions", "partialclone"):
+        fail("legacy migration refuses a partial-clone object authority")
+    for section in parser.sections():
+        if section.casefold().startswith('remote "') and (
+            parser.getboolean(section, "promisor", fallback=False)
+            or parser.has_option(section, "partialclonefilter")
+        ):
+            fail("legacy migration refuses a promisor remote that can execute during object reads")
+
+
 def legacy_tracked_files(paths: Paths, root: Path, current: str) -> set[str]:
     tree_result = git(paths, "ls-tree", "-r", "-z", "--full-tree", current, cwd=root, text=False)
     tree: dict[str, tuple[str, str]] = {}
@@ -1710,6 +1809,7 @@ def inspect_legacy(
     root = checkout or paths.canonical
     if is_pointer(root) or not (root / ".git").exists():
         fail(f"{root} is not a real legacy Git clone")
+    validate_legacy_repository(root)
     top = Path(legacy_git(paths, "rev-parse", "--show-toplevel", checkout=root).stdout.strip()).resolve()
     if top != root.resolve():
         fail(f"legacy checkout root is {top}, expected {root}")
@@ -1784,12 +1884,19 @@ def inspect_legacy(
             fail(f"case-only top-level collision in legacy state: {tracked_spelling!r} and {candidate.name!r}")
     for name in local_names:
         source = root / name
+        if name.casefold() in {CONFIG_FILE.casefold(), RECEIPT_FILE.casefold()}:
+            fail(f"local state uses an installer-reserved name: {source}")
         if name.casefold() in target_top:
             fail(f"local state collides with the target contract tree: {name}")
         if is_pointer(source) or not (source.is_file() or source.is_dir()):
             fail(f"local state must be a regular top-level file or directory: {source}")
         if os.name == "nt" and source.is_file() and not (source.stat().st_mode & stat.S_IWUSR):
             fail(f"read-only local files cannot be migrated safely on Windows: {source}")
+    config = root / CONFIG_FILE
+    if path_exists(config):
+        details = os.lstat(config)
+        if is_pointer(config) or not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+            fail(f"legacy operator policy must be a private regular file: {config}")
     return {"commit": current, "local_names": sorted(local_names)}
 
 
@@ -2023,8 +2130,8 @@ def migrate_legacy(paths: Paths, target: str, target_entries: list[dict[str, str
         if paths.config.exists() and paths.config.read_bytes() != config:
             fail(f"stable operator policy conflicts with the legacy bytes at {paths.canonical / CONFIG_FILE}")
         if not paths.config.exists():
-            generation = policy_generation(paths, config)
-            replace_hardlink(paths.config, generation)
+            policy_generation(paths, config)
+            write_bytes_atomic(paths.config, config, mode=stat.S_IRUSR | stat.S_IWUSR)
     backup = paths.legacy / f"{current}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
     prepare_legacy_local_state(
         paths,
@@ -2065,7 +2172,7 @@ def migrate_legacy(paths: Paths, target: str, target_entries: list[dict[str, str
         raise
 
 
-def recover_transaction(paths: Paths) -> None:
+def recover_transaction(paths: Paths, dry_run: bool = False) -> None:
     if not paths.transaction.exists():
         return
     transaction = read_json(paths.transaction)
@@ -2095,15 +2202,18 @@ def recover_transaction(paths: Paths) -> None:
         current = str(receipt["commit"])
         if current == target:
             # Activation may have switched the pointer immediately before interruption.
-            mark_activated(paths, target)
-            record_current(paths, target, None if backup else previous)
+            if not dry_run:
+                mark_activated(paths, target)
+                record_current(paths, target, None if backup else previous)
         elif previous and current == previous:
             require_activated(paths, previous)
-            record_current(paths, previous, prior_previous)
-            discard_unactivated_bundle(paths, target)
+            if not dry_run:
+                record_current(paths, previous, prior_previous)
+                discard_unactivated_bundle(paths, target)
         else:
             fail(f"active bundle {current} is outside transaction endpoints {previous} -> {target}")
-        remove_state_file(paths.transaction)
+        if not dry_run:
+            remove_state_file(paths.transaction)
         return
     if path_exists(paths.canonical):
         legacy_keys = {"schema", "phase", "backup", "previous", "target"}
@@ -2114,34 +2224,38 @@ def recover_transaction(paths: Paths) -> None:
         legacy = inspect_legacy(paths, tree_entries(paths, target))
         if legacy["commit"] != previous:
             fail(f"legacy canonical path is outside transaction predecessor {previous}: {legacy['commit']}")
-        discard_unactivated_bundle(paths, target)
-        remove_state_file(paths.transaction)
+        if not dry_run:
+            discard_unactivated_bundle(paths, target)
+            remove_state_file(paths.transaction)
         return
     if backup and backup.exists():
         legacy = inspect_legacy(paths, tree_entries(paths, target), checkout=backup)
         if legacy["commit"] != previous:
             fail(f"legacy backup is outside transaction predecessor {previous}: {legacy['commit']}")
-        replace_path(backup, paths.canonical)
-        discard_unactivated_bundle(paths, target)
-        remove_state_file(paths.transaction)
+        if not dry_run:
+            replace_path(backup, paths.canonical)
+            discard_unactivated_bundle(paths, target)
+            remove_state_file(paths.transaction)
         return
     previous_bundle = paths.bundles / previous if previous else None
     if previous_bundle and previous_bundle.exists():
         require_activated(paths, previous)
         verify_stored_bundle(paths, previous_bundle)
-        attach_local(paths, previous_bundle)
-        activate(paths, previous_bundle)
-        record_current(paths, previous, prior_previous)
-        discard_unactivated_bundle(paths, target)
-        remove_state_file(paths.transaction)
+        if not dry_run:
+            attach_local(paths, previous_bundle)
+            activate(paths, previous_bundle)
+            record_current(paths, previous, prior_previous)
+            discard_unactivated_bundle(paths, target)
+            remove_state_file(paths.transaction)
         return
     target_bundle = paths.bundles / target
     if previous is None and target_bundle.exists():
         verify_stored_bundle(paths, target_bundle)
-        attach_local(paths, target_bundle)
-        activate(paths, target_bundle)
-        record_current(paths, target, None)
-        remove_state_file(paths.transaction)
+        if not dry_run:
+            attach_local(paths, target_bundle)
+            activate(paths, target_bundle)
+            record_current(paths, target, None)
+            remove_state_file(paths.transaction)
         return
     fail(f"incomplete activation cannot find a verified recovery bundle: {paths.transaction}")
 
@@ -2477,7 +2591,8 @@ def configure(paths: Paths, assignment: str | None, dry_run: bool) -> None:
             text = merge_missing_config_rows(text, defaults, paths.config if config_exists else Path("fetched SKILL.md"))
             text = apply_config_assignment(text, assignment, paths.config if config_exists else Path("fetched SKILL.md"))
             if paths.bundles.is_dir():
-                validate_policy_destinations(paths)
+                retained = retained_policy_generation(paths)
+                validate_policy_destinations(paths, retained)
             if assignment is None:
                 print(config_block(text, paths.config if config_exists else Path("fetched SKILL.md"))[2])
             return
@@ -2485,7 +2600,8 @@ def configure(paths: Paths, assignment: str | None, dry_run: bool) -> None:
     else:
         if not path_exists(paths.canonical) or not is_pointer(paths.canonical):
             if paths.bundles.is_dir():
-                validate_policy_destinations(paths)
+                retained = retained_policy_generation(paths)
+                validate_policy_destinations(paths, retained)
             expected_target, template = dry_run_sync(paths, announce=False)
             _, _, defaults = config_block(template, Path("fetched SKILL.md"))
             if paths.config.exists():
@@ -2511,11 +2627,10 @@ def configure(paths: Paths, assignment: str | None, dry_run: bool) -> None:
             recover_transaction(paths)
             remove_incoming_ref(paths)
             if is_pointer(paths.canonical):
-                active_state(paths)
+                active_state(paths, verify_policy=False)
             discard_all_unactivated_bundles(paths)
         validate_runtime_paths(paths)
-        bundle, _, _ = active_state(paths)
-        validate_policy_destinations(paths)
+        bundle, _, _ = active_state(paths, verify_policy=False)
         template = (bundle / "SKILL.md").read_bytes().decode("utf-8")
         _, _, defaults = config_block(template, bundle / "SKILL.md")
         config_exists = paths.config.exists()
@@ -2523,11 +2638,10 @@ def configure(paths: Paths, assignment: str | None, dry_run: bool) -> None:
         text = merge_missing_config_rows(text, defaults, paths.config if config_exists else bundle / "SKILL.md")
         text = apply_config_assignment(text, assignment, paths.config if config_exists else bundle / "SKILL.md")
         if dry_run:
+            retained = retained_policy_generation(paths)
+            validate_policy_destinations(paths, retained)
             if assignment is None:
                 print(config_block(text, paths.config if config_exists else bundle / "SKILL.md")[2])
-            return
-        if assignment is None and config_exists:
-            print(config_block(text, paths.config)[2])
             return
         switch_policy(paths, text.encode("utf-8"))
         if assignment is None:
@@ -2594,6 +2708,18 @@ def rollback(paths: Paths, dry_run: bool) -> None:
 def recover(paths: Paths, dry_run: bool) -> None:
     if dry_run:
         print(f"would   acquire operating-system lock {paths.lock}")
+        if path_exists(paths.state):
+            if is_pointer(paths.state) or not paths.state.is_dir():
+                fail(f"installer state is not a real directory: {paths.state}")
+            if paths.repository.is_dir():
+                validate_repository_config(paths.repository)
+            recover_policy_transaction(paths, dry_run=True)
+            recover_transaction(paths, dry_run=True)
+            if not paths.transaction.exists():
+                if is_pointer(paths.canonical):
+                    active_state(paths)
+                else:
+                    require_layout_provenance(paths)
         if paths.transaction.exists():
             print(f"would   recover transaction {paths.transaction}")
         if paths.policy_transaction.exists():
@@ -2602,7 +2728,9 @@ def recover(paths: Paths, dry_run: bool) -> None:
             incoming = incoming_target(paths)
             if incoming:
                 print(f"would   remove abandoned incoming acquisition ref {incoming}")
-        print(f"would   remove {len(abandoned_paths(paths))} abandoned installer temporary path(s)")
+        candidates = abandoned_paths(paths)
+        validate_abandoned_paths(paths, candidates)
+        print(f"would   remove {len(candidates)} abandoned installer temporary path(s)")
         return
     ensure_real_directory(paths.skills)
     with InstallerLock(paths):

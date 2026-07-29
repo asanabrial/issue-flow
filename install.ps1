@@ -30,12 +30,12 @@ function Get-PythonCommand {
     $expectedPlatform = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'win32' } else { '' }
     $python = Get-Command python -ErrorAction SilentlyContinue
     if ($python) {
-        & $python.Source -I -c 'import sys;raise SystemExit(sys.version_info < (3, 10) or (sys.argv[1] and sys.platform != sys.argv[1]))' $expectedPlatform 2>$null
+        & $python.Source -X utf8 -I -c 'import sys;raise SystemExit(sys.version_info < (3, 10) or (sys.argv[1] and sys.platform != sys.argv[1]))' $expectedPlatform 2>$null
         if ($LASTEXITCODE -eq 0) { return @{ Executable = $python.Source; Prefix = @() } }
     }
     $launcher = Get-Command py -ErrorAction SilentlyContinue
     if ($launcher) {
-        & $launcher.Source -3 -I -c 'import sys;raise SystemExit(sys.version_info < (3, 10) or (sys.argv[1] and sys.platform != sys.argv[1]))' $expectedPlatform 2>$null
+        & $launcher.Source -3 -X utf8 -I -c 'import sys;raise SystemExit(sys.version_info < (3, 10) or (sys.argv[1] and sys.platform != sys.argv[1]))' $expectedPlatform 2>$null
         if ($LASTEXITCODE -eq 0) { return @{ Executable = $launcher.Source; Prefix = @('-3') } }
     }
     throw 'A host-native Python 3.10 or newer is required; install it and retry.'
@@ -52,6 +52,7 @@ function Get-InstallerArguments {
 function Invoke-VerifiedLocalHelper {
     param([string]$Path, [string]$Receipt, [string]$Repository, [string]$Current, [string]$Transaction, [string]$Git, [hashtable]$Python, [string]$HomePath, [string[]]$InstallerArguments)
     $code = @'
+import configparser
 import json
 import os
 import re
@@ -93,6 +94,13 @@ def validate_repository(path):
     for name in ("alternates", "http-alternates"):
         if os.path.lexists(os.path.join(path, "objects", "info", name)):
             raise ValueError("alternate object database")
+    parser = configparser.RawConfigParser(interpolation=None, strict=True)
+    parser.read(os.path.join(path, "config"), encoding="utf-8")
+    allowed = {"repositoryformatversion", "filemode", "bare", "logallrefupdates", "symlinks", "ignorecase", "precomposeunicode", "fsync", "fsyncmethod"}
+    if parser.sections() != ["core"] or set(parser["core"]) - allowed:
+        raise ValueError("repository config authority")
+    if parser["core"].get("bare", "").casefold() != "true" or parser["core"].get("fsync", "").casefold() != "reference" or parser["core"].get("fsyncmethod", "").casefold() != "fsync":
+        raise ValueError("repository config durability")
 
 try:
     validate_repository(repository)
@@ -103,6 +111,7 @@ try:
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_COUNT": "0",
         "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
     })
     version = subprocess.check_output([git, "--version"], env=environment, text=True)
     match = re.search(r"\b(\d+)\.(\d+)", version)
@@ -156,7 +165,7 @@ exec(compile(actual, helper, "exec"), namespace)
 '@
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($code))
     $arguments = @($Python.Prefix) + @(
-        '-I', '-c', 'import base64,sys;code=base64.b64decode(sys.argv[1]);del sys.argv[1];exec(code)',
+        '-X', 'utf8', '-I', '-c', 'import base64,sys;code=base64.b64decode(sys.argv[1]);del sys.argv[1];exec(code)',
         $encoded, $Path, $Receipt, $Repository, $Current, $Transaction, $Git
     ) + $InstallerArguments
     $savedHome = [Environment]::GetEnvironmentVariable('HOME', 'Process')
@@ -179,16 +188,17 @@ exec(compile(actual, helper, "exec"), namespace)
 }
 
 $python = Get-PythonCommand
-$homeArguments = @($python.Prefix) + @('-I', '-c', 'import os,sys;print(os.path.realpath(sys.argv[1]))', $HOME)
+$homeArguments = @($python.Prefix) + @('-X', 'utf8', '-I', '-c', 'import base64,os,sys;print(base64.b64encode(os.path.realpath(sys.argv[1]).encode()).decode())', $HOME)
 $resolvedHome = & $python.Executable @homeArguments
 if ($LASTEXITCODE -ne 0 -or -not $resolvedHome) { throw 'Could not resolve the operator home with the selected Python.' }
-$resolvedHome = [string]$resolvedHome
+$resolvedHome = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$resolvedHome))
 $invocationPath = $MyInvocation.MyCommand.Path
 $physicalInvocation = $null
 if ($invocationPath) {
-    $pathArguments = @($python.Prefix) + @('-I', '-c', 'import os,sys;print(os.path.realpath(sys.argv[1]))', $invocationPath)
+    $pathArguments = @($python.Prefix) + @('-X', 'utf8', '-I', '-c', 'import base64,os,sys;print(base64.b64encode(os.path.realpath(sys.argv[1]).encode()).decode())', $invocationPath)
     $physicalInvocation = & $python.Executable @pathArguments
     if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the installer path with the selected Python.' }
+    $physicalInvocation = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$physicalInvocation))
 }
 $helper = if ($physicalInvocation -and [IO.Path]::GetFileName($physicalInvocation) -eq 'install.ps1') {
     Join-Path ([IO.Path]::GetDirectoryName($physicalInvocation)) 'scripts\install_bundle.py'
@@ -254,6 +264,7 @@ try {
     # worktree path under some environment combinations. Python is already required and gives both
     # PowerShell editions the same exact subprocess boundary used by the installed helper.
     $bootstrapCode = @'
+import json
 import os
 import re
 import shutil
@@ -266,11 +277,60 @@ from pathlib import Path
 repository, git_executable, home_value, *installer_arguments = sys.argv[1:]
 git_executable = os.path.realpath(git_executable)
 home = Path(home_value).resolve(strict=True)
+
+def process_exists(pid):
+    if os.name == "nt":
+        kernel32 = __import__("ctypes").WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+def make_writable(function, target, _error):
+    details = os.lstat(target)
+    if stat.S_ISREG(details.st_mode) and details.st_nlink != 1:
+        raise RuntimeError(f"refusing to chmod externally hard-linked bootstrap state: {target}")
+    os.chmod(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    function(target)
+
+def remove_bootstrap(path):
+    shutil.rmtree(path, onerror=make_writable)
+    if path.exists():
+        raise RuntimeError(f"bootstrap quarantine cleanup did not complete: {path}")
+
+for candidate in home.iterdir():
+    if not re.fullmatch(r"\.issue-flow-bootstrap-[0-9a-f]{32}", candidate.name):
+        continue
+    if candidate.is_symlink() or not candidate.is_dir():
+        raise RuntimeError(f"installer-shaped bootstrap path is not a real directory: {candidate}")
+    owner = candidate / ".issue-flow-bootstrap-owner"
+    if not owner.exists():
+        continue
+    details = os.lstat(owner)
+    if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+        raise RuntimeError(f"bootstrap owner marker is not private: {owner}")
+    marker = json.loads(owner.read_text(encoding="ascii"))
+    if marker.get("schema") != 1 or marker.get("path") != candidate.name or not isinstance(marker.get("pid"), int):
+        raise RuntimeError(f"invalid bootstrap owner marker: {owner}")
+    if not process_exists(marker["pid"]):
+        remove_bootstrap(candidate)
+
 bootstrap = home / f".issue-flow-bootstrap-{uuid.uuid4().hex}"
 os.mkdir(bootstrap, 0o700)
 details = os.lstat(bootstrap)
 if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
     raise RuntimeError(f"bootstrap quarantine is not a private directory: {bootstrap}")
+(bootstrap / ".issue-flow-bootstrap-owner").write_text(
+    json.dumps({"schema": 1, "path": bootstrap.name, "pid": os.getpid()}), encoding="ascii"
+)
 bare = bootstrap / "repository.git"
 environment = os.environ.copy()
 for name in tuple(environment):
@@ -285,6 +345,7 @@ environment.update({
     "GIT_ASKPASS": "",
     "GIT_ATTR_NOSYSTEM": "1",
     "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_NO_LAZY_FETCH": "1",
 })
 file_protocol = "always" if repository.lower().startswith("file:") else "never"
 disabled_hooks = "NUL" if os.name == "nt" else "/dev/null"
@@ -320,20 +381,14 @@ try:
     namespace = {"__name__": "__main__", "__file__": sys.argv[0]}
     exec(compile(helper, sys.argv[0], "exec"), namespace)
 finally:
-    def make_writable(function, target, _error) -> None:
-        os.chmod(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-        function(target)
-
     if bootstrap.exists():
-        shutil.rmtree(bootstrap, onerror=make_writable)
-    if bootstrap.exists():
-        raise RuntimeError(f"bootstrap quarantine cleanup did not complete: {bootstrap}")
+        remove_bootstrap(bootstrap)
 '@
     # Base64 keeps Windows PowerShell 5.1 from stripping quotes in the multiline `-c` argument.
     $encodedBootstrap = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootstrapCode))
     $installerArguments = @(Get-InstallerArguments)
     $bootstrapArguments = @($python.Prefix) + @(
-        '-I', '-c', 'import base64,sys;code=base64.b64decode(sys.argv[1]);del sys.argv[1];exec(code)',
+        '-X', 'utf8', '-I', '-c', 'import base64,sys;code=base64.b64decode(sys.argv[1]);del sys.argv[1];exec(code)',
         $encodedBootstrap, $RepositoryUrl, $gitCommand.Source, $resolvedHome
     ) + $installerArguments
     & $python.Executable @bootstrapArguments

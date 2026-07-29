@@ -105,7 +105,9 @@ operator home, extracts the commit's shared installer into memory, and executes 
 without reopening a replaceable helper path. Standard proxy variables remain available to Git;
 Git-specific authority and caller-controlled CA override variables do not, so TLS identity comes
 from the host's system trust store. Quarantine cleanup clears Git's read-only pack attributes and
-fails if any bootstrap path remains. Installed wrappers likewise reverify the local helper against
+fails if its bootstrap path remains; a later bootstrap removes owner-marked quarantines whose
+creating process no longer exists. Every Python entrypoint forces UTF-8 mode so non-ASCII operator
+homes survive shell/native-process boundaries. Installed wrappers likewise reverify the local helper against
 its Git blob in the same Python process that executes those bytes; the absolute Git executable
 selected by the wrapper is propagated through every helper subprocess instead of being reselected
 after a directory change. The
@@ -151,6 +153,8 @@ interrupted before activation, recovery validates and restores the original stan
 including when canonical GitHub is temporarily unavailable and the command starts from a retained
 journal endpoint. Top-level ignored state and empty directories move intact; untracked state nested
 inside a tracked contract directory fails closed because Git cannot inventory an empty nested path.
+Reserved installer names, linked operator policy and partial/promisor Git object authority are
+rejected before migration publishes attachment state or reads tracked objects.
 On Windows, read-only local files are rejected before attachment publication because safely deleting
 one hardlink must not change the attributes of another operator-owned link.
 Run the one-time directory move between agent sessions because it has a brief availability gap.
@@ -248,8 +252,9 @@ write deaf, and it never collapses the two.
 
 ## Configuration
 
-Settings appear as the ignored `operator.local.md` beside `SKILL.md` and persist as immutable local
-generations under `~/.agents/skills/.issue-flow/` across bundle switches. They include tracker, delivery route, merge
+Settings appear as the ignored `operator.local.md` beside `SKILL.md` and persist across bundle
+switches. The stable file is a private editable copy; each bundle exposes a content-addressed,
+immutable local generation under `~/.agents/skills/.issue-flow/`. Settings include tracker, delivery route, merge
 strategy, worktree location, and whether delivery is pre-authorised. The `config` command creates
 the file from the marked defaults in `SKILL.md` when needed. A pull-request route publishes the branch
 for independent review, waits for required CI on the latest head, and then merges using the selected
@@ -258,8 +263,8 @@ immutable tag on the delivered commit and pushes it to the remote before closing
 Releases remain a separate publication layer and follow the repository's existing convention. The
 configuration is a table with the defaults written next to each value, so it reads on its own.
 
-Read or update it through the installer. The visible file is managed state; editors that replace it
-would sever the generation link and are deliberately rejected on the next verification:
+Read or update it through the installer. Manual edits may add arbitrary local instructions; run
+`config` afterward to validate the markers and atomically publish those exact bytes to every bundle:
 
 ```sh
 ./install.sh config                                              # print the table
@@ -268,8 +273,9 @@ would sever the generation link and are deliberately rejected on the next verifi
 
 The installer matches a setting **by its name** and carries no setting list of its own, so a default
 row added to the skill is settable immediately. It verifies every destination, publishes the new
-content-addressed generation through a fsynced temporary file, then atomically changes each visible
-hard link. Recovery removes abandoned link temporaries before finishing the journal. It refuses a
+content-addressed generation through a fsynced temporary file, then atomically changes each bundle
+hard link while keeping the editable stable file independent. Recovery removes abandoned link
+temporaries before finishing the journal. It refuses a
 name that matches no row or more than one, and refuses a value containing `|`, which would split the
 cell and corrupt the table.
 
@@ -289,10 +295,14 @@ the active pointer unchanged and cannot retain an unactivated final bundle. Dry-
 runtime paths, configuration destinations and preserved attachment collisions without activating
 the fetched target. `config` binds preflight and activation to the same commit; if `main` advances it
 fails before activation and asks for a retry. Explicit updates merge newly shipped default rows into
-the preserved table while retaining every existing operator value. Every newly created state-directory component is fsynced into its parent before
-a journal can name content beneath it. After two immutable
+the preserved table while retaining every existing operator value. On POSIX, every newly created
+state-directory component is fsynced into its parent before a journal can name it, and cross-directory
+renames persist the destination before source deletion. Windows uses write-through atomic replacements
+for published files and junction switches rather than claiming unsupported directory-handle fsync.
+After two immutable
 generations exist, the previous complete bundle remains available through `rollback`; `recover`
-restores the standalone clone or reconciles the bundle journal when an operation was interrupted.
+restores the standalone clone or reconciles the bundle journal when an operation was interrupted;
+`recover --dry-run` validates the same journal, authority, provenance and cleanup ownership without mutation.
 Never force-add `operator.local.md`: its values are permissions, including whether an agent may
 publish or merge without asking.
 
@@ -303,8 +313,8 @@ live board. **The Linear and Trello bindings are written against their official 
 but have not yet been exercised against a live workspace** — expect the first real run to find
 something. The installer acceptance suite runs the same bootstrap, migration, update, drift,
 authority, crash-recovery, rollback and policy-preservation cases through PowerShell 7, Windows
-PowerShell 5.1 and Git Bash. The POSIX adapter
-has not yet run on a native Linux or macOS shell.
+PowerShell 5.1 and Git Bash. The POSIX-only lane also runs under native Linux through WSL, exercising
+native symlinks, `flock`, modes and directory fsync. Native macOS remains untested.
 
 The Python and Git executables selected from the operator's `PATH`, the host's system TLS roots and
 canonical GitHub `main` are trust roots. The shell runtime and resolved operator home are part of the
