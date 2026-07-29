@@ -39,6 +39,7 @@ LOCAL_LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 REFERENCE_LINK = re.compile(r"\[([^\]]+)\]\[([^\]]*)\]")
 REFERENCE_DEFINITION = re.compile(r"(?m)^\s{0,3}\[([^\]]+)\]:\s*(\S+)")
 TEMPORARY_NAME = re.compile(r"^\..+\.[0-9a-f]{32}\.tmp$")
+DISCARD_NAME = re.compile(r"^\.discard-([0-9a-f]{40}|[0-9a-f]{64})-[0-9a-f]{32}$")
 WINDOWS_RESERVED = frozenset(
     {"CON", "PRN", "AUX", "NUL", *(f"COM{index}" for index in range(1, 10)), *(f"LPT{index}" for index in range(1, 10))}
 )
@@ -52,6 +53,7 @@ class InstallError(RuntimeError):
 
 @dataclass(frozen=True)
 class Paths:
+    home: Path
     skills: Path
     canonical: Path
     state: Path
@@ -71,9 +73,11 @@ class Paths:
 
     @classmethod
     def for_home(cls, home: Path) -> "Paths":
+        home = Path(os.path.realpath(home))
         skills = home / ".agents" / "skills"
         state = skills / ".issue-flow"
         return cls(
+            home=home,
             skills=skills,
             canonical=skills / SKILL_NAME,
             state=state,
@@ -87,7 +91,7 @@ class Paths:
             attachments=state / "attachments.json",
             transaction=state / "transaction.json",
             policy_transaction=state / "policy-transaction.json",
-            lock=state / "sync.lock",
+            lock=skills / ".issue-flow.sync.lock",
             hooks=state / "empty-hooks",
             template=state / "empty-template",
         )
@@ -115,10 +119,12 @@ def validate_tree_path(name: str, casefolded: dict[str, str] | None = None) -> P
         if part.casefold() == ".git":
             fail(f"the target tree attempts to materialize Git metadata: {name!r}")
     if casefolded is not None:
-        folded = unicodedata.normalize("NFC", name).casefold()
-        if folded in casefolded and casefolded[folded] != name:
-            fail(f"the target tree has a portable-name collision: {casefolded[folded]!r} and {name!r}")
-        casefolded[folded] = name
+        for index in range(1, len(pure.parts) + 1):
+            prefix = "/".join(pure.parts[:index])
+            folded = unicodedata.normalize("NFC", prefix).casefold()
+            if folded in casefolded and casefolded[folded] != prefix:
+                fail(f"the target tree has a portable-name collision: {casefolded[folded]!r} and {prefix!r}")
+            casefolded[folded] = prefix
     return pure
 
 
@@ -137,11 +143,37 @@ def is_pointer(path: Path) -> bool:
 
 
 def ensure_real_directory(path: Path) -> None:
-    if path_exists(path):
-        if is_pointer(path) or not path.is_dir():
-            fail(f"{path} must be a real directory, not a link or file")
-        return
-    path.mkdir(parents=True)
+    chain = [path, *path.parents]
+    for directory in reversed(chain):
+        if directory == Path():
+            continue
+        if path_exists(directory):
+            if is_pointer(directory) or not directory.is_dir():
+                fail(f"{directory} must be a real directory, not a link or file")
+            continue
+        try:
+            directory.mkdir()
+            fsync_directory(directory.parent)
+        except FileExistsError:
+            pass
+        if is_pointer(directory) or not directory.is_dir():
+            fail(f"{directory} must be a real directory, not a link or file")
+
+
+def validate_real_ancestors(root: Path, path: Path) -> None:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        fail(f"installer path escapes the resolved home: {path}")
+    current = root
+    if is_pointer(current) or not current.is_dir():
+        fail(f"resolved installer home is not a real directory: {current}")
+    for part in relative.parts:
+        current = current / part
+        if not path_exists(current):
+            return
+        if is_pointer(current) or not current.is_dir():
+            fail(f"installer path ancestor is not a real directory: {current}")
 
 
 def fsync_directory(path: Path) -> None:
@@ -394,7 +426,7 @@ def open_safe_lock(path: Path):
 def clean_git_environment() -> dict[str, str]:
     environment = os.environ.copy()
     for name in tuple(environment):
-        if name.startswith("GIT_"):
+        if name.startswith("GIT_") or name in {"SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE"}:
             environment.pop(name, None)
     environment.update(
         {
@@ -419,7 +451,13 @@ def git_executable() -> str:
     global _VERIFIED_GIT_EXECUTABLE
     if _VERIFIED_GIT_EXECUTABLE:
         return _VERIFIED_GIT_EXECUTABLE
-    executable = shutil.which("git")
+    configured = os.environ.get("ISSUE_FLOW_GIT")
+    if configured:
+        if not os.path.isabs(configured):
+            fail("ISSUE_FLOW_GIT must name one absolute selected executable")
+        executable = os.path.realpath(configured)
+    else:
+        executable = shutil.which("git")
     if not executable:
         fail("git is required; install Git 2.36 or newer and retry")
     result = subprocess.run(
@@ -490,9 +528,41 @@ def initialize_directories(paths: Paths) -> None:
 
 
 def validate_repository_config(repository: Path) -> None:
+    if is_pointer(repository) or not repository.is_dir():
+        fail(f"bare repository is not a real installer-owned directory: {repository}")
+    if path_exists(repository / "commondir"):
+        fail(f"bare repository may not redirect its common directory: {repository / 'commondir'}")
+    for directory in (repository / "objects", repository / "refs"):
+        if is_pointer(directory) or not directory.is_dir():
+            fail(f"bare repository control directory is missing or linked: {directory}")
+    for optional in (repository / "objects" / "info", repository / "objects" / "pack"):
+        if path_exists(optional) and (is_pointer(optional) or not optional.is_dir()):
+            fail(f"bare repository object directory is linked or invalid: {optional}")
+    for forbidden in (repository / "objects" / "info" / "alternates", repository / "objects" / "info" / "http-alternates"):
+        if path_exists(forbidden):
+            fail(f"bare repository must not use an alternate object database: {forbidden}")
+    for directory, names, files in os.walk(repository / "refs", followlinks=False):
+        root = Path(directory)
+        for name in names:
+            candidate = root / name
+            if is_pointer(candidate) or not candidate.is_dir():
+                fail(f"bare repository ref directory is linked or invalid: {candidate}")
+        for name in files:
+            candidate = root / name
+            details = os.lstat(candidate)
+            if is_pointer(candidate) or not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+                fail(f"bare repository ref is not a private regular file: {candidate}")
+            if candidate.read_bytes().lstrip().startswith(b"ref:"):
+                fail(f"bare repository may not use symbolic refs: {candidate}")
     config_path = repository / "config"
-    if config_path.is_symlink() or not config_path.is_file():
-        fail(f"bare repository config is missing or linked: {config_path}")
+    for authority_file in (config_path, repository / "HEAD", repository / "packed-refs"):
+        if not path_exists(authority_file):
+            if authority_file.name == "packed-refs":
+                continue
+            fail(f"bare repository authority file is missing: {authority_file}")
+        details = os.lstat(authority_file)
+        if is_pointer(authority_file) or not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+            fail(f"bare repository authority file is not private and regular: {authority_file}")
     parser = configparser.RawConfigParser(interpolation=None, strict=True)
     try:
         parser.read_string(config_path.read_text(encoding="utf-8"))
@@ -518,8 +588,6 @@ def validate_repository_config(repository: Path) -> None:
         "fsyncmethod", ""
     ).casefold() != "fsync":
         fail(f"bare repository does not durably fsync references: {config_path}")
-    if (repository / "objects" / "info" / "alternates").exists():
-        fail(f"bare repository must not use an alternate object database: {repository}")
 
 
 def initialize_repository(paths: Paths) -> None:
@@ -585,7 +653,7 @@ def fetch_target(paths: Paths) -> str:
         validate_commit_id(target)
         copy_object_database(staging / "objects", paths.repository / "objects")
         git(paths, "cat-file", "-e", f"{target}^{{commit}}", repository=paths.repository)
-        git(paths, "update-ref", temporary_ref, target, repository=paths.repository)
+        update_direct_ref(paths, temporary_ref, target)
         return target
     finally:
         if staging.exists():
@@ -645,23 +713,66 @@ def copy_object_database(source: Path, destination: Path) -> None:
         fsync_directory(directory)
 
 
-def finish_target(paths: Paths, target: str, keep: bool) -> None:
-    if keep:
-        git(
-            paths,
-            "update-ref",
-            f"refs/issue-flow/bundles/{target}",
-            target,
-            repository=paths.repository,
-        )
-    git(
+def direct_ref_target(paths: Paths, reference: str) -> str | None:
+    result = git(
         paths,
-        "update-ref",
-        "-d",
-        "refs/issue-flow/incoming",
+        "rev-parse",
+        "--verify",
+        f"{reference}^{{commit}}",
         repository=paths.repository,
         check=False,
     )
+    if result.returncode:
+        return None
+    target = result.stdout.strip()
+    validate_commit_id(target)
+    return target
+
+
+def update_direct_ref(paths: Paths, reference: str, target: str) -> None:
+    validate_commit_id(target)
+    current = direct_ref_target(paths, reference)
+    if current is not None and current != target:
+        fail(f"refusing to replace installer ref {reference}: {current} != {target}")
+    expected = current or ("0" * len(target))
+    git(
+        paths,
+        "update-ref",
+        "--no-deref",
+        reference,
+        target,
+        expected,
+        repository=paths.repository,
+    )
+
+
+def incoming_target(paths: Paths) -> str | None:
+    return direct_ref_target(paths, "refs/issue-flow/incoming")
+
+
+def remove_incoming_ref(paths: Paths, expected: str | None = None) -> None:
+    target = incoming_target(paths)
+    if target is None:
+        if expected is not None:
+            fail("incoming acquisition ref disappeared before transaction completion")
+        return
+    if expected is not None and target != expected:
+        fail(f"incoming acquisition ref changed from {expected} to {target}")
+    git(
+        paths,
+        "update-ref",
+        "--no-deref",
+        "-d",
+        "refs/issue-flow/incoming",
+        target,
+        repository=paths.repository,
+    )
+
+
+def finish_target(paths: Paths, target: str, keep: bool) -> None:
+    if keep:
+        update_direct_ref(paths, f"refs/issue-flow/bundles/{target}", target)
+    remove_incoming_ref(paths, target)
 
 
 def tree_entries(
@@ -762,21 +873,29 @@ def validate_markdown_links(bundle: Path, tracked: set[str]) -> None:
             validate_destination(name, definitions[label])
 
 
+def validate_attachment_collisions(paths: Paths, entries: list[dict[str, str | int]]) -> None:
+    attachment_names = {record["name"].casefold() for record in attachment_records(paths)}
+    for entry in entries:
+        top = PurePosixPath(str(entry["path"])).parts[0]
+        if top.casefold() in attachment_names:
+            fail(f"target contract collides with preserved local state: {top}")
+
+
 def materialize_bundle(paths: Paths, target: str, require_entrypoints: bool = True) -> Path:
     validate_commit_id(target)
     final = paths.bundles / target
     entries = tree_entries(paths, target, require_entrypoints=require_entrypoints)
+    validate_attachment_collisions(paths, entries)
     tree = git(paths, "rev-parse", f"{target}^{{tree}}", repository=paths.repository).stdout.strip()
     if final.exists():
-        verify_bundle_against_git(paths, final, target, tree, entries)
-        git(
-            paths,
-            "update-ref",
-            f"refs/issue-flow/bundles/{target}",
-            target,
-            repository=paths.repository,
-        )
-        return final
+        try:
+            verify_bundle_against_git(paths, final, target, tree, entries)
+            update_direct_ref(paths, f"refs/issue-flow/bundles/{target}", target)
+            return final
+        except Exception:
+            if is_activated(paths, target):
+                raise
+            discard_unactivated_bundle(paths, target)
     staging = paths.bundles / f".staging-{target}-{uuid.uuid4().hex}"
     staging.mkdir()
     created_directories: set[Path] = {staging}
@@ -828,14 +947,12 @@ def materialize_bundle(paths: Paths, target: str, require_entrypoints: bool = Tr
     except Exception:
         remove_tree(staging, ignore_errors=True)
         raise
-    verify_bundle_against_git(paths, final, target, tree, entries)
-    git(
-        paths,
-        "update-ref",
-        f"refs/issue-flow/bundles/{target}",
-        target,
-        repository=paths.repository,
-    )
+    try:
+        verify_bundle_against_git(paths, final, target, tree, entries)
+        update_direct_ref(paths, f"refs/issue-flow/bundles/{target}", target)
+    except Exception:
+        discard_unactivated_bundle(paths, target)
+        raise
     return final
 
 
@@ -1089,6 +1206,16 @@ def active_bundle(paths: Paths) -> tuple[Path, dict]:
     return bundle, receipt
 
 
+def active_state(paths: Paths) -> tuple[Path, dict, dict]:
+    bundle, receipt = active_bundle(paths)
+    if not paths.current.exists():
+        fail(f"active bundle has no activation state: {paths.current}")
+    state = read_current_state(paths)
+    if state["current"] != receipt["commit"]:
+        fail(f"current activation state disagrees with active bundle {bundle}: {paths.current}")
+    return bundle, receipt, state
+
+
 def verify_stored_bundle(paths: Paths, bundle: Path) -> dict:
     commit = bundle.name
     validate_commit_id(commit)
@@ -1287,13 +1414,47 @@ def generated_temporaries(
     return matches
 
 
-def abandoned_paths(paths: Paths) -> list[Path]:
+def git_ref_locks(paths: Paths) -> list[Path]:
+    if not paths.repository.is_dir() or is_pointer(paths.repository):
+        return []
+    locks = [
+        candidate
+        for candidate in (paths.repository / "HEAD.lock", paths.repository / "packed-refs.lock")
+        if path_exists(candidate)
+    ]
+    refs = paths.repository / "refs"
+    if refs.is_dir() and not is_pointer(refs):
+        locks.extend(refs.rglob("*.lock"))
+    return locks
+
+
+def cleanup_git_ref_locks(paths: Paths) -> None:
+    for candidate in git_ref_locks(paths):
+        details = os.lstat(candidate)
+        if is_pointer(candidate) or not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+            fail(f"stale Git ref lock is not a private regular file: {candidate}")
+        candidate.unlink()
+        fsync_directory(candidate.parent)
+
+
+def abandoned_paths(paths: Paths, strict_attachments: bool = True) -> list[Path]:
     candidates: list[Path] = []
-    attachment_names = frozenset(record["name"] for record in attachment_records(paths))
+    try:
+        attachment_names = frozenset(record["name"] for record in attachment_records(paths))
+    except InstallError:
+        if strict_attachments:
+            raise
+        attachment_names = frozenset()
     if paths.bundles.exists():
         candidates.extend(paths.bundles.glob(".staging-*-" + "?" * 32))
+        candidates.extend(path for path in paths.bundles.iterdir() if DISCARD_NAME.fullmatch(path.name))
         for bundle in paths.bundles.iterdir():
-            if not bundle.is_dir() or is_pointer(bundle) or bundle.name.startswith(".staging-"):
+            if (
+                not bundle.is_dir()
+                or is_pointer(bundle)
+                or bundle.name.startswith(".staging-")
+                or DISCARD_NAME.fullmatch(bundle.name)
+            ):
                 continue
             tracked: set[str] = set()
             receipt = bundle / RECEIPT_FILE
@@ -1316,6 +1477,7 @@ def abandoned_paths(paths: Paths) -> list[Path]:
         candidates.extend(paths.state.glob(".repository-" + "?" * 32))
         candidates.extend(paths.state.glob(".fetch-" + "?" * 32))
         candidates.extend(generated_temporaries(paths.state))
+    candidates.extend(git_ref_locks(paths))
     candidates.extend(generated_temporaries(paths.policies))
     candidates.extend(generated_temporaries(paths.local, excluded_names=attachment_names))
     candidates.extend(generated_temporaries(paths.repository))
@@ -1328,7 +1490,59 @@ def abandoned_paths(paths: Paths) -> list[Path]:
     return sorted(set(candidates))
 
 
+def remove_pointer_temporary(paths: Paths, candidate: Path, activation: bool) -> None:
+    if is_pointer(candidate):
+        if activation:
+            try:
+                target = candidate.resolve(strict=True)
+            except OSError as error:
+                fail(f"activation temporary is broken: {candidate}: {error}")
+            if target.parent.resolve() != paths.bundles.resolve():
+                fail(f"activation temporary points outside the bundle store: {candidate}")
+            validate_commit_id(target.name)
+            receipt = read_json(target / RECEIPT_FILE)
+            transaction = read_json(paths.transaction) if paths.transaction.exists() else {}
+            transaction_endpoint = transaction.get("schema") == STATE_SCHEMA and target.name in {
+                transaction.get("previous"),
+                transaction.get("target"),
+            }
+            if (
+                receipt.get("schema") != STATE_SCHEMA
+                or receipt.get("repository") != REPOSITORY_URL
+                or receipt.get("commit") != target.name
+                or not (is_activated(paths, target.name) or transaction_endpoint)
+            ):
+                fail(f"activation temporary has no installer-owned target: {candidate}")
+        elif not pointer_targets(candidate, paths.canonical):
+            fail(f"runtime temporary does not target the canonical skill: {candidate}")
+        remove_directory_pointer(candidate)
+        return
+    if os.name == "nt" and candidate.is_dir():
+        try:
+            next(candidate.iterdir())
+        except StopIteration:
+            candidate.rmdir()
+            fsync_directory(candidate.parent)
+            return
+    fail(f"refusing to delete an unowned installer-shaped temporary: {candidate}")
+
+
+def cleanup_pointer_temporaries(paths: Paths, activation: bool = True, runtime: bool = True) -> None:
+    if activation and paths.skills.exists():
+        for candidate in paths.skills.glob(f".{SKILL_NAME}.activate-" + "?" * 32):
+            remove_pointer_temporary(paths, candidate, activation=True)
+    if runtime:
+        for runtime_path in runtime_paths(paths):
+            if not runtime_path.parent.exists():
+                continue
+            for candidate in runtime_path.parent.glob(f".{SKILL_NAME}.runtime-" + "?" * 32):
+                remove_pointer_temporary(paths, candidate, activation=False)
+
+
 def cleanup_abandoned(paths: Paths) -> None:
+    cleanup_git_ref_locks(paths)
+    cleanup_discard_tombstones(paths)
+    cleanup_pointer_temporaries(paths)
     for candidate in abandoned_paths(paths):
         if is_pointer(candidate):
             remove_directory_pointer(candidate)
@@ -1393,10 +1607,15 @@ def verify_attachments(paths: Paths, bundle: Path) -> None:
             fail(f"local file attachment drifted: {candidate}")
 
 
+def validate_runtime_ancestors(paths: Paths) -> None:
+    for base in (paths.home / ".claude" / "skills", paths.home / ".codex" / "skills"):
+        validate_real_ancestors(paths.home, base)
+
+
 def validate_runtime_paths(paths: Paths) -> None:
     canonical_target = paths.canonical.resolve(strict=True) if path_exists(paths.canonical) else None
-    home = paths.skills.parent.parent
-    for base in (home / ".claude" / "skills", home / ".codex" / "skills"):
+    validate_runtime_ancestors(paths)
+    for base in (paths.home / ".claude" / "skills", paths.home / ".codex" / "skills"):
         runtime = base / SKILL_NAME
         if not path_exists(runtime):
             continue
@@ -1475,6 +1694,11 @@ def legacy_tracked_files(paths: Paths, root: Path, current: str) -> set[str]:
         algorithm = hashlib.sha1 if len(expected_object) == 40 else hashlib.sha256
         if algorithm(header + content).hexdigest() != expected_object:
             fail(f"legacy migration requires clean tracked bytes: {name}")
+        if os.name != "nt":
+            expected_executable = bool(int(tree[name][0], 8) & stat.S_IXUSR)
+            actual_executable = bool(path.stat().st_mode & stat.S_IXUSR)
+            if actual_executable != expected_executable:
+                fail(f"legacy migration requires clean tracked executable mode: {name}")
     return set(tree)
 
 
@@ -1493,11 +1717,49 @@ def inspect_legacy(
     if branch != "main":
         fail(f"legacy migration requires main, current branch is {branch}")
     origin = legacy_git(paths, "config", "--local", "--get", "remote.origin.url", checkout=root).stdout.strip()
-    if origin.rstrip("/") != REPOSITORY_URL.rstrip("/"):
+    if normalized_repository_url(origin) != normalized_repository_url(REPOSITORY_URL):
         fail("legacy origin is not the canonical repository; its value is redacted because URLs can contain credentials")
     current = legacy_git(paths, "rev-parse", "HEAD^{commit}", checkout=root).stdout.strip()
     tracked = legacy_tracked_files(paths, root, current)
-    tracked_top = {PurePosixPath(name).parts[0].casefold() for name in tracked}
+    tracked_top_names = {PurePosixPath(name).parts[0] for name in tracked}
+    tracked_top = {name.casefold(): name for name in tracked_top_names}
+    if len(tracked_top) != len(tracked_top_names):
+        fail("legacy tracked tree has a case-only top-level collision")
+    tracked_directory_names = {
+        parent.as_posix()
+        for name in tracked
+        for parent in PurePosixPath(name).parents
+        if parent.parts
+    }
+    tracked_directories = {
+        parent.as_posix().casefold(): parent.as_posix()
+        for name in tracked
+        for parent in PurePosixPath(name).parents
+        if parent.parts
+    }
+    if len(tracked_directories) != len(tracked_directory_names):
+        fail("legacy tracked tree has a case-only directory collision")
+    stack = [
+        candidate
+        for name in tracked_top_names
+        if (candidate := root / name).is_dir() and not is_pointer(candidate)
+    ]
+    while stack:
+        directory = stack.pop()
+        for item in os.scandir(directory):
+            candidate = Path(item.path)
+            if item.is_symlink() or is_junction(candidate):
+                relative = candidate.relative_to(root).as_posix()
+                fail(f"untracked link nested inside a tracked runtime directory cannot be migrated safely: {relative}")
+            if not item.is_dir(follow_symlinks=False):
+                continue
+            relative = candidate.relative_to(root).as_posix()
+            tracked_spelling = tracked_directories.get(relative.casefold())
+            if tracked_spelling is None:
+                fail(f"untracked state nested inside a tracked runtime directory cannot be migrated safely: {relative}/")
+            if tracked_spelling != relative:
+                fail(f"case-only directory collision inside tracked legacy state: {tracked_spelling!r} and {relative!r}")
+            stack.append(candidate)
     target_top = {PurePosixPath(str(entry["path"])).parts[0].casefold() for entry in target_entries}
     local_names: set[str] = set()
     for arguments in (
@@ -1512,12 +1774,22 @@ def inspect_legacy(
                 fail(f"untracked state nested inside a tracked runtime directory cannot be migrated safely: {name}")
             local_names.add(first)
     local_names.discard(CONFIG_FILE)
+    for candidate in root.iterdir():
+        if candidate.name == ".git" or not candidate.is_dir():
+            continue
+        tracked_spelling = tracked_top.get(candidate.name.casefold())
+        if tracked_spelling is None:
+            local_names.add(candidate.name)
+        elif tracked_spelling != candidate.name:
+            fail(f"case-only top-level collision in legacy state: {tracked_spelling!r} and {candidate.name!r}")
     for name in local_names:
         source = root / name
         if name.casefold() in target_top:
             fail(f"local state collides with the target contract tree: {name}")
         if is_pointer(source) or not (source.is_file() or source.is_dir()):
             fail(f"local state must be a regular top-level file or directory: {source}")
+        if os.name == "nt" and source.is_file() and not (source.stat().st_mode & stat.S_IWUSR):
+            fail(f"read-only local files cannot be migrated safely on Windows: {source}")
     return {"commit": current, "local_names": sorted(local_names)}
 
 
@@ -1542,16 +1814,32 @@ def validate_commit_id(value: str) -> None:
         fail(f"invalid Git commit identity in installer state: {value!r}")
 
 
+def normalized_repository_url(value: str) -> str:
+    parsed = urllib.parse.urlparse(value)
+    if (
+        parsed.scheme.casefold() == "https"
+        and parsed.netloc.casefold() == "github.com"
+        and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+    ):
+        path = parsed.path.rstrip("/")
+        if path.casefold().endswith(".git"):
+            path = path[:-4]
+        return f"https://github.com{path}"
+    return value.rstrip("/")
+
+
 def activation_ref(commit: str) -> str:
     validate_commit_id(commit)
     return f"refs/issue-flow/activated/{commit}"
 
 
 def mark_activated(paths: Paths, commit: str) -> None:
-    git(paths, "update-ref", activation_ref(commit), commit, repository=paths.repository)
+    update_direct_ref(paths, activation_ref(commit), commit)
 
 
-def require_activated(paths: Paths, commit: str) -> None:
+def is_activated(paths: Paths, commit: str) -> bool:
     result = git(
         paths,
         "rev-parse",
@@ -1560,7 +1848,11 @@ def require_activated(paths: Paths, commit: str) -> None:
         repository=paths.repository,
         check=False,
     )
-    if result.returncode or result.stdout.strip() != commit:
+    return not result.returncode and result.stdout.strip() == commit
+
+
+def require_activated(paths: Paths, commit: str) -> None:
+    if not is_activated(paths, commit):
         fail(f"bundle has no completed activation provenance: {commit}")
 
 
@@ -1606,19 +1898,94 @@ def reconcile_retained_state(paths: Paths) -> None:
         if bundle.name.startswith(".staging-"):
             continue
         validate_commit_id(bundle.name)
-        git(
-            paths,
-            "update-ref",
-            f"refs/issue-flow/bundles/{bundle.name}",
-            bundle.name,
-            repository=paths.repository,
-        )
+        require_activated(paths, bundle.name)
+        update_direct_ref(paths, f"refs/issue-flow/bundles/{bundle.name}", bundle.name)
     current_generation = current_policy_generation(paths)
     for generation in paths.policies.iterdir():
         if current_generation and os.path.samefile(generation, current_generation):
             continue
         if generation.is_file() and generation.stat().st_nlink == 1:
             generation.unlink()
+
+
+def remove_bundle_ref(paths: Paths, commit: str) -> None:
+    reference = f"refs/issue-flow/bundles/{commit}"
+    result = git(
+        paths,
+        "rev-parse",
+        "--verify",
+        f"{reference}^{{commit}}",
+        repository=paths.repository,
+        check=False,
+    )
+    if result.returncode:
+        return
+    if result.stdout.strip() != commit:
+        fail(f"materialization ref disagrees with bundle identity: {reference}")
+    git(
+        paths,
+        "update-ref",
+        "--no-deref",
+        "-d",
+        reference,
+        commit,
+        repository=paths.repository,
+    )
+
+
+def finish_discard_tombstone(paths: Paths, tombstone: Path, commit: str) -> None:
+    if is_activated(paths, commit):
+        fail(f"refusing to discard an activated bundle: {commit}")
+    remove_bundle_ref(paths, commit)
+    if path_exists(tombstone):
+        if is_pointer(tombstone) or not tombstone.is_dir():
+            fail(f"bundle discard tombstone changed type: {tombstone}")
+        remove_tree(tombstone)
+        fsync_directory(paths.bundles)
+
+
+def cleanup_discard_tombstones(paths: Paths) -> None:
+    if not paths.bundles.exists():
+        return
+    for tombstone in paths.bundles.iterdir():
+        match = DISCARD_NAME.fullmatch(tombstone.name)
+        if match:
+            finish_discard_tombstone(paths, tombstone, match.group(1))
+
+
+def discard_unactivated_bundle(paths: Paths, commit: str) -> None:
+    validate_commit_id(commit)
+    if is_activated(paths, commit):
+        return
+    bundle = paths.bundles / commit
+    tombstone = paths.bundles / f".discard-{commit}-{uuid.uuid4().hex}"
+    if path_exists(bundle):
+        if is_pointer(bundle) or not bundle.is_dir():
+            fail(f"unactivated bundle changed type before discard: {bundle}")
+        replace_path(bundle, tombstone)
+        fsync_directory(paths.bundles)
+    finish_discard_tombstone(paths, tombstone, commit)
+
+
+def discard_all_unactivated_bundles(paths: Paths) -> None:
+    for bundle in list(paths.bundles.iterdir()):
+        if bundle.name.startswith(".staging-") or DISCARD_NAME.fullmatch(bundle.name):
+            continue
+        validate_commit_id(bundle.name)
+        if not is_activated(paths, bundle.name):
+            discard_unactivated_bundle(paths, bundle.name)
+    result = git(
+        paths,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/issue-flow/bundles",
+        repository=paths.repository,
+    )
+    for reference in result.stdout.splitlines():
+        commit = reference.rsplit("/", 1)[-1]
+        validate_commit_id(commit)
+        if not is_activated(paths, commit) and not (paths.bundles / commit).exists():
+            remove_bundle_ref(paths, commit)
 
 
 def prepare_legacy_local_state(
@@ -1733,6 +2100,7 @@ def recover_transaction(paths: Paths) -> None:
         elif previous and current == previous:
             require_activated(paths, previous)
             record_current(paths, previous, prior_previous)
+            discard_unactivated_bundle(paths, target)
         else:
             fail(f"active bundle {current} is outside transaction endpoints {previous} -> {target}")
         remove_state_file(paths.transaction)
@@ -1746,6 +2114,7 @@ def recover_transaction(paths: Paths) -> None:
         legacy = inspect_legacy(paths, tree_entries(paths, target))
         if legacy["commit"] != previous:
             fail(f"legacy canonical path is outside transaction predecessor {previous}: {legacy['commit']}")
+        discard_unactivated_bundle(paths, target)
         remove_state_file(paths.transaction)
         return
     if backup and backup.exists():
@@ -1753,6 +2122,7 @@ def recover_transaction(paths: Paths) -> None:
         if legacy["commit"] != previous:
             fail(f"legacy backup is outside transaction predecessor {previous}: {legacy['commit']}")
         replace_path(backup, paths.canonical)
+        discard_unactivated_bundle(paths, target)
         remove_state_file(paths.transaction)
         return
     previous_bundle = paths.bundles / previous if previous else None
@@ -1762,6 +2132,7 @@ def recover_transaction(paths: Paths) -> None:
         attach_local(paths, previous_bundle)
         activate(paths, previous_bundle)
         record_current(paths, previous, prior_previous)
+        discard_unactivated_bundle(paths, target)
         remove_state_file(paths.transaction)
         return
     target_bundle = paths.bundles / target
@@ -1775,13 +2146,35 @@ def recover_transaction(paths: Paths) -> None:
     fail(f"incomplete activation cannot find a verified recovery bundle: {paths.transaction}")
 
 
+def require_layout_provenance(paths: Paths) -> None:
+    if is_pointer(paths.canonical):
+        return
+    evidence: list[str] = []
+    if paths.current.exists():
+        evidence.append(paths.current.name)
+    if paths.repository.is_dir():
+        result = git(
+            paths,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/issue-flow/activated",
+            repository=paths.repository,
+        )
+        activated = result.stdout.splitlines()
+        if activated:
+            evidence.append(f"{len(activated)} activation ref(s)")
+    if evidence:
+        kind = "absent" if not path_exists(paths.canonical) else "not an immutable pointer"
+        fail(
+            f"canonical layout is {kind} while durable activation state exists "
+            f"({', '.join(evidence)}); recovery requires an activation journal"
+        )
+
+
 def sync_versioned(paths: Paths, target: str) -> None:
-    bundle, receipt = active_bundle(paths)
+    bundle, receipt, state = active_state(paths)
     current = str(receipt["commit"])
     ensure_ancestor(paths, current, target)
-    state = read_current_state(paths)
-    if state["current"] != current:
-        fail(f"current activation receipt disagrees with the active bundle: {paths.current}")
     if current == target:
         print(f"ok      complete bundle already active at {target}")
         return
@@ -1811,12 +2204,14 @@ def transient_paths(root: Path) -> Paths:
     return Paths.for_home(root)
 
 
-def dry_run_sync(paths: Paths) -> None:
+def dry_run_sync(paths: Paths, announce: bool = True) -> tuple[str, str]:
     current: str | None = None
+    template = ""
+    require_layout_provenance(paths)
+    validate_runtime_paths(paths)
     if path_exists(paths.canonical):
-        validate_runtime_paths(paths)
         if is_pointer(paths.canonical):
-            _, receipt = active_bundle(paths)
+            _, receipt, _ = active_state(paths)
             current = str(receipt["commit"])
         else:
             # Target entries are validated in the transient object store below.
@@ -1827,30 +2222,42 @@ def dry_run_sync(paths: Paths) -> None:
         target = fetch_target(dry)
         try:
             entries = tree_entries(dry, target)
-            materialize_bundle(dry, target)
+            validate_attachment_collisions(paths, entries)
+            target_bundle = materialize_bundle(dry, target)
+            template = (target_bundle / "SKILL.md").read_text(encoding="utf-8")
             if current:
                 ensure_ancestor(dry, current, target)
             if path_exists(paths.canonical) and not is_pointer(paths.canonical):
                 inspect_legacy(paths, entries)
         finally:
             finish_target(dry, target, keep=False)
-    print(f"would   activate complete Git tree {current or '<absent>'} -> {target}")
+    if announce:
+        print(f"would   activate complete Git tree {current or '<absent>'} -> {target}")
+    return target, template
 
 
-def sync(paths: Paths, dry_run: bool) -> None:
+def sync(paths: Paths, dry_run: bool, expected_target: str | None = None) -> None:
     if dry_run:
         dry_run_sync(paths)
         return
-    initialize_directories(paths)
+    ensure_real_directory(paths.skills)
     with InstallerLock(paths):
+        initialize_directories(paths)
         initialize_repository(paths)
         cleanup_abandoned(paths)
         recover_policy_transaction(paths)
         recover_transaction(paths)
+        require_layout_provenance(paths)
+        remove_incoming_ref(paths)
+        if is_pointer(paths.canonical):
+            active_state(paths)
+        discard_all_unactivated_bundles(paths)
         validate_runtime_paths(paths)
         target = fetch_target(paths)
         keep = False
         try:
+            if expected_target is not None and target != expected_target:
+                fail(f"canonical main changed after preflight: {expected_target} -> {target}; retry config")
             entries = tree_entries(paths, target)
             materialize_bundle(paths, target)
             if not path_exists(paths.canonical):
@@ -1877,6 +2284,8 @@ def sync(paths: Paths, dry_run: bool) -> None:
                 print(f"migrated legacy clone to complete Git tree at {target}")
             keep = True
         finally:
+            if not keep and not paths.transaction.exists():
+                discard_unactivated_bundle(paths, target)
             finish_target(paths, target, keep)
         if keep:
             reconcile_retained_state(paths)
@@ -1884,16 +2293,15 @@ def sync(paths: Paths, dry_run: bool) -> None:
 
 def ensure_layout(paths: Paths, dry_run: bool) -> None:
     if path_exists(paths.canonical) and is_pointer(paths.canonical):
-        active_bundle(paths)
+        active_state(paths)
         return
     sync(paths, dry_run)
 
 
 def runtime_paths(paths: Paths) -> tuple[Path, Path]:
-    home = paths.skills.parent.parent
     return (
-        home / ".claude" / "skills" / SKILL_NAME,
-        home / ".codex" / "skills" / SKILL_NAME,
+        paths.home / ".claude" / "skills" / SKILL_NAME,
+        paths.home / ".codex" / "skills" / SKILL_NAME,
     )
 
 
@@ -1911,16 +2319,21 @@ def install_runtime_links(paths: Paths, dry_run: bool) -> None:
                 print(f"would   link {runtime} -> {paths.canonical} after bundle activation")
         return
     if not dry_run:
-        initialize_directories(paths)
+        ensure_real_directory(paths.skills)
     context = nullcontext() if dry_run else InstallerLock(paths)
     with context:
         if not dry_run:
+            initialize_directories(paths)
             initialize_repository(paths)
             cleanup_abandoned(paths)
             recover_policy_transaction(paths)
             recover_transaction(paths)
+            remove_incoming_ref(paths)
+            if is_pointer(paths.canonical):
+                active_state(paths)
+            discard_all_unactivated_bundles(paths)
             validate_runtime_paths(paths)
-        active_bundle(paths)
+        active_state(paths)
         for runtime in runtime_paths(paths):
             if not runtime.parent.parent.exists():
                 continue
@@ -1937,8 +2350,7 @@ def install_runtime_links(paths: Paths, dry_run: bool) -> None:
                 print(f"would   link {runtime} -> {paths.canonical}")
                 continue
             if not runtime.parent.exists():
-                runtime.parent.mkdir(parents=True)
-                fsync_directory(runtime.parent.parent)
+                ensure_real_directory(runtime.parent)
             if os.name == "nt":
                 temporary = runtime.parent / f".{SKILL_NAME}.runtime-{uuid.uuid4().hex}"
                 create_directory_pointer(temporary, paths.canonical)
@@ -1953,10 +2365,12 @@ def install_runtime_links(paths: Paths, dry_run: bool) -> None:
 def remove_runtime_links(paths: Paths, dry_run: bool) -> None:
     if not dry_run and path_exists(paths.state) and (is_pointer(paths.state) or not paths.state.is_dir()):
         fail(f"installer state is not a real directory: {paths.state}")
-    context = InstallerLock(paths) if not dry_run and paths.state.is_dir() else nullcontext()
+    if not dry_run:
+        ensure_real_directory(paths.skills)
+    context = InstallerLock(paths) if not dry_run else nullcontext()
     with context:
-        if not dry_run and paths.state.is_dir():
-            cleanup_abandoned(paths)
+        if not dry_run:
+            cleanup_runtime_temporaries(paths)
         for runtime in runtime_paths(paths):
             if not path_exists(runtime):
                 continue
@@ -1975,6 +2389,10 @@ def remove_runtime_links(paths: Paths, dry_run: bool) -> None:
             print(f"removed {runtime}")
 
 
+def cleanup_runtime_temporaries(paths: Paths) -> None:
+    cleanup_pointer_temporaries(paths, activation=False)
+
+
 def config_block(text: str, origin: Path) -> tuple[int, int, str]:
     start = text.find(CONFIG_START)
     end = text.find(CONFIG_END)
@@ -1984,58 +2402,135 @@ def config_block(text: str, origin: Path) -> tuple[int, int, str]:
     return start, end, text[start:end]
 
 
+def validate_config_assignment(assignment: str | None) -> None:
+    if assignment is None:
+        return
+    if "=" not in assignment:
+        fail(f"expected '<Setting>=<value>', got {assignment!r}")
+    name, value = (part.strip() for part in assignment.split("=", 1))
+    if not name:
+        fail("configuration setting name may not be empty")
+    if "|" in value:
+        fail("configuration values may not contain '|'")
+
+
+def apply_config_assignment(text: str, assignment: str | None, origin: Path, announce: bool = True) -> str:
+    config_block(text, origin)
+    if assignment is None:
+        return text
+    validate_config_assignment(assignment)
+    name, value = (part.strip() for part in assignment.split("=", 1))
+    lines = text.splitlines(keepends=True)
+    matches: list[int] = []
+    for index, line in enumerate(lines):
+        cells = line.split("|")
+        if len(cells) >= 4 and cells[1].strip() == name:
+            matches.append(index)
+    if len(matches) != 1:
+        fail(f"configuration setting {name!r} matched {len(matches)} rows")
+    index = matches[0]
+    cells = lines[index].split("|")
+    old = cells[2].strip()
+    cells[2] = f" {value} "
+    lines[index] = "|".join(cells)
+    if announce:
+        print(f"set     {name}: {old} -> {value}")
+    return "".join(lines)
+
+
+def merge_missing_config_rows(text: str, defaults: str, origin: Path) -> str:
+    _, _, current_block = config_block(text, origin)
+    _, _, default_block = config_block(defaults, Path("active SKILL.md"))
+
+    def rows(block: str) -> list[tuple[str, str]]:
+        found: list[tuple[str, str]] = []
+        for line in block.splitlines(keepends=True):
+            cells = line.split("|")
+            if len(cells) < 4:
+                continue
+            name = cells[1].strip()
+            if not name or name == "Setting" or not name.strip("-: "):
+                continue
+            found.append((name, line))
+        return found
+
+    current_names = {name for name, _ in rows(current_block)}
+    missing = [line for name, line in rows(default_block) if name not in current_names]
+    if not missing:
+        return text
+    newline = "\r\n" if "\r\n" in current_block else "\n"
+    insertion = "".join(line.rstrip("\r\n") + newline for line in missing)
+    end = text.find(CONFIG_END)
+    if end < 0:
+        fail(f"configuration end marker is missing in {origin}")
+    return text[:end] + insertion + text[end:]
+
+
 def configure(paths: Paths, assignment: str | None, dry_run: bool) -> None:
+    validate_config_assignment(assignment)
     if dry_run:
-        ensure_layout(paths, True)
         if not path_exists(paths.canonical) or not is_pointer(paths.canonical):
+            _, template = dry_run_sync(paths)
+            _, _, defaults = config_block(template, Path("fetched SKILL.md"))
+            config_exists = paths.config.exists()
+            text = paths.config.read_bytes().decode("utf-8") if config_exists else defaults
+            text = merge_missing_config_rows(text, defaults, paths.config if config_exists else Path("fetched SKILL.md"))
+            text = apply_config_assignment(text, assignment, paths.config if config_exists else Path("fetched SKILL.md"))
+            if paths.bundles.is_dir():
+                validate_policy_destinations(paths)
+            if assignment is None:
+                print(config_block(text, paths.config if config_exists else Path("fetched SKILL.md"))[2])
             return
         context = nullcontext()
     else:
         if not path_exists(paths.canonical) or not is_pointer(paths.canonical):
-            sync(paths, False)
-        initialize_directories(paths)
+            if paths.bundles.is_dir():
+                validate_policy_destinations(paths)
+            expected_target, template = dry_run_sync(paths, announce=False)
+            _, _, defaults = config_block(template, Path("fetched SKILL.md"))
+            if paths.config.exists():
+                preflight_text = paths.config.read_text(encoding="utf-8")
+                preflight_origin = paths.config
+            elif path_exists(paths.canonical) and (paths.canonical / CONFIG_FILE).exists():
+                preflight_text = (paths.canonical / CONFIG_FILE).read_text(encoding="utf-8")
+                preflight_origin = paths.canonical / CONFIG_FILE
+            else:
+                preflight_text = defaults
+                preflight_origin = Path("fetched SKILL.md")
+            preflight_text = merge_missing_config_rows(preflight_text, defaults, preflight_origin)
+            apply_config_assignment(preflight_text, assignment, preflight_origin, announce=False)
+            sync(paths, False, expected_target=expected_target)
+        ensure_real_directory(paths.skills)
         context = InstallerLock(paths)
     with context:
         if not dry_run:
+            initialize_directories(paths)
             initialize_repository(paths)
             cleanup_abandoned(paths)
             recover_policy_transaction(paths)
             recover_transaction(paths)
-        bundle, _ = active_bundle(paths)
+            remove_incoming_ref(paths)
+            if is_pointer(paths.canonical):
+                active_state(paths)
+            discard_all_unactivated_bundles(paths)
+        validate_runtime_paths(paths)
+        bundle, _, _ = active_state(paths)
+        validate_policy_destinations(paths)
         template = (bundle / "SKILL.md").read_bytes().decode("utf-8")
         _, _, defaults = config_block(template, bundle / "SKILL.md")
         config_exists = paths.config.exists()
         text = paths.config.read_bytes().decode("utf-8") if config_exists else defaults
-        if assignment:
-            if "=" not in assignment:
-                fail(f"expected '<Setting>=<value>', got {assignment!r}")
-            name, value = (part.strip() for part in assignment.split("=", 1))
-            if "|" in value:
-                fail("configuration values may not contain '|'")
-            lines = text.splitlines(keepends=True)
-            matches: list[int] = []
-            for index, line in enumerate(lines):
-                cells = line.split("|")
-                if len(cells) >= 4 and cells[1].strip() == name:
-                    matches.append(index)
-            if len(matches) != 1:
-                fail(f"configuration setting {name!r} matched {len(matches)} rows")
-            index = matches[0]
-            cells = lines[index].split("|")
-            old = cells[2].strip()
-            cells[2] = f" {value} "
-            lines[index] = "|".join(cells)
-            text = "".join(lines)
-            print(f"set     {name}: {old} -> {value}")
+        text = merge_missing_config_rows(text, defaults, paths.config if config_exists else bundle / "SKILL.md")
+        text = apply_config_assignment(text, assignment, paths.config if config_exists else bundle / "SKILL.md")
         if dry_run:
-            if not assignment:
+            if assignment is None:
                 print(config_block(text, paths.config if config_exists else bundle / "SKILL.md")[2])
             return
-        if not assignment and config_exists:
+        if assignment is None and config_exists:
             print(config_block(text, paths.config)[2])
             return
         switch_policy(paths, text.encode("utf-8"))
-        if not assignment:
+        if assignment is None:
             print(config_block(text, paths.config)[2])
 
 
@@ -2052,16 +2547,17 @@ def rollback(paths: Paths, dry_run: bool) -> None:
         verify_stored_bundle(paths, paths.bundles / previous)
         print(f"would   roll back {receipt['commit']} -> {previous}")
         return
-    initialize_directories(paths)
+    ensure_real_directory(paths.skills)
     with InstallerLock(paths):
+        initialize_directories(paths)
         initialize_repository(paths)
         cleanup_abandoned(paths)
         recover_policy_transaction(paths)
         recover_transaction(paths)
-        _, receipt = active_bundle(paths)
-        state = read_current_state(paths)
-        if state["current"] != receipt["commit"]:
-            fail(f"current activation receipt disagrees with the active bundle: {paths.current}")
+        require_layout_provenance(paths)
+        remove_incoming_ref(paths)
+        _, receipt, state = active_state(paths)
+        discard_all_unactivated_bundles(paths)
         previous = state.get("previous")
         if not isinstance(previous, str) or not previous:
             fail("no retained previous bundle is recorded")
@@ -2102,24 +2598,28 @@ def recover(paths: Paths, dry_run: bool) -> None:
             print(f"would   recover transaction {paths.transaction}")
         if paths.policy_transaction.exists():
             print(f"would   recover policy transaction {paths.policy_transaction}")
+        if paths.repository.is_dir():
+            incoming = incoming_target(paths)
+            if incoming:
+                print(f"would   remove abandoned incoming acquisition ref {incoming}")
         print(f"would   remove {len(abandoned_paths(paths))} abandoned installer temporary path(s)")
         return
-    initialize_directories(paths)
+    ensure_real_directory(paths.skills)
     with InstallerLock(paths):
+        initialize_directories(paths)
         initialize_repository(paths)
         cleanup_abandoned(paths)
         recover_policy_transaction(paths)
         recover_transaction(paths)
+        require_layout_provenance(paths)
+        remove_incoming_ref(paths)
         if is_pointer(paths.canonical):
-            bundle, receipt = active_bundle(paths)
-            if not paths.current.exists():
-                fail(f"active bundle has no activation state or recovery journal: {paths.current}")
-            state = read_current_state(paths)
-            if state["current"] != receipt["commit"]:
-                fail(f"refusing to normalize unexplained pointer/state drift: {paths.current}")
+            bundle, _, _ = active_state(paths)
+            discard_all_unactivated_bundles(paths)
             reconcile_retained_state(paths)
             print(f"recovered active bundle {bundle.name}")
         else:
+            discard_all_unactivated_bundles(paths)
             print("recovery found no incomplete immutable-bundle activation")
 
 
@@ -2161,26 +2661,43 @@ def status(paths: Paths) -> None:
             fail(f"installer state is not a real directory: {paths.state}")
         if path_exists(paths.bundles) and (is_pointer(paths.bundles) or not paths.bundles.is_dir()):
             fail(f"bundle store is not a real directory: {paths.bundles}")
+        if path_exists(paths.repository):
+            validate_repository_config(paths.repository)
         try:
             transactions = [path.name for path in (paths.transaction, paths.policy_transaction) if path.exists()]
-            staging = len(abandoned_paths(paths))
+            staging = len(abandoned_paths(paths, strict_attachments=False))
             bundles = (
-                [path for path in paths.bundles.iterdir() if not path.name.startswith(".staging-")]
+                [
+                    path
+                    for path in paths.bundles.iterdir()
+                    if not path.name.startswith(".staging-") and not DISCARD_NAME.fullmatch(path.name)
+                ]
                 if paths.bundles.exists()
                 else []
             )
+            incoming = incoming_target(paths) if paths.repository.is_dir() else None
         except OSError as error:
             fail(f"cannot enumerate installer status under {paths.state}: {error}")
         corrupt_bundles = 0
+        unactivated_bundles = 0
         for candidate in bundles:
             try:
-                verify_stored_bundle(paths, candidate)
+                receipt = verify_stored_bundle(paths, candidate)
                 verify_attachments(paths, candidate)
+                if not is_activated(paths, str(receipt["commit"])):
+                    unactivated_bundles += 1
             except (InstallError, OSError, AttributeError, KeyError, TypeError, ValueError):
                 corrupt_bundles += 1
         store_bytes = directory_usage(paths.state)
-        print(f"store      {len(bundles)} bundle(s), {store_bytes} bytes, corrupt={corrupt_bundles}")
-        print(f"recovery   transactions={transactions or 'none'} temporaries={staging}")
+        print(
+            f"store      {len(bundles)} bundle(s), {store_bytes} bytes, "
+            f"corrupt={corrupt_bundles} unactivated={unactivated_bundles}"
+        )
+        print(
+            f"recovery   transactions={transactions or 'none'} temporaries={staging} "
+            f"incoming={incoming or 'none'}"
+        )
+    require_layout_provenance(paths)
     if not path_exists(paths.canonical):
         print("layout     absent")
         return
@@ -2190,8 +2707,7 @@ def status(paths: Paths) -> None:
         print(f"config     {config if config.exists() else 'portable defaults'}")
         return
     try:
-        bundle, receipt = active_bundle(paths)
-        state = read_current_state(paths) if paths.current.exists() else {}
+        bundle, receipt, state = active_state(paths)
     except InstallError:
         raise
     except (OSError, AttributeError, KeyError, TypeError, ValueError) as error:
@@ -2219,7 +2735,7 @@ def status(paths: Paths) -> None:
 
 
 def parse_args(arguments: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument(
         "command",
         nargs="?",
@@ -2230,12 +2746,12 @@ def parse_args(arguments: list[str]) -> argparse.Namespace:
     parser.add_argument("--set")
     parser.add_argument("--from", dest="source")
     options = parser.parse_args(arguments)
-    if options.source:
+    if options.source is not None:
         fail(
             "single-file sync is retired because it cannot prove companion bytes; "
             "run sync without --from to install one verified Git tree"
         )
-    if options.set and options.command != "config":
+    if options.set is not None and options.command != "config":
         fail("--set is valid only with config")
     return options
 
@@ -2243,7 +2759,9 @@ def parse_args(arguments: list[str]) -> argparse.Namespace:
 def main(arguments: list[str] | None = None) -> int:
     try:
         options = parse_args(sys.argv[1:] if arguments is None else arguments)
-        paths = Paths.for_home(Path.home())
+        paths = Paths.for_home(Path(os.environ.get("ISSUE_FLOW_HOME", Path.home())))
+        validate_real_ancestors(paths.home, paths.skills)
+        validate_runtime_ancestors(paths)
         # A legacy checkout cannot be renamed on Windows while it is this process's current directory.
         os.chdir(paths.skills if paths.skills.exists() else Path.home())
         if options.command == "install":

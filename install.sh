@@ -4,20 +4,15 @@
 set -eu
 
 REPOSITORY_URL='https://github.com/asanabrial/issue-flow.git'
-SCRIPT_PARENT=${0%/*}
-[ "$SCRIPT_PARENT" = "$0" ] && SCRIPT_PARENT=.
-SCRIPT_DIR=$(CDPATH= cd -- "$SCRIPT_PARENT" 2>/dev/null && pwd -P) || SCRIPT_DIR=''
-case ${0##*/} in install.sh) ;; *) SCRIPT_DIR='' ;; esac
-HELPER="$SCRIPT_DIR/scripts/install_bundle.py"
 
 find_python() {
     candidate=$(command -v python3 2>/dev/null || :)
-    if [ -n "$candidate" ] && "$candidate" -I -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then printf '%s\n' "$candidate"
+    if [ -n "$candidate" ] && "$candidate" -I -c 'import sys; raise SystemExit(sys.version_info < (3, 10) or sys.platform.startswith(("cygwin", "msys")))' >/dev/null 2>&1; then printf '%s\n' "$candidate"
     else
         candidate=$(command -v python 2>/dev/null || :)
-        if [ -n "$candidate" ] && "$candidate" -I -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then printf '%s\n' "$candidate"
+        if [ -n "$candidate" ] && "$candidate" -I -c 'import sys; raise SystemExit(sys.version_info < (3, 10) or sys.platform.startswith(("cygwin", "msys")))' >/dev/null 2>&1; then printf '%s\n' "$candidate"
         else
-            printf 'error: Python 3.10 or newer is required; install it and retry.\n' >&2
+            printf 'error: native Python 3.10 or newer is required; Cygwin/MSYS Python cannot create Windows-native pointers.\n' >&2
             return 1
         fi
     fi
@@ -26,30 +21,60 @@ find_python() {
 find_git() {
     candidate=$(command -v git 2>/dev/null || :)
     [ -n "$candidate" ] || return 1
-    "$PYTHON" -I -c 'import re,subprocess,sys; out=subprocess.check_output([sys.argv[1], "--version"], text=True); m=re.search(r"\b(\d+)\.(\d+)", out); raise SystemExit(not m or tuple(map(int, m.groups())) < (2, 36))' "$candidate" || return 1
-    printf '%s\n' "$candidate"
+    "$PYTHON" -I -c 'import os,re,subprocess,sys; executable=os.path.realpath(sys.argv[1]); environment={name:value for name,value in os.environ.items() if not name.startswith("GIT_")}; environment.update({"GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_SYSTEM":os.devnull,"GIT_CONFIG_GLOBAL":os.devnull,"GIT_CONFIG_COUNT":"0"}); out=subprocess.check_output([executable, "--version"], env=environment, text=True); m=re.search(r"\b(\d+)\.(\d+)", out); bad=not m or tuple(map(int, m.groups())) < (2, 36); print(executable.replace("\\", "/")) if not bad else sys.exit(1)' "$candidate" || return 1
 }
 
-verify_local_helper() {
-    "$PYTHON" -I - "$HELPER" "$SCRIPT_DIR/.issue-flow-bundle.json" \
-        "$HOME/.agents/skills/.issue-flow/repository.git" \
-        "$HOME/.agents/skills/.issue-flow/current.json" "$GIT" <<'PY'
-import json
+LOCAL_VERIFIER='import json
 import os
 import re
 import subprocess
 import sys
 
-helper, receipt_path, repository, current_path, git = sys.argv[1:]
+mode, helper, receipt_path, repository, current_path, transaction_path, git = sys.argv[1:8]
+installer_arguments = sys.argv[8:]
+
+def is_pointer(path):
+    junction = getattr(os.path, "isjunction", lambda _path: False)
+    return os.path.islink(path) or junction(path)
+
+def validate_repository(path):
+    if is_pointer(path) or not os.path.isdir(path) or os.path.lexists(os.path.join(path, "commondir")):
+        raise ValueError("redirected repository")
+    for name in ("objects", "refs"):
+        candidate = os.path.join(path, name)
+        if is_pointer(candidate) or not os.path.isdir(candidate):
+            raise ValueError("linked repository directory")
+    for name in ("config", "HEAD", "packed-refs"):
+        candidate = os.path.join(path, name)
+        if name == "packed-refs" and not os.path.lexists(candidate):
+            continue
+        details = os.lstat(candidate)
+        if is_pointer(candidate) or not os.path.isfile(candidate) or details.st_nlink != 1:
+            raise ValueError("linked repository authority")
+    for directory, names, files in os.walk(os.path.join(path, "refs"), followlinks=False):
+        for name in names:
+            candidate = os.path.join(directory, name)
+            if is_pointer(candidate) or not os.path.isdir(candidate):
+                raise ValueError("linked ref directory")
+        for name in files:
+            candidate = os.path.join(directory, name)
+            if is_pointer(candidate) or not os.path.isfile(candidate) or os.lstat(candidate).st_nlink != 1:
+                raise ValueError("linked ref")
+            if open(candidate, "rb").read().lstrip().startswith(b"ref:"):
+                raise ValueError("symbolic ref")
+    for name in ("alternates", "http-alternates"):
+        if os.path.lexists(os.path.join(path, "objects", "info", name)):
+            raise ValueError("alternate object database")
+
 try:
+    validate_repository(repository)
     receipt = json.loads(open(receipt_path, encoding="utf-8").read())
     commit = str(receipt["commit"])
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
         raise ValueError("invalid commit")
     bundle_commit = os.path.basename(os.path.dirname(os.path.dirname(os.path.realpath(helper))))
-    current = json.loads(open(current_path, encoding="utf-8").read())
-    if bundle_commit != commit or current.get("current") != commit:
-        raise ValueError("helper is not in the recorded active bundle")
+    if bundle_commit != commit:
+        raise ValueError("helper is not in its receipt-named bundle")
     environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
     environment.update({
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -66,51 +91,145 @@ try:
         "-c", "core.fsmonitor=false",
         "cat-file", "blob", f"{commit}:scripts/install_bundle.py",
     ], env=environment)
-    activated = subprocess.check_output([
-        git,
-        "--no-replace-objects",
-        f"--git-dir={repository}",
-        "-c", f"core.hooksPath={os.devnull}",
-        "rev-parse", "--verify", f"refs/issue-flow/activated/{commit}^{{commit}}",
-    ], env=environment, text=True).strip()
-    if activated != commit:
-        raise ValueError("active bundle has no completed activation ref")
+    try:
+        current = json.loads(open(current_path, encoding="utf-8").read())
+        activated = subprocess.check_output([
+            git,
+            "--no-replace-objects",
+            f"--git-dir={repository}",
+            "-c", f"core.hooksPath={os.devnull}",
+            "rev-parse", "--verify", f"refs/issue-flow/activated/{commit}^{{commit}}",
+        ], env=environment, text=True).strip()
+        normal_identity = current.get("current") == commit and activated == commit
+    except (OSError, subprocess.SubprocessError, ValueError):
+        normal_identity = False
+    try:
+        transaction = json.loads(open(transaction_path, encoding="utf-8").read())
+        recovery_identity = transaction.get("schema") == 1 and commit in {
+            transaction.get("previous"), transaction.get("target")
+        }
+    except (OSError, ValueError):
+        recovery_identity = False
+    if not normal_identity and not recovery_identity:
+        raise ValueError("helper is neither active nor a declared recovery endpoint")
     actual = open(helper, "rb").read()
 except (KeyError, OSError, subprocess.SubprocessError, ValueError):
-    raise SystemExit(1)
-raise SystemExit(authoritative != actual)
-PY
+    raise SystemExit(125)
+if authoritative != actual:
+    raise SystemExit(125)
+if mode == "check":
+    raise SystemExit(0)
+os.environ["ISSUE_FLOW_GIT"] = os.path.realpath(git)
+sys.argv = [helper, *installer_arguments]
+namespace = {"__name__": "__main__", "__file__": helper}
+exec(compile(actual, helper, "exec"), namespace)'
+
+verify_local_helper() {
+    "$PYTHON" -I -c "$LOCAL_VERIFIER" check "$HELPER" "$SCRIPT_DIR/.issue-flow-bundle.json" \
+        "$HOME/.agents/skills/.issue-flow/repository.git" \
+        "$HOME/.agents/skills/.issue-flow/current.json" \
+        "$HOME/.agents/skills/.issue-flow/transaction.json" "$GIT" "$@"
 }
 
 PYTHON=$(find_python) || exit 1
+PYTHON_PLATFORM=$("$PYTHON" -I -c 'import sys; print(sys.platform)')
+if [ "$PYTHON_PLATFORM" = win32 ] && [ -z "${MSYSTEM-}" ]; then
+    printf 'error: Cygwin is not supported; use Git Bash with native Windows Python.\n' >&2
+    exit 1
+fi
+HOME=$("$PYTHON" -I -c '
+import os
+import sys
+
+path = os.path.realpath(sys.argv[1])
+ancestor = path
+while not os.path.exists(ancestor):
+    parent = os.path.dirname(ancestor)
+    if parent == ancestor:
+        raise SystemExit(1)
+    ancestor = parent
+details = os.stat(ancestor)
+owner = getattr(os, "geteuid", lambda: details.st_uid)()
+if details.st_uid != owner:
+    raise SystemExit(1)
+print(path.replace("\\", "/"))
+' "$HOME") || {
+    printf 'error: installer HOME must resolve to a directory owned by the current user.\n' >&2
+    exit 1
+}
+USERPROFILE=$HOME; ISSUE_FLOW_HOME=$HOME; export HOME USERPROFILE ISSUE_FLOW_HOME
+SCRIPT_PATH=$("$PYTHON" -I -c 'import os,sys; print(os.path.realpath(sys.argv[1]).replace("\\", "/"))' "$0" 2>/dev/null || :)
+SCRIPT_PARENT=${SCRIPT_PATH%/*}
+[ "$SCRIPT_PARENT" = "$SCRIPT_PATH" ] && SCRIPT_PARENT=.
+SCRIPT_DIR=$(CDPATH= cd -- "$SCRIPT_PARENT" 2>/dev/null && pwd -P) || SCRIPT_DIR=''
+case ${SCRIPT_PATH##*/} in install.sh) ;; *) SCRIPT_DIR='' ;; esac
+HELPER="$SCRIPT_DIR/scripts/install_bundle.py"
 
 if [ -f "$HELPER" ]; then
     GIT=$(find_git) || {
         printf 'error: Git 2.36 or newer is required; install it and retry.\n' >&2
         exit 1
     }
-    if verify_local_helper; then
-        USERPROFILE=$HOME; export USERPROFILE
-        exec "$PYTHON" -I "$HELPER" "$@"
+    ISSUE_FLOW_GIT=$GIT; export ISSUE_FLOW_GIT
+    if verify_local_helper "$@"; then
+        exec "$PYTHON" -I -c "$LOCAL_VERIFIER" execute "$HELPER" "$SCRIPT_DIR/.issue-flow-bundle.json" \
+            "$HOME/.agents/skills/.issue-flow/repository.git" \
+            "$HOME/.agents/skills/.issue-flow/current.json" \
+            "$HOME/.agents/skills/.issue-flow/transaction.json" "$GIT" "$@"
+    else
+        LOCAL_RESULT=$?
+        [ "$LOCAL_RESULT" -ne 125 ] && exit "$LOCAL_RESULT"
     fi
     printf 'warning: local installer helper failed Git-object verification; reacquiring canonical main.\n' >&2
 fi
 
 # A raw/piped script has no companion files. Refuse unsafe legacy arguments and a fresh dry-run
 # before network or filesystem mutation, then acquire the complete current bootstrap in quarantine.
+"$PYTHON" -I - "$@" <<'PY'
+import argparse
+import sys
+
+parser = argparse.ArgumentParser(description="Install one verified issue-flow Git tree.", allow_abbrev=False)
+parser.add_argument("command", nargs="?", default="install", choices=(
+    "install", "sync", "uninstall", "status", "config", "rollback", "recover"
+))
+parser.add_argument("--dry-run", action="store_true")
+parser.add_argument("--set")
+parser.add_argument("--from", dest="source")
+options = parser.parse_args(sys.argv[1:])
+if options.set and options.command != "config":
+    parser.error("--set is valid only with config")
+PY
 FRESH_DRY=0
+FRESH_COMMAND=install
+FRESH_SET=0
+FRESH_HELP=0
 for argument in "$@"; do
     case "$argument" in
+        install|sync|uninstall|status|config|rollback|recover) FRESH_COMMAND=$argument ;;
         --from|--from=*)
             printf 'error: single-file sync is retired; run sync without --from.\n' >&2
             exit 1
             ;;
         --dry-run) FRESH_DRY=1 ;;
+        --set|--set=*) FRESH_SET=1 ;;
+        -h|--help) FRESH_HELP=1 ;;
     esac
 done
+[ "$FRESH_HELP" -eq 1 ] && exit 0
 
 DEST="$HOME/.agents/skills/issue-flow"
-if [ "$FRESH_DRY" -eq 1 ] && [ ! -e "$DEST" ] && [ ! -L "$DEST" ]; then
+STATE="$HOME/.agents/skills/.issue-flow"
+CLAUDE_DEST="$HOME/.claude/skills/issue-flow"
+CODEX_DEST="$HOME/.codex/skills/issue-flow"
+case $FRESH_COMMAND in install|sync) FRESH_DRY_INSTALL=1 ;; *) FRESH_DRY_INSTALL=0 ;; esac
+if [ "$FRESH_DRY" -eq 1 ] && [ "$FRESH_DRY_INSTALL" -eq 1 ] && [ "$FRESH_SET" -eq 0 ] \
+    && [ ! -e "$DEST" ] && [ ! -L "$DEST" ] \
+    && [ ! -e "$STATE" ] && [ ! -L "$STATE" ] \
+    && [ ! -e "$HOME/.claude" ] && [ ! -L "$HOME/.claude" ] \
+    && [ ! -e "$HOME/.codex" ] && [ ! -L "$HOME/.codex" ] \
+    && [ ! -e "$CLAUDE_DEST" ] && [ ! -L "$CLAUDE_DEST" ] \
+    && [ ! -e "$CODEX_DEST" ] && [ ! -L "$CODEX_DEST" ]; then
     printf 'would   install one complete Git tree at %s\n' "$DEST"
     exit 0
 fi
@@ -119,37 +238,78 @@ GIT=$(find_git) || {
     printf 'error: Git 2.36 or newer is required; install it and retry.\n' >&2
     exit 1
 }
+ISSUE_FLOW_GIT=$GIT; export ISSUE_FLOW_GIT
 
-BOOTSTRAP=$(mktemp -d "${TMPDIR:-/tmp}/issue-flow-bootstrap.XXXXXX") || exit 1
-trap 'rm -rf -- "$BOOTSTRAP"' EXIT HUP INT TERM
-mkdir -p -- "$BOOTSTRAP/source/scripts"
+USERPROFILE=$HOME; ISSUE_FLOW_HOME=$HOME; export USERPROFILE ISSUE_FLOW_HOME
+exec "$PYTHON" -I - "$REPOSITORY_URL" "$GIT" "$@" <<'PY'
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import uuid
+from pathlib import Path
 
-case "$REPOSITORY_URL" in file://*) FILE_PROTOCOL=always ;; *) FILE_PROTOCOL=never ;; esac
-clean_git() {
-    env -i \
-        PATH="$PATH" HOME="${HOME-}" TMPDIR="${TMPDIR-}" TEMP="${TEMP-}" TMP="${TMP-}" \
-        SYSTEMROOT="${SYSTEMROOT-}" SystemRoot="${SystemRoot-}" COMSPEC="${COMSPEC-}" PATHEXT="${PATHEXT-}" \
-        LANG="${LANG-}" LC_ALL="${LC_ALL-}" \
-        HTTP_PROXY="${HTTP_PROXY-}" HTTPS_PROXY="${HTTPS_PROXY-}" ALL_PROXY="${ALL_PROXY-}" NO_PROXY="${NO_PROXY-}" \
-        http_proxy="${http_proxy-}" https_proxy="${https_proxy-}" all_proxy="${all_proxy-}" no_proxy="${no_proxy-}" \
-        SSL_CERT_FILE="${SSL_CERT_FILE-}" SSL_CERT_DIR="${SSL_CERT_DIR-}" CURL_CA_BUNDLE="${CURL_CA_BUNDLE-}" \
-        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_GLOBAL=/dev/null \
-        GIT_CONFIG_COUNT=0 GIT_ATTR_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 \
-        GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= \
-        "$GIT" "$@"
-}
-(
-    clean_git --no-replace-objects -c core.hooksPath=/dev/null -c credential.helper= \
-        -c protocol.allow=never -c protocol.ext.allow=never \
-        -c "protocol.file.allow=$FILE_PROTOCOL" -c protocol.https.allow=always \
-        clone -q --bare --no-tags --single-branch --branch main \
-        "$REPOSITORY_URL" "$BOOTSTRAP/repository.git"
-    clean_git --no-replace-objects --git-dir="$BOOTSTRAP/repository.git" \
-        -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-        show refs/heads/main:scripts/install_bundle.py > "$BOOTSTRAP/source/scripts/install_bundle.py"
-)
+repository, git, *installer_arguments = sys.argv[1:]
+home = Path.home().resolve(strict=True)
+if os.name != "nt" and home.stat().st_uid != os.geteuid():
+    raise RuntimeError(f"installer HOME is not owned by the current user: {home}")
+bootstrap = home / f".issue-flow-bootstrap-{uuid.uuid4().hex}"
+os.mkdir(bootstrap, 0o700)
+details = os.lstat(bootstrap)
+if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
+    raise RuntimeError(f"bootstrap quarantine is not a private directory: {bootstrap}")
+bare = bootstrap / "repository.git"
+environment = os.environ.copy()
+for name in tuple(environment):
+    if name.startswith("GIT_") or name in {"SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE"}:
+        environment.pop(name, None)
+environment.update({
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_COUNT": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+})
+file_protocol = "always" if repository.lower().startswith("file:") else "never"
+hooks = "NUL" if os.name == "nt" else "/dev/null"
+common = [git, "--no-replace-objects", "-c", f"core.hooksPath={hooks}", "-c", "credential.helper="]
+try:
+    subprocess.run([
+        *common,
+        "-c", "protocol.allow=never",
+        "-c", "protocol.ext.allow=never",
+        "-c", f"protocol.file.allow={file_protocol}",
+        "-c", "protocol.https.allow=always",
+        "clone", "-q", "--bare", "--no-tags", "--single-branch", "--branch", "main",
+        repository, str(bare),
+    ], env=environment, check=True)
+    commit = subprocess.check_output([
+        git, "--no-replace-objects", f"--git-dir={bare}",
+        "-c", f"core.hooksPath={hooks}", "rev-parse", "refs/heads/main^{commit}",
+    ], env=environment, text=True).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        raise RuntimeError("canonical main did not resolve to a commit")
+    helper = subprocess.check_output([
+        git, "--no-replace-objects", f"--git-dir={bare}",
+        "-c", f"core.hooksPath={hooks}", "-c", "core.fsmonitor=false",
+        "cat-file", "blob", f"{commit}:scripts/install_bundle.py",
+    ], env=environment)
+    os.environ["ISSUE_FLOW_GIT"] = os.path.realpath(git)
+    sys.argv = [f"git:{commit}:scripts/install_bundle.py", *installer_arguments]
+    namespace = {"__name__": "__main__", "__file__": sys.argv[0]}
+    exec(compile(helper, sys.argv[0], "exec"), namespace)
+finally:
+    def make_writable(function, target, _error) -> None:
+        os.chmod(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        function(target)
 
-USERPROFILE=$HOME; export USERPROFILE
-"$PYTHON" -I "$BOOTSTRAP/source/scripts/install_bundle.py" "$@"
-RESULT=$?
-exit "$RESULT"
+    if bootstrap.exists():
+        shutil.rmtree(bootstrap, onerror=make_writable)
+    if bootstrap.exists():
+        raise RuntimeError(f"bootstrap quarantine cleanup did not complete: {bootstrap}")
+PY

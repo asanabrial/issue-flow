@@ -23,33 +23,34 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $RepositoryUrl = 'https://github.com/asanabrial/issue-flow.git'
+$fromSpecified = $PSBoundParameters.ContainsKey('From')
+$setSpecified = $PSBoundParameters.ContainsKey('Set')
 
 function Get-PythonCommand {
+    $expectedPlatform = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'win32' } else { '' }
     $python = Get-Command python -ErrorAction SilentlyContinue
     if ($python) {
-        & $python.Source -I -c 'import sys;raise SystemExit(sys.version_info < (3, 10))' 2>$null
+        & $python.Source -I -c 'import sys;raise SystemExit(sys.version_info < (3, 10) or (sys.argv[1] and sys.platform != sys.argv[1]))' $expectedPlatform 2>$null
         if ($LASTEXITCODE -eq 0) { return @{ Executable = $python.Source; Prefix = @() } }
     }
     $launcher = Get-Command py -ErrorAction SilentlyContinue
     if ($launcher) {
-        & $launcher.Source -3 -I -c 'import sys;raise SystemExit(sys.version_info < (3, 10))' 2>$null
+        & $launcher.Source -3 -I -c 'import sys;raise SystemExit(sys.version_info < (3, 10) or (sys.argv[1] and sys.platform != sys.argv[1]))' $expectedPlatform 2>$null
         if ($LASTEXITCODE -eq 0) { return @{ Executable = $launcher.Source; Prefix = @('-3') } }
     }
-    throw 'Python 3.10 or newer is required; install it and retry.'
+    throw 'A host-native Python 3.10 or newer is required; install it and retry.'
 }
 
-function Invoke-Helper {
-    param([string]$Path, [hashtable]$Python)
-    $arguments = @($Python.Prefix) + @('-I', $Path, $Command)
-    if ($From) { $arguments += @('--from', $From) }
-    if ($Set) { $arguments += @('--set', $Set) }
+function Get-InstallerArguments {
+    $arguments = @($Command)
+    if ($fromSpecified) { $arguments += @('--from', $From) }
+    if ($setSpecified) { $arguments += @('--set', $Set) }
     if ($DryRun) { $arguments += '--dry-run' }
-    & $Python.Executable @arguments
-    $script:HelperResult = $LASTEXITCODE
+    return $arguments
 }
 
-function Test-LocalHelper {
-    param([string]$Path, [string]$Receipt, [string]$Repository, [string]$Current, [string]$Git, [hashtable]$Python)
+function Invoke-VerifiedLocalHelper {
+    param([string]$Path, [string]$Receipt, [string]$Repository, [string]$Current, [string]$Transaction, [string]$Git, [hashtable]$Python, [string]$HomePath, [string[]]$InstallerArguments)
     $code = @'
 import json
 import os
@@ -57,20 +58,44 @@ import re
 import subprocess
 import sys
 
-helper, receipt_path, repository, current_path, git = sys.argv[1:]
+helper, receipt_path, repository, current_path, transaction_path, git = sys.argv[1:7]
+installer_arguments = sys.argv[7:]
+
+def is_pointer(path):
+    junction = getattr(os.path, "isjunction", lambda _path: False)
+    return os.path.islink(path) or junction(path)
+
+def validate_repository(path):
+    if is_pointer(path) or not os.path.isdir(path) or os.path.lexists(os.path.join(path, "commondir")):
+        raise ValueError("redirected repository")
+    for name in ("objects", "refs"):
+        candidate = os.path.join(path, name)
+        if is_pointer(candidate) or not os.path.isdir(candidate):
+            raise ValueError("linked repository directory")
+    for name in ("config", "HEAD", "packed-refs"):
+        candidate = os.path.join(path, name)
+        if name == "packed-refs" and not os.path.lexists(candidate):
+            continue
+        details = os.lstat(candidate)
+        if is_pointer(candidate) or not os.path.isfile(candidate) or details.st_nlink != 1:
+            raise ValueError("linked repository authority")
+    for directory, names, files in os.walk(os.path.join(path, "refs"), followlinks=False):
+        for name in names:
+            candidate = os.path.join(directory, name)
+            if is_pointer(candidate) or not os.path.isdir(candidate):
+                raise ValueError("linked ref directory")
+        for name in files:
+            candidate = os.path.join(directory, name)
+            if is_pointer(candidate) or not os.path.isfile(candidate) or os.lstat(candidate).st_nlink != 1:
+                raise ValueError("linked ref")
+            if open(candidate, "rb").read().lstrip().startswith(b"ref:"):
+                raise ValueError("symbolic ref")
+    for name in ("alternates", "http-alternates"):
+        if os.path.lexists(os.path.join(path, "objects", "info", name)):
+            raise ValueError("alternate object database")
+
 try:
-    version = subprocess.check_output([git, "--version"], text=True)
-    match = re.search(r"\b(\d+)\.(\d+)", version)
-    if not match or tuple(map(int, match.groups())) < (2, 36):
-        raise ValueError("old Git")
-    receipt = json.loads(open(receipt_path, encoding="utf-8").read())
-    commit = str(receipt["commit"])
-    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
-        raise ValueError("invalid commit")
-    bundle_commit = os.path.basename(os.path.dirname(os.path.dirname(os.path.realpath(helper))))
-    current = json.loads(open(current_path, encoding="utf-8").read())
-    if bundle_commit != commit or current.get("current") != commit:
-        raise ValueError("helper is not in the recorded active bundle")
+    validate_repository(repository)
     environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
     environment.update({
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -79,6 +104,17 @@ try:
         "GIT_CONFIG_COUNT": "0",
         "GIT_NO_REPLACE_OBJECTS": "1",
     })
+    version = subprocess.check_output([git, "--version"], env=environment, text=True)
+    match = re.search(r"\b(\d+)\.(\d+)", version)
+    if not match or tuple(map(int, match.groups())) < (2, 36):
+        raise ValueError("old Git")
+    receipt = json.loads(open(receipt_path, encoding="utf-8").read())
+    commit = str(receipt["commit"])
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        raise ValueError("invalid commit")
+    bundle_commit = os.path.basename(os.path.dirname(os.path.dirname(os.path.realpath(helper))))
+    if bundle_commit != commit:
+        raise ValueError("helper is not in its receipt-named bundle")
     authoritative = subprocess.check_output([
         git,
         "--no-replace-objects",
@@ -87,57 +123,107 @@ try:
         "-c", "core.fsmonitor=false",
         "cat-file", "blob", f"{commit}:scripts/install_bundle.py",
     ], env=environment)
-    activated = subprocess.check_output([
-        git,
-        "--no-replace-objects",
-        f"--git-dir={repository}",
-        "-c", f"core.hooksPath={os.devnull}",
-        "rev-parse", "--verify", f"refs/issue-flow/activated/{commit}^{{commit}}",
-    ], env=environment, text=True).strip()
-    if activated != commit:
-        raise ValueError("active bundle has no completed activation ref")
+    try:
+        current = json.loads(open(current_path, encoding="utf-8").read())
+        activated = subprocess.check_output([
+            git,
+            "--no-replace-objects",
+            f"--git-dir={repository}",
+            "-c", f"core.hooksPath={os.devnull}",
+            "rev-parse", "--verify", f"refs/issue-flow/activated/{commit}^{{commit}}",
+        ], env=environment, text=True).strip()
+        normal_identity = current.get("current") == commit and activated == commit
+    except (OSError, subprocess.SubprocessError, ValueError):
+        normal_identity = False
+    try:
+        transaction = json.loads(open(transaction_path, encoding="utf-8").read())
+        recovery_identity = transaction.get("schema") == 1 and commit in {
+            transaction.get("previous"), transaction.get("target")
+        }
+    except (OSError, ValueError):
+        recovery_identity = False
+    if not normal_identity and not recovery_identity:
+        raise ValueError("helper is neither active nor a declared recovery endpoint")
     actual = open(helper, "rb").read()
 except (KeyError, OSError, subprocess.SubprocessError, ValueError):
-    raise SystemExit(1)
-raise SystemExit(authoritative != actual)
+    raise SystemExit(125)
+if authoritative != actual:
+    raise SystemExit(125)
+os.environ["ISSUE_FLOW_GIT"] = os.path.realpath(git)
+sys.argv = [helper, *installer_arguments]
+namespace = {"__name__": "__main__", "__file__": helper}
+exec(compile(actual, helper, "exec"), namespace)
 '@
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($code))
     $arguments = @($Python.Prefix) + @(
         '-I', '-c', 'import base64,sys;code=base64.b64decode(sys.argv[1]);del sys.argv[1];exec(code)',
-        $encoded, $Path, $Receipt, $Repository, $Current, $Git
-    )
-    & $Python.Executable @arguments
-    return $LASTEXITCODE -eq 0
+        $encoded, $Path, $Receipt, $Repository, $Current, $Transaction, $Git
+    ) + $InstallerArguments
+    $savedHome = [Environment]::GetEnvironmentVariable('HOME', 'Process')
+    $savedProfile = [Environment]::GetEnvironmentVariable('USERPROFILE', 'Process')
+    $savedInstallerHome = [Environment]::GetEnvironmentVariable('ISSUE_FLOW_HOME', 'Process')
+    $savedInstallerGit = [Environment]::GetEnvironmentVariable('ISSUE_FLOW_GIT', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('HOME', $HomePath, 'Process')
+        [Environment]::SetEnvironmentVariable('USERPROFILE', $HomePath, 'Process')
+        [Environment]::SetEnvironmentVariable('ISSUE_FLOW_HOME', $HomePath, 'Process')
+        [Environment]::SetEnvironmentVariable('ISSUE_FLOW_GIT', $Git, 'Process')
+        & $Python.Executable @arguments
+        $script:LocalHelperResult = $LASTEXITCODE
+    } finally {
+        [Environment]::SetEnvironmentVariable('HOME', $savedHome, 'Process')
+        [Environment]::SetEnvironmentVariable('USERPROFILE', $savedProfile, 'Process')
+        [Environment]::SetEnvironmentVariable('ISSUE_FLOW_HOME', $savedInstallerHome, 'Process')
+        [Environment]::SetEnvironmentVariable('ISSUE_FLOW_GIT', $savedInstallerGit, 'Process')
+    }
 }
 
 $python = Get-PythonCommand
+$homeArguments = @($python.Prefix) + @('-I', '-c', 'import os,sys;print(os.path.realpath(sys.argv[1]))', $HOME)
+$resolvedHome = & $python.Executable @homeArguments
+if ($LASTEXITCODE -ne 0 -or -not $resolvedHome) { throw 'Could not resolve the operator home with the selected Python.' }
+$resolvedHome = [string]$resolvedHome
 $invocationPath = $MyInvocation.MyCommand.Path
-$canonicalScript = Join-Path $HOME '.agents\skills\issue-flow\install.ps1'
-$isCanonicalInvocation = $invocationPath -and (
-    [IO.Path]::GetFullPath($invocationPath) -eq [IO.Path]::GetFullPath($canonicalScript)
-)
-$helper = if ($isCanonicalInvocation) {
-    Join-Path ([IO.Path]::GetDirectoryName($invocationPath)) 'scripts\install_bundle.py'
+$physicalInvocation = $null
+if ($invocationPath) {
+    $pathArguments = @($python.Prefix) + @('-I', '-c', 'import os,sys;print(os.path.realpath(sys.argv[1]))', $invocationPath)
+    $physicalInvocation = & $python.Executable @pathArguments
+    if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the installer path with the selected Python.' }
+}
+$helper = if ($physicalInvocation -and [IO.Path]::GetFileName($physicalInvocation) -eq 'install.ps1') {
+    Join-Path ([IO.Path]::GetDirectoryName($physicalInvocation)) 'scripts\install_bundle.py'
 } else { $null }
 $gitCommand = $null
 if ($helper -and (Test-Path -LiteralPath $helper -PathType Leaf)) {
     $gitCommand = Get-Command git -ErrorAction SilentlyContinue
-    $receipt = Join-Path ([IO.Path]::GetDirectoryName($invocationPath)) '.issue-flow-bundle.json'
-    $repository = Join-Path $HOME '.agents\skills\.issue-flow\repository.git'
-    $current = Join-Path $HOME '.agents\skills\.issue-flow\current.json'
-    if ($gitCommand -and (Test-LocalHelper -Path $helper -Receipt $receipt -Repository $repository -Current $current -Git $gitCommand.Source -Python $python)) {
-        Invoke-Helper -Path $helper -Python $python
-        exit $script:HelperResult
+    $receipt = Join-Path ([IO.Path]::GetDirectoryName($physicalInvocation)) '.issue-flow-bundle.json'
+    $repository = Join-Path $resolvedHome '.agents\skills\.issue-flow\repository.git'
+    $current = Join-Path $resolvedHome '.agents\skills\.issue-flow\current.json'
+    $transaction = Join-Path $resolvedHome '.agents\skills\.issue-flow\transaction.json'
+    if ($gitCommand) {
+        Invoke-VerifiedLocalHelper -Path $helper -Receipt $receipt -Repository $repository -Current $current -Transaction $transaction -Git $gitCommand.Source -Python $python -HomePath $resolvedHome -InstallerArguments @(Get-InstallerArguments)
+        if ($script:LocalHelperResult -ne 125) { exit $script:LocalHelperResult }
     }
     Write-Warning 'Local installer helper failed Git-object verification; reacquiring canonical main.'
 }
 
-if ($From) {
+if ($fromSpecified) {
     throw 'single-file sync is retired; run sync without -From.'
 }
 
-$destination = Join-Path $HOME '.agents\skills\issue-flow'
-if ($DryRun -and -not (Test-Path -LiteralPath $destination)) {
+$destination = Join-Path $resolvedHome '.agents\skills\issue-flow'
+$statePath = Join-Path $resolvedHome '.agents\skills\.issue-flow'
+$destinationPresent = $null -ne (Get-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue)
+$statePresent = $null -ne (Get-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue)
+$runtimePresent = @(
+    Join-Path $resolvedHome '.claude\skills\issue-flow'
+    Join-Path $resolvedHome '.codex\skills\issue-flow'
+) | Where-Object { $null -ne (Get-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue) }
+$runtimeRootPresent = @(
+    Join-Path $resolvedHome '.claude'
+    Join-Path $resolvedHome '.codex'
+) | Where-Object { $null -ne (Get-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue) }
+if ($DryRun -and -not $setSpecified -and -not $fromSpecified -and $Command -in @('install', 'sync') -and -not $destinationPresent -and -not $statePresent -and -not $runtimePresent -and -not $runtimeRootPresent) {
     Write-Host "would   install one complete Git tree at $destination"
     return
 }
@@ -145,11 +231,6 @@ if (-not $gitCommand) { $gitCommand = Get-Command git -ErrorAction SilentlyConti
 if (-not $gitCommand) {
     throw 'git is required; install it and retry.'
 }
-
-$bootstrap = Join-Path ([IO.Path]::GetTempPath()) ('issue-flow-bootstrap-' + [guid]::NewGuid().ToString('N'))
-$bootstrapSource = Join-Path $bootstrap 'source'
-$bootstrapRepository = Join-Path $bootstrap 'repository.git'
-New-Item -ItemType Directory -Path $bootstrap | Out-Null
 
 $gitNames = @(
     'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
@@ -175,13 +256,25 @@ try {
     $bootstrapCode = @'
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
+import uuid
+from pathlib import Path
 
-repository, source, bare, git_executable = sys.argv[1:]
+repository, git_executable, home_value, *installer_arguments = sys.argv[1:]
+git_executable = os.path.realpath(git_executable)
+home = Path(home_value).resolve(strict=True)
+bootstrap = home / f".issue-flow-bootstrap-{uuid.uuid4().hex}"
+os.mkdir(bootstrap, 0o700)
+details = os.lstat(bootstrap)
+if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
+    raise RuntimeError(f"bootstrap quarantine is not a private directory: {bootstrap}")
+bare = bootstrap / "repository.git"
 environment = os.environ.copy()
 for name in tuple(environment):
-    if name.startswith("GIT_"):
+    if name.startswith("GIT_") or name in {"SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE"}:
         environment.pop(name, None)
 environment.update({
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -199,40 +292,55 @@ version = subprocess.check_output([git_executable, "--version"], env=environment
 match = re.search(r"\b(\d+)\.(\d+)", version)
 if not match or tuple(map(int, match.groups())) < (2, 36):
     raise RuntimeError(f"Git 2.36 or newer is required, got {version.strip()}")
-os.makedirs(os.path.join(source, "scripts"))
 common = [git_executable, "--no-replace-objects", "-c", f"core.hooksPath={disabled_hooks}", "-c", "credential.helper="]
-subprocess.run([
-    *common,
-    "-c", "protocol.allow=never",
-    "-c", "protocol.ext.allow=never",
-    "-c", f"protocol.file.allow={file_protocol}",
-    "-c", "protocol.https.allow=always",
-    "clone", "-q", "--bare", "--no-tags", "--single-branch", "--branch", "main",
-    repository, bare,
-], env=environment, check=True)
-helper = subprocess.run([
-    git_executable, "--no-replace-objects", f"--git-dir={bare}",
-    "-c", f"core.hooksPath={disabled_hooks}", "-c", "core.fsmonitor=false",
-    "show", "refs/heads/main:scripts/install_bundle.py",
-], env=environment, check=True, stdout=subprocess.PIPE).stdout
-with open(os.path.join(source, "scripts", "install_bundle.py"), "xb") as handle:
-    handle.write(helper)
+try:
+    subprocess.run([
+        *common,
+        "-c", "protocol.allow=never",
+        "-c", "protocol.ext.allow=never",
+        "-c", f"protocol.file.allow={file_protocol}",
+        "-c", "protocol.https.allow=always",
+        "clone", "-q", "--bare", "--no-tags", "--single-branch", "--branch", "main",
+        repository, str(bare),
+    ], env=environment, check=True)
+    commit = subprocess.check_output([
+        git_executable, "--no-replace-objects", f"--git-dir={bare}",
+        "-c", f"core.hooksPath={disabled_hooks}", "rev-parse", "refs/heads/main^{commit}",
+    ], env=environment, text=True).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        raise RuntimeError("canonical main did not resolve to a commit")
+    helper = subprocess.check_output([
+        git_executable, "--no-replace-objects", f"--git-dir={bare}",
+        "-c", f"core.hooksPath={disabled_hooks}", "-c", "core.fsmonitor=false",
+        "cat-file", "blob", f"{commit}:scripts/install_bundle.py",
+    ], env=environment)
+    os.environ["ISSUE_FLOW_HOME"] = str(home)
+    os.environ["ISSUE_FLOW_GIT"] = git_executable
+    sys.argv = [f"git:{commit}:scripts/install_bundle.py", *installer_arguments]
+    namespace = {"__name__": "__main__", "__file__": sys.argv[0]}
+    exec(compile(helper, sys.argv[0], "exec"), namespace)
+finally:
+    def make_writable(function, target, _error) -> None:
+        os.chmod(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        function(target)
+
+    if bootstrap.exists():
+        shutil.rmtree(bootstrap, onerror=make_writable)
+    if bootstrap.exists():
+        raise RuntimeError(f"bootstrap quarantine cleanup did not complete: {bootstrap}")
 '@
     # Base64 keeps Windows PowerShell 5.1 from stripping quotes in the multiline `-c` argument.
     $encodedBootstrap = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootstrapCode))
+    $installerArguments = @(Get-InstallerArguments)
     $bootstrapArguments = @($python.Prefix) + @(
         '-I', '-c', 'import base64,sys;code=base64.b64decode(sys.argv[1]);del sys.argv[1];exec(code)',
-        $encodedBootstrap, $RepositoryUrl, $bootstrapSource, $bootstrapRepository, $gitCommand.Source
-    )
+        $encodedBootstrap, $RepositoryUrl, $gitCommand.Source, $resolvedHome
+    ) + $installerArguments
     & $python.Executable @bootstrapArguments
     if ($LASTEXITCODE -ne 0) { throw "bootstrap acquisition failed ($LASTEXITCODE)." }
-    Invoke-Helper -Path (Join-Path $bootstrapSource 'scripts\install_bundle.py') -Python $python
-    $result = $script:HelperResult
 } finally {
     foreach ($name in $gitNames) {
         [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process')
     }
-    Remove-Item -LiteralPath $bootstrap -Recurse -Force -ErrorAction SilentlyContinue
 }
-if ($result -ne 0) { throw "issue-flow installer failed ($result)." }
 return

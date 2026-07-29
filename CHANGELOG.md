@@ -2,7 +2,7 @@
 
 All notable changes to Issue Flow are documented here.
 
-## [1.12.0] - 2026-07-28
+## [1.12.0] - 2026-07-29
 
 ### Changed
 
@@ -16,13 +16,24 @@ All notable changes to Issue Flow are documented here.
   in-place installer as an immutable rollback target.
 - Harden bootstrap and recovery authority with portable path rejection, operating-system locks,
   isolated Python imports, disabled Git hooks, core-only repository config, Git-bound rollback
-  verification, verified local-helper loading and fsynced post-switch activation provenance. Git
-  2.36 or newer is now required for reference fsync support.
+  verification, verified local-helper loading, in-memory execution from the canonical Git blob,
+  system-only CA trust and fsynced post-switch activation provenance. Git 2.36 or newer is now
+  required for reference fsync support, Windows POSIX layers require native Windows Python, and the
+  wrapper-selected absolute Git identity is reused after every directory change. Bare repositories
+  reject redirected common directories, alternates, linked reference authority and symbolic refs;
+  installer refs use no-dereference compare-and-swap updates.
 - Publish Git objects, policy generations and migrated local files through durable atomic
   replacements; recover abandoned attachment temporaries and reject linked object-store parents,
-  symlinked policy generations and unexplained pointer/state drift.
+  symlinked policy generations, unowned installer-shaped cleanup candidates and unexplained
+  pointer/state drift, including a missing canonical pointer with durable activation state but no
+  recovery journal. Target trees reject case-only collisions at every path prefix. A stable
+  pre-state lock serializes first install with first uninstall, and
+  each newly created directory entry is fsynced before child journals can become durable. Runtime
+  and installer ancestors must remain real directories under the resolved home; cleanup also
+  recovers private stale Git ref lockfiles and rejects read-only Windows attachment sources.
 - Retain every activated bundle for resolved readers, verify retained bytes and attachments in
-  `status`, and report deduplicated storage including corrupt and auxiliary installer state.
+  `status`, atomically tombstone never-activated targets for crash-resumable cleanup, and report
+  deduplicated storage including corrupt, unactivated, incoming and auxiliary installer state.
 - Revalidate rollback targets against canonical `main`; rollback becomes available after the first
   subsequent immutable upgrade creates a safe predecessor.
 

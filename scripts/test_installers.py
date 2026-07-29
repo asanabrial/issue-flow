@@ -18,11 +18,15 @@ from install_bundle import (
     InstallError,
     Paths,
     activate,
+    clean_git_environment,
     copy_object_database,
     create_directory_pointer,
+    ensure_real_directory,
     fetch_target,
     initialize_state,
+    is_pointer,
     materialize_bundle,
+    normalized_repository_url,
     policy_generation,
     pointer_targets,
     remove_directory_pointer,
@@ -60,6 +64,16 @@ for unsafe_path in (
         continue
     FAILURES.append(f"unsafe tree path accepted: {unsafe_path!r}")
 
+portable_prefixes: dict[str, str] = {}
+validate_tree_path("Docs/first.md", portable_prefixes)
+try:
+    validate_tree_path("docs/second.md", portable_prefixes)
+except InstallError:
+    pass
+else:
+    FAILURES.append("case-only tree prefix collision accepted")
+
+
 def check(name: str, condition: bool, result: subprocess.CompletedProcess | None = None) -> None:
     if not condition:
         FAILURES.append(name)
@@ -67,6 +81,48 @@ def check(name: str, condition: bool, result: subprocess.CompletedProcess | None
             print(result.stdout.encode("ascii", "backslashreplace").decode("ascii"))
             print(result.stderr.encode("ascii", "backslashreplace").decode("ascii"))
     print(f"{'OK  ' if condition else 'FAIL'} {name}")
+
+
+check(
+    "documented GitHub clone URL matches the canonical legacy origin",
+    normalized_repository_url("https://github.com/asanabrial/issue-flow")
+    == normalized_repository_url("https://github.com/asanabrial/issue-flow.git"),
+)
+check(
+    "credential-bearing GitHub URLs are not canonical legacy origins",
+    normalized_repository_url("https://token@github.com/asanabrial/issue-flow.git")
+    != normalized_repository_url("https://github.com/asanabrial/issue-flow.git"),
+)
+saved_ca = {name: os.environ.get(name) for name in ("SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE")}
+try:
+    for name in saved_ca:
+        os.environ[name] = "attacker-controlled-ca"
+    isolated_environment = clean_git_environment()
+    check(
+        "authoritative Git ignores caller-controlled CA overrides",
+        not set(saved_ca).intersection(isolated_environment),
+    )
+finally:
+    for name, value in saved_ca.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+with tempfile.TemporaryDirectory() as durable_directory:
+    durable_root = Path(durable_directory)
+    durable_target = durable_root / "first" / "second"
+    fsynced_parents: list[Path] = []
+    original_fsync_directory = installer.fsync_directory
+    installer.fsync_directory = fsynced_parents.append
+    try:
+        ensure_real_directory(durable_target)
+    finally:
+        installer.fsync_directory = original_fsync_directory
+    check(
+        "directory creation fsyncs every newly published parent entry",
+        fsynced_parents == [durable_root, durable_root / "first"],
+    )
 
 
 with tempfile.TemporaryDirectory() as object_test_directory:
@@ -160,6 +216,7 @@ def copy_candidate(author: Path, repository: str) -> None:
 
 
 def write_contract(repository: Path, version: str, companion: str) -> None:
+    extra_setting = "| New setting | default | default |\n" if version not in {"1.11.0", "1.12.0"} else ""
     (repository / "SKILL.md").write_text(
         "---\nname: issue-flow\nmetadata:\n"
         f"  version: \"{version}\"\n---\n\n"
@@ -169,6 +226,7 @@ def write_contract(repository: Path, version: str, companion: str) -> None:
         "| Setting | Value here | Skill default |\n"
         "|---|---|---|\n"
         "| Tracker | github | github |\n"
+        f"{extra_setting}"
         "<!-- issue-flow:config:end -->\n",
         encoding="utf-8",
     )
@@ -232,6 +290,7 @@ def clone_legacy(remote: Path, target: Path, revision: str) -> None:
     hook.write_bytes(b"#!/bin/sh\nexit 0\n")
     os.chmod(hook, 0o755)
     (target / (".cache." + "b" * 32 + ".tmp")).write_bytes(b"legitimate local temporary name\n")
+    (target / ".empty-cache").mkdir()
 
 
 def external_installer(root: Path, kind: str, repository: str) -> Path:
@@ -300,6 +359,28 @@ def invoked_powershell(kind: str, executable: str, script: Path, home: Path) -> 
         *(["-ExecutionPolicy", "Bypass"] if kind == "Windows PowerShell" else []),
         "-Command",
         f"try {{ Invoke-Expression (Get-Content -LiteralPath '{escaped}' -Raw) }} catch {{ 'caught' }}; 'after-iex'",
+    ]
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
+    return run(invocation, env=env)
+
+
+def divergent_profile_powershell(
+    kind: str,
+    executable: str,
+    script: Path,
+    home: Path,
+    wrong_profile: Path,
+) -> subprocess.CompletedProcess:
+    escaped_script = str(script).replace("'", "''")
+    escaped_profile = str(wrong_profile).replace("'", "''")
+    invocation = [
+        executable,
+        "-NoProfile",
+        *(["-ExecutionPolicy", "Bypass"] if kind == "Windows PowerShell" else []),
+        "-Command",
+        f"$env:USERPROFILE = '{escaped_profile}'; & '{escaped_script}' status",
     ]
     env = os.environ.copy()
     env["HOME"] = str(home)
@@ -406,7 +487,33 @@ for kind, executable in shells():
                 "POSIX piped bootstrap acquires and activates the isolated helper",
                 result.returncode == 0
                 and not sentinel.exists()
-                and current_revision(piped_install_home) == candidate,
+                and current_revision(piped_install_home) == candidate
+                and not list(piped_install_home.glob(".issue-flow-bootstrap-*")),
+                result,
+            )
+            hostile_path = root / "hostile path"
+            hostile_path.mkdir()
+            path_sentinel = root / "path-helper-sentinel"
+            for utility in ("cygpath", "mktemp", "mkdir", "env", "rm"):
+                script = hostile_path / utility
+                script.write_text(
+                    f"#!/bin/sh\nprintf '{utility}' >> '{path_sentinel.as_posix()}'\nexit 99\n",
+                    encoding="utf-8",
+                )
+                os.chmod(script, 0o755)
+            hostile_path_home = root / "hostile path home"
+            hostile_path_home.mkdir()
+            result = piped_posix(
+                executable,
+                external,
+                ["install"],
+                hostile_path_home,
+                hostile,
+                {"PATH": str(hostile_path) + os.pathsep + os.environ["PATH"]},
+            )
+            check(
+                "POSIX bootstrap executes only declared PATH trust roots",
+                result.returncode == 0 and not path_sentinel.exists(),
                 result,
             )
 
@@ -417,7 +524,172 @@ for kind, executable in shells():
             result.returncode == 0 and not (fresh_home / ".agents").exists(),
             result,
         )
+        empty_command_home = root / "empty command home"
+        empty_command_home.mkdir()
+        result = command(kind, executable, external, shell_args(kind, "rollback", "--dry-run"), empty_command_home)
+        check(
+            f"{kind} fresh rollback dry-run reports the missing predecessor",
+            result.returncode != 0 and "would   install" not in result.stdout,
+            result,
+        )
+        result = command(kind, executable, external, shell_args(kind, "uninstall", "--dry-run"), empty_command_home)
+        check(
+            f"{kind} fresh uninstall dry-run does not claim it would install",
+            result.returncode == 0 and "would   install" not in result.stdout,
+            result,
+        )
+        result = command(
+            kind,
+            executable,
+            external,
+            shell_args(kind, "install", "--dry-run", "--set", "Tracker=linear"),
+            empty_command_home,
+        )
+        check(
+            f"{kind} fresh dry-run still validates command-specific options",
+            result.returncode != 0 and not (empty_command_home / ".agents").exists(),
+            result,
+        )
+        result = command(
+            kind,
+            executable,
+            external,
+            shell_args(kind, "sync", "--from", ""),
+            empty_command_home,
+        )
+        check(
+            f"{kind} retired single-file sync rejects an explicitly empty source",
+            result.returncode != 0 and not (empty_command_home / ".agents").exists(),
+            result,
+        )
+        result = command(
+            kind,
+            executable,
+            external,
+            shell_args(kind, "config", "--set", ""),
+            empty_command_home,
+        )
+        check(
+            f"{kind} config rejects an explicitly empty assignment before installation",
+            result.returncode != 0 and not (empty_command_home / ".agents").exists(),
+            result,
+        )
+        for invalid_assignment in ("=linear", "Tracker=value|invalid"):
+            result = command(
+                kind,
+                executable,
+                external,
+                shell_args(kind, "config", "--set", invalid_assignment),
+                empty_command_home,
+            )
+            check(
+                f"{kind} config rejects {invalid_assignment!r} before installation",
+                result.returncode != 0 and not (empty_command_home / ".agents").exists(),
+                result,
+            )
+        result = command(
+            kind,
+            executable,
+            external,
+            shell_args(kind, "install", "--unknown-option", "--dry-run"),
+            empty_command_home,
+        )
+        check(
+            f"{kind} fresh dry-run rejects unknown options before success",
+            result.returncode != 0 and "would   install" not in result.stdout,
+            result,
+        )
+        result = command(kind, executable, external, shell_args(kind, "unknown", "--dry-run"), empty_command_home)
+        check(
+            f"{kind} fresh dry-run rejects unknown commands before success",
+            result.returncode != 0 and "would   install" not in result.stdout,
+            result,
+        )
+        if kind == "POSIX":
+            result = command(
+                kind,
+                executable,
+                external,
+                ["sync", "--fro", "payload", "--dry-run"],
+                empty_command_home,
+            )
+            check(
+                "POSIX fresh dry-run rejects abbreviated retired options",
+                result.returncode != 0 and "would   install" not in result.stdout,
+                result,
+            )
+            result = command(kind, executable, external, ["--help"], empty_command_home)
+            check(
+                "POSIX fresh help returns without bootstrap mutation",
+                result.returncode == 0 and "usage:" in result.stdout and not (empty_command_home / ".agents").exists(),
+                result,
+            )
 
+        state_only_home = root / "state-only dry-run home"
+        state_only_paths = Paths.for_home(state_only_home)
+        state_only_target = state_only_paths.legacy / "preserved" / "references"
+        state_only_target.mkdir(parents=True)
+        write_json(
+            state_only_paths.attachments,
+            {
+                "schema": 1,
+                "entries": [
+                    {
+                        "kind": "directory",
+                        "name": "references",
+                        "target": str(state_only_target),
+                    }
+                ],
+            },
+        )
+        for dry_command in ("install", "sync", "config"):
+            result = command(
+                kind,
+                executable,
+                external,
+                shell_args(kind, dry_command, "--dry-run"),
+                state_only_home,
+            )
+            check(
+                f"{kind} fresh {dry_command} dry-run validates preserved private state",
+                result.returncode != 0
+                and "would   install" not in result.stdout
+                and not state_only_paths.canonical.exists(),
+                result,
+            )
+        malformed_config_author = root / "malformed config author"
+        git(root, "clone", author.as_posix(), malformed_config_author.as_posix())
+        git(malformed_config_author, "config", "user.email", "test@example.com")
+        git(malformed_config_author, "config", "user.name", "Installer Test")
+        git(malformed_config_author, "reset", "--hard", candidate)
+        malformed_skill = malformed_config_author / "SKILL.md"
+        malformed_skill.write_text(
+            malformed_skill.read_text(encoding="utf-8").replace("<!-- issue-flow:config:start -->", ""),
+            encoding="utf-8",
+        )
+        git(malformed_config_author, "add", "SKILL.md")
+        git(malformed_config_author, "commit", "-m", "remove config boundary")
+        malformed_config = git(malformed_config_author, "rev-parse", "HEAD")
+        git(remote, "fetch", malformed_config_author.as_uri(), f"{malformed_config}:refs/heads/malformed-config")
+        git(remote, "update-ref", "refs/heads/main", malformed_config)
+        malformed_config_home = root / "malformed config dry-run home"
+        malformed_config_home.mkdir()
+        try:
+            result = command(
+                kind,
+                executable,
+                external,
+                shell_args(kind, "config", "--dry-run"),
+                malformed_config_home,
+            )
+        finally:
+            git(remote, "update-ref", "refs/heads/main", candidate)
+            git(remote, "update-ref", "-d", "refs/heads/malformed-config")
+        check(
+            f"{kind} fresh config dry-run validates fetched configuration markers",
+            result.returncode != 0 and not (malformed_config_home / ".agents").exists(),
+            result,
+        )
         fresh_install_home = root / "fresh install home"
         (fresh_install_home / ".claude").mkdir(parents=True)
         (fresh_install_home / ".codex").mkdir()
@@ -456,7 +728,8 @@ for kind, executable in shells():
                 (fresh_install_home / runtime / "skills/issue-flow").resolve(strict=True)
                 == fresh_canonical.resolve(strict=True)
                 for runtime in (".claude", ".codex")
-            ),
+            )
+            and not list(fresh_install_home.glob(".issue-flow-bootstrap-*")),
             result,
         )
         fresh_script = fresh_canonical / ("install.sh" if kind == "POSIX" else "install.ps1")
@@ -474,9 +747,14 @@ for kind, executable in shells():
             ),
             encoding="utf-8",
         )
-        result = command(kind, executable, fresh_script, shell_args(kind, "install"), fresh_install_home)
+        offline_remote = root / "remote-offline.git"
+        remote.rename(offline_remote)
+        try:
+            result = command(kind, executable, fresh_script, shell_args(kind, "install"), fresh_install_home)
+        finally:
+            offline_remote.rename(remote)
         check(
-            f"{kind} install retry recovers first activation after pointer publication",
+            f"{kind} install retry recovers first activation locally while remote is unavailable",
             result.returncode == 0
             and current_revision(fresh_install_home) == candidate
             and not (fresh_state / "transaction.json").exists(),
@@ -535,6 +813,23 @@ for kind, executable in shells():
             result.returncode == 0 and "immutable bundle" in result.stdout and "healthy" in result.stdout,
             result,
         )
+        if kind != "POSIX":
+            divergent_profile = root / f"{kind} divergent profile"
+            divergent_profile.mkdir()
+            result = divergent_profile_powershell(
+                kind,
+                executable,
+                fresh_script,
+                fresh_install_home,
+                divergent_profile,
+            )
+            check(
+                f"{kind} binds verified and mutated state to one resolved home",
+                result.returncode == 0
+                and "immutable bundle" in result.stdout
+                and not (divergent_profile / ".agents").exists(),
+                result,
+            )
         local_helper = fresh_canonical / "scripts/install_bundle.py"
         local_helper_bytes = local_helper.read_bytes()
         helper_sentinel = root / "helper-sentinel"
@@ -581,22 +876,225 @@ for kind, executable in shells():
         local_helper.write_bytes(local_helper_bytes)
         fresh_receipt.write_bytes(fresh_receipt_bytes)
         git(remote, "update-ref", "-d", "refs/heads/helper-substitution")
+        fresh_current = fresh_state / "current.json"
+        fresh_current_bytes = fresh_current.read_bytes()
+        fresh_current.unlink()
+        publish(author, new)
+        try:
+            result = command(kind, executable, fresh_script, shell_args(kind, "install"), fresh_install_home)
+        finally:
+            publish(author, candidate)
+        check(
+            f"{kind} install fails closed when active state is missing without a journal",
+            result.returncode != 0
+            and not fresh_current.exists()
+            and not (fresh_state / f"bundles/{new}").exists()
+            and run(
+                [
+                    "git",
+                    f"--git-dir={fresh_state / 'repository.git'}",
+                    "rev-parse",
+                    "--verify",
+                    f"refs/issue-flow/bundles/{new}",
+                ]
+            ).returncode
+            != 0,
+            result,
+        )
+        result = command(
+            kind,
+            executable,
+            fresh_script,
+            shell_args(kind, "config", "--set", "Tracker=linear"),
+            fresh_install_home,
+        )
+        check(
+            f"{kind} config fails closed when active state is missing without a journal",
+            result.returncode != 0 and not (fresh_state / "operator.local.md").exists(),
+            result,
+        )
+        result = command(kind, executable, fresh_script, shell_args(kind, "status"), fresh_install_home)
+        check(
+            f"{kind} status fails closed when active state is missing without a journal",
+            result.returncode != 0,
+            result,
+        )
+        fresh_current.write_bytes(fresh_current_bytes)
+        fresh_paths = Paths.for_home(fresh_install_home)
+        if kind == "PowerShell":
+            failed_activation_home = root / "failed first activation home"
+            failed_activation_paths = Paths.for_home(failed_activation_home)
+            original_activate = installer.activate
+
+            def fail_first_activation(_paths: Paths, _bundle: Path) -> None:
+                raise InstallError("injected pre-pointer activation failure")
+
+            installer.activate = fail_first_activation
+            try:
+                try:
+                    installer.sync(failed_activation_paths, False)
+                except InstallError:
+                    pass
+            finally:
+                installer.activate = original_activate
+            protected_transaction = json.loads(failed_activation_paths.transaction.read_text(encoding="utf-8"))
+            protected_target = str(protected_transaction["target"])
+            offline_remote = root / "failed-activation-remote-offline.git"
+            remote.rename(offline_remote)
+            try:
+                installer.recover(failed_activation_paths, False)
+            finally:
+                offline_remote.rename(remote)
+            check(
+                "shared installer retains a journal target after handled activation failure for offline recovery",
+                current_revision(failed_activation_home) == protected_target
+                and not failed_activation_paths.transaction.exists(),
+            )
+            config_race_home = root / "config main race home"
+            config_race_home.mkdir()
+            config_race_paths = Paths.for_home(config_race_home)
+            original_dry_run_sync = installer.dry_run_sync
+
+            def advance_main_after_config_preflight(paths: Paths, announce: bool = True) -> tuple[str, str]:
+                preflight = original_dry_run_sync(paths, announce)
+                publish(author, new)
+                return preflight
+
+            installer.dry_run_sync = advance_main_after_config_preflight
+            try:
+                try:
+                    installer.configure(config_race_paths, "Tracker=linear", False)
+                except InstallError:
+                    pass
+            finally:
+                installer.dry_run_sync = original_dry_run_sync
+                publish(author, candidate)
+            check(
+                "shared config refuses to activate main when it changes after preflight",
+                not os.path.lexists(config_race_paths.canonical),
+            )
+        publish(author, new)
+        try:
+            orphan_target = fetch_target(fresh_paths)
+            orphan_bundle = materialize_bundle(fresh_paths, orphan_target)
+        finally:
+            publish(author, candidate)
+        result = command(kind, executable, fresh_script, shell_args(kind, "status"), fresh_install_home)
+        check(
+            f"{kind} status exposes a fetched but never-activated target as pending recovery",
+            result.returncode == 0 and f"incoming={new}" in result.stdout and "unactivated=1" in result.stdout,
+            result,
+        )
+        result = command(kind, executable, fresh_script, shell_args(kind, "recover"), fresh_install_home)
+        orphan_reference = f"refs/issue-flow/bundles/{new}"
+        check(
+            f"{kind} recovery sweeps a fetched bundle and its incoming ref when activation never started",
+            result.returncode == 0
+            and not orphan_bundle.exists()
+            and run(
+                ["git", f"--git-dir={fresh_state / 'repository.git'}", "rev-parse", "--verify", orphan_reference]
+            ).returncode
+            != 0,
+            result,
+        )
+        check(
+            f"{kind} recovery removes the abandoned incoming acquisition ref",
+            run(
+                [
+                    "git",
+                    f"--git-dir={fresh_state / 'repository.git'}",
+                    "rev-parse",
+                    "--verify",
+                    "refs/issue-flow/incoming",
+                ]
+            ).returncode
+            != 0,
+            result,
+        )
+        orphan_bundle = materialize_bundle(fresh_paths, new)
+        tombstone = orphan_bundle.with_name(f".discard-{new}-" + "e" * 32)
+        replace_path(orphan_bundle, tombstone)
+        result = command(kind, executable, fresh_script, shell_args(kind, "recover"), fresh_install_home)
+        check(
+            f"{kind} recovery completes an interrupted unactivated-bundle discard",
+            result.returncode == 0
+            and not tombstone.exists()
+            and run(
+                ["git", f"--git-dir={fresh_state / 'repository.git'}", "rev-parse", "--verify", orphan_reference]
+            ).returncode
+            != 0,
+            result,
+        )
+        fresh_attachments = fresh_state / "attachments.json"
+        fresh_attachments.write_bytes(b"not json")
         result = command(kind, executable, fresh_script, shell_args(kind, "uninstall"), fresh_install_home)
         check(
-            f"{kind} uninstall removes only runtime links",
+            f"{kind} uninstall removes runtime links despite corrupt attachment metadata",
             result.returncode == 0
             and fresh_canonical.exists()
             and not (fresh_install_home / ".claude/skills/issue-flow").exists()
             and not (fresh_install_home / ".codex/skills/issue-flow").exists(),
             result,
         )
+        fresh_attachments.unlink()
 
         blocked_home = root / "stale runtime home"
         (blocked_home / ".claude/skills/issue-flow").mkdir(parents=True)
+        for dry_command in ("install", "sync", "config"):
+            result = command(kind, executable, external, shell_args(kind, dry_command, "--dry-run"), blocked_home)
+            check(
+                f"{kind} fresh {dry_command} dry-run refuses an independent runtime copy",
+                result.returncode != 0
+                and "would   install" not in result.stdout
+                and not (blocked_home / ".agents").exists(),
+                result,
+            )
         result = command(kind, executable, external, shell_args(kind, "install"), blocked_home)
         check(
             f"{kind} refuses an independent runtime copy before canonical installation",
             result.returncode != 0 and not (blocked_home / ".agents").exists(),
+            result,
+        )
+        linked_runtime_home = root / "linked runtime parent home"
+        linked_runtime_home.mkdir()
+        external_runtime_root = root / "external runtime root"
+        external_runtime_root.mkdir()
+        create_directory_pointer(linked_runtime_home / ".claude", external_runtime_root)
+        result = command(kind, executable, external, shell_args(kind, "install"), linked_runtime_home)
+        check(
+            f"{kind} refuses a linked runtime ancestor before writing outside home",
+            result.returncode != 0
+            and not (linked_runtime_home / ".agents").exists()
+            and not (external_runtime_root / "skills/issue-flow").exists(),
+            result,
+        )
+        remove_directory_pointer(linked_runtime_home / ".claude")
+        linked_state_home = root / "linked state parent home"
+        linked_state_home.mkdir()
+        external_state_root = root / "external state root"
+        external_state_root.mkdir()
+        create_directory_pointer(linked_state_home / ".agents", external_state_root)
+        result = command(kind, executable, external, shell_args(kind, "install"), linked_state_home)
+        check(
+            f"{kind} refuses a linked installer-state ancestor before external mutation",
+            result.returncode != 0 and not (external_state_root / "skills/.issue-flow").exists(),
+            result,
+        )
+        remove_directory_pointer(linked_state_home / ".agents")
+        lock_only_home = root / "lock-only home"
+        lock_only_paths = Paths.for_home(lock_only_home)
+        lock_only_paths.skills.mkdir(parents=True)
+        with InstallerLock(lock_only_paths):
+            blocked_install = command(kind, executable, external, shell_args(kind, "install"), lock_only_home)
+            result = command(kind, executable, external, shell_args(kind, "uninstall"), lock_only_home)
+        check(
+            f"{kind} first install acquires the stable lock before creating private state",
+            blocked_install.returncode != 0 and not lock_only_paths.state.exists(),
+            blocked_install,
+        )
+        check(
+            f"{kind} first uninstall shares the stable operating-system lock with first install",
+            result.returncode != 0 and not lock_only_paths.state.exists(),
             result,
         )
         if kind != "POSIX":
@@ -634,6 +1132,51 @@ for kind, executable in shells():
             result,
         )
 
+        nested_legacy_home = root / "nested empty legacy home"
+        nested_legacy = nested_legacy_home / ".agents/skills/issue-flow"
+        clone_legacy(remote, nested_legacy, legacy)
+        nested_empty = nested_legacy / "references/.empty-local-state"
+        nested_empty.mkdir()
+        result = command(kind, executable, external, shell_args(kind, "install"), nested_legacy_home)
+        check(
+            f"{kind} legacy migration refuses an untracked empty directory nested in tracked state",
+            result.returncode != 0
+            and nested_empty.exists()
+            and (nested_legacy / ".git").exists(),
+            result,
+        )
+        if os.name == "nt":
+            nested_pointer_home = root / "nested pointer legacy home"
+            nested_pointer_legacy = nested_pointer_home / ".agents/skills/issue-flow"
+            clone_legacy(remote, nested_pointer_legacy, legacy)
+            nested_pointer_target = root / "nested pointer target"
+            nested_pointer_target.mkdir()
+            nested_pointer = nested_pointer_legacy / "references/.empty-local-pointer"
+            create_directory_pointer(nested_pointer, nested_pointer_target)
+            result = command(kind, executable, external, shell_args(kind, "install"), nested_pointer_home)
+            check(
+                f"{kind} legacy migration refuses an empty junction nested in tracked state",
+                result.returncode != 0
+                and is_pointer(nested_pointer)
+                and (nested_pointer_legacy / ".git").exists(),
+                result,
+            )
+            readonly_legacy_home = root / "readonly local legacy home"
+            readonly_legacy = readonly_legacy_home / ".agents/skills/issue-flow"
+            clone_legacy(remote, readonly_legacy, legacy)
+            readonly_local = readonly_legacy / "readonly.local"
+            readonly_local.write_bytes(b"operator state")
+            os.chmod(readonly_local, stat.S_IRUSR)
+            result = command(kind, executable, external, shell_args(kind, "install"), readonly_legacy_home)
+            check(
+                f"{kind} legacy migration rejects read-only local files before attachment publication",
+                result.returncode != 0
+                and readonly_local.read_bytes() == b"operator state"
+                and (readonly_legacy / ".git").exists(),
+                result,
+            )
+            os.chmod(readonly_local, stat.S_IRUSR | stat.S_IWUSR)
+
         legacy_recovery_home = root / "legacy recovery home"
         legacy_recovery = legacy_recovery_home / ".agents/skills/issue-flow"
         clone_legacy(remote, legacy_recovery, legacy)
@@ -659,12 +1202,31 @@ for kind, executable in shells():
         )
         replace_path(legacy_recovery, recovery_backup)
         recovery_script = recovery_bundle / ("install.sh" if kind == "POSIX" else "install.ps1")
-        result = command(kind, executable, recovery_script, shell_args(kind, "install"), legacy_recovery_home)
+        offline_remote = root / "legacy-recovery-remote-offline.git"
+        remote.rename(offline_remote)
+        try:
+            recovery_result = command(kind, executable, recovery_script, shell_args(kind, "recover"), legacy_recovery_home)
+        finally:
+            offline_remote.rename(remote)
         check(
-            f"{kind} install retry restores and resumes an interrupted legacy migration",
+            f"{kind} retained transaction endpoint restores legacy migration while remote is unavailable",
+            recovery_result.returncode == 0
+            and (legacy_recovery / ".git").exists()
+            and not recovery_paths.transaction.exists()
+            and not (recovery_paths.bundles / candidate).exists(),
+            recovery_result,
+        )
+        publish(author, new)
+        try:
+            result = command(kind, executable, external, shell_args(kind, "install"), legacy_recovery_home)
+        finally:
+            publish(author, candidate)
+        check(
+            f"{kind} install after local recovery migrates the restored clone to the newer target",
             result.returncode == 0
-            and current_revision(legacy_recovery_home) == candidate
-            and not recovery_paths.transaction.exists(),
+            and current_revision(legacy_recovery_home) == new
+            and not recovery_paths.transaction.exists()
+            and not (recovery_paths.bundles / candidate).exists(),
             result,
         )
 
@@ -696,7 +1258,63 @@ for kind, executable in shells():
             == stat.S_IMODE((home / ".agents/skills/.issue-flow/local/custom-hook.sh").stat().st_mode)
             and (os.name == "nt" or stat.S_IMODE((installed / "custom-hook.sh").stat().st_mode) == 0o755)
             and (installed / (".cache." + "b" * 32 + ".tmp")).read_bytes()
-            == b"legitimate local temporary name\n",
+            == b"legitimate local temporary name\n"
+            and is_pointer(installed / ".empty-cache")
+            and not any((installed / ".empty-cache").iterdir()),
+            result,
+        )
+        collision_author = root / "collision author"
+        git(root, "clone", author.as_posix(), collision_author.as_posix())
+        git(collision_author, "config", "user.email", "test@example.com")
+        git(collision_author, "config", "user.name", "Installer Test")
+        git(collision_author, "reset", "--hard", candidate)
+        (collision_author / ".empty-cache").mkdir()
+        (collision_author / ".empty-cache/tracked.txt").write_text("tracked collision\n", encoding="utf-8")
+        git(collision_author, "add", "-f", ".empty-cache/tracked.txt")
+        git(collision_author, "commit", "-m", "collide with preserved local state")
+        collision = git(collision_author, "rev-parse", "HEAD")
+        git(remote, "fetch", collision_author.as_uri(), f"{collision}:refs/heads/collision")
+        git(remote, "update-ref", "refs/heads/main", collision)
+        try:
+            dry_collision = command(
+                kind,
+                executable,
+                installed / ("install.sh" if kind == "POSIX" else "install.ps1"),
+                shell_args(kind, "sync", "--dry-run"),
+                home,
+            )
+            result = command(
+                kind,
+                executable,
+                installed / ("install.sh" if kind == "POSIX" else "install.ps1"),
+                shell_args(kind, "sync"),
+                home,
+            )
+        finally:
+            git(remote, "update-ref", "refs/heads/main", candidate)
+            git(remote, "update-ref", "-d", "refs/heads/collision")
+        check(
+            f"{kind} sync dry-run rejects a target collision with real preserved attachments",
+            dry_collision.returncode != 0
+            and current_revision(home) == candidate
+            and not (home / f".agents/skills/.issue-flow/bundles/{collision}").exists(),
+            dry_collision,
+        )
+        check(
+            f"{kind} rejects a target tree that collides with preserved local state before publication",
+            result.returncode != 0
+            and current_revision(home) == candidate
+            and not (home / f".agents/skills/.issue-flow/bundles/{collision}").exists()
+            and run(
+                [
+                    "git",
+                    f"--git-dir={home / '.agents/skills/.issue-flow/repository.git'}",
+                    "rev-parse",
+                    "--verify",
+                    f"refs/issue-flow/bundles/{collision}",
+                ]
+            ).returncode
+            != 0,
             result,
         )
         result = command(
@@ -858,6 +1476,31 @@ for kind, executable in shells():
             result.returncode != 0 and current_revision(home) == candidate,
             result,
         )
+        policy_before_runtime_failure = fixture_paths.config.read_bytes()
+        result = command(
+            kind,
+            executable,
+            installed / ("install.sh" if kind == "POSIX" else "install.ps1"),
+            shell_args(kind, "config", "--set", "Tracker=github", "--dry-run"),
+            home,
+        )
+        check(
+            f"{kind} config dry-run refuses a runtime pointer that bypasses canonical",
+            result.returncode != 0 and fixture_paths.config.read_bytes() == policy_before_runtime_failure,
+            result,
+        )
+        result = command(
+            kind,
+            executable,
+            installed / ("install.sh" if kind == "POSIX" else "install.ps1"),
+            shell_args(kind, "config", "--set", "Tracker=github"),
+            home,
+        )
+        check(
+            f"{kind} config mutation refuses a runtime pointer that bypasses canonical",
+            result.returncode != 0 and fixture_paths.config.read_bytes() == policy_before_runtime_failure,
+            result,
+        )
         remove_directory_pointer(direct_runtime)
         create_directory_pointer(direct_runtime, installed)
 
@@ -881,6 +1524,23 @@ for kind, executable in shells():
                 for runtime in (".claude", ".codex")
             ),
         )
+        previous_policy = configured_policy
+        result = command(
+            kind,
+            executable,
+            active_script,
+            shell_args(kind, "config", "--set", "New setting=custom"),
+            home,
+        )
+        configured_policy = (installed / "operator.local.md").read_bytes()
+        previous_tracker_row = next(line for line in previous_policy.splitlines() if line.startswith(b"| Tracker |"))
+        check(
+            f"{kind} config merges a newly shipped setting while preserving existing values",
+            result.returncode == 0
+            and b"| New setting | custom | default |" in configured_policy
+            and previous_tracker_row in configured_policy.splitlines(),
+            result,
+        )
 
         hostile_git_config = root / "hostile-git-config"
         hostile_git_config.write_text(
@@ -900,6 +1560,45 @@ for kind, executable in shells():
             result.returncode == 0 and current_revision(home) == new,
             result,
         )
+        git_trace = root / "hostile-git-trace"
+        git_trace2 = root / "hostile-git-trace2"
+        result = command(
+            kind,
+            executable,
+            active_script,
+            shell_args(kind, "status"),
+            home,
+            {"GIT_TRACE": str(git_trace), "GIT_TRACE2_EVENT": str(git_trace2)},
+        )
+        check(
+            f"{kind} sanitizes Git tracing before its first version probe",
+            result.returncode == 0 and not git_trace.exists() and not git_trace2.exists(),
+            result,
+        )
+        git_reselection_sentinel = root / "git-reselection-sentinel"
+        planted_git_cmd = fixture_paths.skills / "git.cmd"
+        planted_git_cmd.write_text(f'@echo attacked > "{git_reselection_sentinel}"\n', encoding="utf-8")
+        planted_git_shell = fixture_paths.skills / "git"
+        planted_git_shell.write_text(
+            f"#!/bin/sh\nprintf attacked > '{git_reselection_sentinel.as_posix()}'\n",
+            encoding="utf-8",
+        )
+        os.chmod(planted_git_shell, 0o755)
+        result = command(
+            kind,
+            executable,
+            active_script,
+            shell_args(kind, "status"),
+            home,
+            {"PATH": "." + os.pathsep + os.environ["PATH"]},
+        )
+        check(
+            f"{kind} helper keeps the wrapper-selected Git after changing directory",
+            result.returncode == 0 and not git_reselection_sentinel.exists(),
+            result,
+        )
+        planted_git_cmd.unlink()
+        planted_git_shell.unlink()
 
         state_root = home / ".agents/skills/.issue-flow"
         state_before_dry_rollback = (state_root / "current.json").read_bytes()
@@ -928,6 +1627,34 @@ for kind, executable in shells():
         unactivated = git(author, "rev-parse", "HEAD")
         publish(author, unactivated)
         object_store = state_root / "repository.git"
+        symbolic_probe = "refs/issue-flow/symbolic-probe"
+        git(
+            state_root,
+            f"--git-dir={object_store}",
+            "symbolic-ref",
+            symbolic_probe,
+            f"refs/issue-flow/activated/{new}",
+        )
+        try:
+            installer.validate_repository_config(object_store)
+        except InstallError:
+            shared_symbolic_rejected = True
+        else:
+            shared_symbolic_rejected = False
+        result = command(kind, executable, active_script, shell_args(kind, "status"), home)
+        check(
+            f"{kind} wrapper and shared installer reject symbolic authority refs",
+            shared_symbolic_rejected and result.returncode != 0 and current_revision(home) == new,
+            result,
+        )
+        git(
+            state_root,
+            f"--git-dir={object_store}",
+            "update-ref",
+            "--no-deref",
+            "-d",
+            symbolic_probe,
+        )
         git(
             state_root,
             f"--git-dir={object_store}",
@@ -1007,6 +1734,26 @@ for kind, executable in shells():
             "-d",
             f"refs/issue-flow/bundles/{legacy}",
         )
+
+        state_before_missing_canonical = (state_root / "current.json").read_bytes()
+        remove_directory_pointer(fixture_paths.canonical)
+        result = command(kind, executable, retained_script, shell_args(kind, "recover"), home)
+        check(
+            f"{kind} recovery refuses lost canonical provenance without a journal",
+            result.returncode != 0
+            and not os.path.lexists(fixture_paths.canonical)
+            and (state_root / "current.json").read_bytes() == state_before_missing_canonical,
+            result,
+        )
+        result = command(kind, executable, retained_script, shell_args(kind, "sync"), home)
+        check(
+            f"{kind} sync refuses to replace lost canonical provenance as a fresh install",
+            result.returncode != 0
+            and not os.path.lexists(fixture_paths.canonical)
+            and (state_root / "current.json").read_bytes() == state_before_missing_canonical,
+            result,
+        )
+        create_directory_pointer(fixture_paths.canonical, state_root / "bundles" / new)
 
         remove_directory_pointer(fixture_paths.canonical)
         result = command(kind, executable, retained_script, shell_args(kind, "uninstall", "--dry-run"), home)
@@ -1260,11 +2007,92 @@ for kind, executable in shells():
             result.returncode == 0 and "corrupt=1" in result.stdout,
             result,
         )
+        result = command(
+            kind,
+            executable,
+            active_script,
+            shell_args(kind, "config", "--set", "Tracker=github", "--dry-run"),
+            home,
+        )
+        check(
+            f"{kind} config dry-run rejects a corrupt retained policy destination",
+            result.returncode != 0,
+            result,
+        )
         inactive_policy.rmdir()
         replace_hardlink(inactive_policy, fixture_paths.config)
 
-        lock_path = home / ".agents/skills/.issue-flow/sync.lock"
-        state_root = lock_path.parent
+        attachments_bytes = fixture_paths.attachments.read_bytes()
+        fixture_paths.attachments.write_bytes(b"not json")
+        result = command(kind, executable, active_script, shell_args(kind, "status"), home)
+        check(
+            f"{kind} status reports storage before failing on corrupt attachment metadata",
+            result.returncode != 0 and "store" in result.stdout and "Traceback" not in result.stderr,
+            result,
+        )
+        fixture_paths.attachments.write_bytes(attachments_bytes)
+
+        shaped_id = "f" * 32
+        unowned_activation_file = fixture_paths.skills / f".issue-flow.activate-{shaped_id}"
+        unowned_activation_file.write_bytes(b"operator data")
+        result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
+        check(
+            f"{kind} cleanup refuses an installer-shaped regular file it does not own",
+            result.returncode != 0 and unowned_activation_file.read_bytes() == b"operator data",
+            result,
+        )
+        unowned_activation_file.unlink()
+        unowned_runtime_directory = home / f".claude/skills/.issue-flow.runtime-{shaped_id}"
+        unowned_runtime_directory.mkdir()
+        (unowned_runtime_directory / "operator-data").write_bytes(b"keep")
+        result = command(kind, executable, active_script, shell_args(kind, "uninstall"), home)
+        check(
+            f"{kind} uninstall refuses a non-empty installer-shaped directory it does not own",
+            result.returncode != 0 and (unowned_runtime_directory / "operator-data").read_bytes() == b"keep",
+            result,
+        )
+        (unowned_runtime_directory / "operator-data").unlink()
+        unowned_runtime_directory.rmdir()
+        foreign_activation_target = root / "foreign activation target"
+        foreign_activation_target.mkdir()
+        foreign_activation_pointer = fixture_paths.skills / f".issue-flow.activate-{shaped_id}"
+        create_directory_pointer(foreign_activation_pointer, foreign_activation_target)
+        result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
+        check(
+            f"{kind} cleanup refuses an installer-shaped pointer to foreign state",
+            result.returncode != 0 and is_pointer(foreign_activation_pointer),
+            result,
+        )
+        remove_directory_pointer(foreign_activation_pointer)
+        claude_root = home / ".claude"
+        saved_claude_root = home / ".claude-safe"
+        owned_runtime = claude_root / "skills/issue-flow"
+        remove_directory_pointer(owned_runtime)
+        claude_root.rename(saved_claude_root)
+        external_linked_runtime = root / "external linked runtime"
+        (external_linked_runtime / "skills").mkdir(parents=True)
+        external_runtime_temporary = external_linked_runtime / f"skills/.issue-flow.runtime-{shaped_id}"
+        create_directory_pointer(external_runtime_temporary, fixture_paths.canonical)
+        create_directory_pointer(claude_root, external_linked_runtime)
+        recover_result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
+        uninstall_result = command(kind, executable, active_script, shell_args(kind, "uninstall"), home)
+        check(
+            f"{kind} recovery validates linked runtime ancestors before external cleanup",
+            recover_result.returncode != 0 and is_pointer(external_runtime_temporary),
+            recover_result,
+        )
+        check(
+            f"{kind} uninstall validates linked runtime ancestors before external cleanup",
+            uninstall_result.returncode != 0 and is_pointer(external_runtime_temporary),
+            uninstall_result,
+        )
+        remove_directory_pointer(claude_root)
+        remove_directory_pointer(external_runtime_temporary)
+        saved_claude_root.rename(claude_root)
+        create_directory_pointer(owned_runtime, fixture_paths.canonical)
+
+        lock_path = fixture_paths.lock
+        state_root = fixture_paths.state
         lock_path.unlink()
         lock_victim = root / "lock-victim"
         lock_victim.write_bytes(b"must-survive")
@@ -1326,6 +2154,14 @@ for kind, executable in shells():
         abandoned_policy.write_bytes(b"partial")
         abandoned_object = object_store / "objects/pack" / f".object.{temporary_id}.tmp"
         abandoned_object.write_bytes(b"partial")
+        abandoned_ref_locks = [
+            object_store / "refs/issue-flow/incoming.lock",
+            object_store / f"refs/issue-flow/bundles/{new}.lock",
+            object_store / f"refs/issue-flow/activated/{new}.lock",
+        ]
+        for ref_lock in abandoned_ref_locks:
+            ref_lock.parent.mkdir(parents=True, exist_ok=True)
+            ref_lock.write_bytes(b"partial ref update")
         result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
         check(
             f"{kind} recovers a post-switch receipt write after lock release",
@@ -1337,6 +2173,7 @@ for kind, executable in shells():
             and not abandoned_bundle_link.exists()
             and not abandoned_policy.exists()
             and not abandoned_object.exists()
+            and not any(ref_lock.exists() for ref_lock in abandoned_ref_locks)
             and current_revision(home) == new
             and json.loads((state_root / "current.json").read_text(encoding="utf-8"))["previous"] == candidate,
             result,
@@ -1421,6 +2258,30 @@ for kind, executable in shells():
             result,
         )
         repository_config.write_bytes(safe_config)
+
+        common_directory = object_store / "commondir"
+        common_directory.write_text("../external-common\n", encoding="utf-8")
+        result = command(kind, executable, active_script, shell_args(kind, "status"), home)
+        check(
+            f"{kind} rejects a bare repository common-directory redirect",
+            result.returncode != 0 and current_revision(home) == new,
+            result,
+        )
+        common_directory.unlink()
+        repository_refs = object_store / "refs"
+        safe_repository_refs = object_store / "refs-safe"
+        external_repository_refs = root / "external repository refs"
+        external_repository_refs.mkdir()
+        repository_refs.rename(safe_repository_refs)
+        create_directory_pointer(repository_refs, external_repository_refs)
+        result = command(kind, executable, active_script, shell_args(kind, "status"), home)
+        check(
+            f"{kind} rejects linked bare-repository refs",
+            result.returncode != 0 and current_revision(home) == new,
+            result,
+        )
+        remove_directory_pointer(repository_refs)
+        safe_repository_refs.rename(repository_refs)
 
         git(state_root, f"--git-dir={object_store}", "replace", new, candidate)
         result = command(kind, executable, active_script, shell_args(kind, "sync"), home)
