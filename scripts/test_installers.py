@@ -529,7 +529,10 @@ def secondary_shell_smoke(
         result, sentinel = outer_script_powershell(kind, executable, external, iex_home, root)
         check(
             "Windows PowerShell smoke executes through IEX and returns control",
-            result.returncode == 0 and "after-outer-iex" in result.stdout and not sentinel.exists(),
+            result.returncode == 0
+            and "after-outer-iex" in result.stdout
+            and not sentinel.exists()
+            and current_revision(iex_home) == candidate,
             result,
         )
 
@@ -1551,10 +1554,9 @@ for kind, executable in shells():
             initialize_state(concurrent_paths)
             concurrent_target = fetch_target(concurrent_paths)
             concurrent_entries = tree_entries(concurrent_paths, concurrent_target)
-            concurrent_policy = LOCAL_POLICY.replace(b"| Tracker | github |", b"| Tracker | linear |")
             policy_generation(concurrent_paths, LOCAL_POLICY)
             installer.write_bytes_atomic(concurrent_paths.config, LOCAL_POLICY)
-            (concurrent_policy_legacy / "operator.local.md").write_bytes(concurrent_policy)
+            (concurrent_policy_legacy / "operator.local.md").unlink()
             migration_error: Exception | None = None
             try:
                 installer.migrate_legacy(concurrent_paths, concurrent_target, concurrent_entries)
@@ -1563,10 +1565,10 @@ for kind, executable in shells():
             if migration_error is None:
                 installer.finish_target(concurrent_paths, concurrent_target, keep=True)
             check(
-                "shared migration retry adopts policy changed after provisional state",
+                "shared migration retry removes provisional policy after legacy returns to defaults",
                 migration_error is None
-                and concurrent_paths.config.read_bytes() == concurrent_policy
-                and (concurrent_paths.canonical / "operator.local.md").read_bytes() == concurrent_policy,
+                and not concurrent_paths.config.exists()
+                and not (concurrent_paths.canonical / "operator.local.md").exists(),
             )
 
         clone_legacy(remote, installed, legacy)

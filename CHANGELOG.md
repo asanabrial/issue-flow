@@ -61,6 +61,8 @@ All notable changes to Issue Flow are documented here.
 - Apply raw direct-commit activation provenance in installed wrappers, validate both activation
   endpoints during recovery dry-run, reject linked `skills` ancestors before fresh dry-run success,
   and recognize verified file-attachment hard-link temporaries with the same dry/live behavior.
+- Remove provisional migration policy when a restored v1.11 checkout returns to portable defaults;
+  legacy post-switch dry recovery no longer requires an intentionally absent immutable predecessor.
 
 ## [1.11.0] - 2026-07-28
 

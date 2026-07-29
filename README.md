@@ -132,6 +132,8 @@ An existing v1.11 installation upgrades by rerunning the current one-line bootst
 using v1.11's retired single-file `sync --from` command. Migration rejects included, worktree-scoped,
 promisor and partial-clone Git authority before reading objects, and adopts a v1.11 policy write that
 wins before the legacy clone move or after provisional policy state from an interrupted attempt.
+If that restored checkout instead removes its policy and returns to portable defaults, retry removes
+the provisional generation rather than resurrecting it.
 Stop all v1.11 installer commands before migration: v1.11 has no operating-system lock, so an already
 paused process cannot participate in v1.12 serialization after the public path changes layout.
 

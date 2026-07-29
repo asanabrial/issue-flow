@@ -1538,6 +1538,24 @@ def switch_policy(paths: Paths, content: bytes, edited_destination: Path | None 
     fsync_directory(paths.policies)
 
 
+def clear_provisional_policy(paths: Paths) -> None:
+    generation = current_policy_generation(paths)
+    if generation is None:
+        return
+    for destination in policy_destinations(paths):
+        if not path_exists(destination):
+            continue
+        if not is_regular_hardlink(destination, generation):
+            fail(f"provisional bundle policy is outside stable state: {destination}")
+        destination.unlink()
+        fsync_directory(destination.parent)
+    remove_state_file(paths.config)
+    for candidate in paths.policies.iterdir():
+        if candidate.is_file() and candidate.stat().st_nlink == 1:
+            candidate.unlink()
+    fsync_directory(paths.policies)
+
+
 def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> set[Path]:
     if not paths.policy_transaction.exists():
         return stable_policy_temporaries(paths)
@@ -2317,6 +2335,10 @@ def migrate_legacy(paths: Paths, target: str, target_entries: list[dict[str, str
         if not paths.config.exists():
             policy_generation(paths, config)
             write_bytes_atomic(paths.config, config, mode=stat.S_IRUSR | stat.S_IWUSR)
+    elif paths.config.exists():
+        if paths.current.exists() or paths.transaction.exists():
+            fail("stable operator policy exists while the legacy checkout uses portable defaults")
+        clear_provisional_policy(paths)
     backup = paths.legacy / f"{current}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
     prepare_legacy_local_state(
         paths,
@@ -2402,7 +2424,7 @@ def recover_transaction(
                 activated = direct_ref_target(paths, activation_ref(target))
                 if activated is not None and activated != target:
                     fail(f"activation ref for {target} resolves to conflicting commit {activated}")
-                if previous is not None and direct_ref_target(paths, activation_ref(previous)) != previous:
+                if backup is None and previous is not None and direct_ref_target(paths, activation_ref(previous)) != previous:
                     fail(f"previous activation ref is missing or conflicting: {previous}")
             else:
                 mark_activated(paths, target)
