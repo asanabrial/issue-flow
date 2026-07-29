@@ -25,6 +25,7 @@ find_git() {
 }
 
 LOCAL_VERIFIER='import configparser
+import ctypes
 import json
 import os
 import re
@@ -35,8 +36,15 @@ mode, helper, receipt_path, repository, current_path, transaction_path, git = sy
 installer_arguments = sys.argv[8:]
 
 def is_pointer(path):
-    junction = getattr(os.path, "isjunction", lambda _path: False)
-    return os.path.islink(path) or junction(path)
+    junction = getattr(os.path, "isjunction", None)
+    if junction and junction(path):
+        return True
+    if os.path.islink(path):
+        return True
+    if os.name != "nt" or not os.path.lexists(path):
+        return False
+    attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    return attributes != 0xFFFFFFFF and bool(attributes & 0x400)
 
 def validate_repository(path):
     if is_pointer(path) or not os.path.isdir(path) or os.path.lexists(os.path.join(path, "commondir")):
@@ -107,7 +115,7 @@ try:
             "--no-replace-objects",
             f"--git-dir={repository}",
             "-c", f"core.hooksPath={os.devnull}",
-            "rev-parse", "--verify", f"refs/issue-flow/activated/{commit}^{{commit}}",
+            "show-ref", "--verify", "--hash", f"refs/issue-flow/activated/{commit}",
         ], env=environment, text=True).strip()
         normal_identity = current.get("current") == commit and activated == commit
     except (OSError, subprocess.SubprocessError, ValueError):
@@ -231,8 +239,31 @@ DEST="$HOME/.agents/skills/issue-flow"
 STATE="$HOME/.agents/skills/.issue-flow"
 CLAUDE_DEST="$HOME/.claude/skills/issue-flow"
 CODEX_DEST="$HOME/.codex/skills/issue-flow"
+if "$PYTHON" -X utf8 -I - "$HOME" <<'PY'
+import ctypes
+import os
+import sys
+
+home = sys.argv[1]
+checker = getattr(os.path, "isjunction", None)
+for relative in (".agents", ".agents/skills", ".claude", ".claude/skills", ".codex", ".codex/skills"):
+    path = os.path.join(home, relative)
+    if not os.path.lexists(path):
+        continue
+    junction = bool(checker(path)) if checker else (
+        os.name == "nt"
+        and (attributes := ctypes.windll.kernel32.GetFileAttributesW(str(path))) != 0xFFFFFFFF
+        and bool(attributes & 0x400)
+    )
+    if os.path.islink(path) or junction or not os.path.isdir(path):
+        raise SystemExit(1)
+PY
+then FRESH_ANCESTORS_SAFE=1
+else FRESH_ANCESTORS_SAFE=0
+fi
 case $FRESH_COMMAND in install|sync) FRESH_DRY_INSTALL=1 ;; *) FRESH_DRY_INSTALL=0 ;; esac
 if [ "$FRESH_DRY" -eq 1 ] && [ "$FRESH_DRY_INSTALL" -eq 1 ] && [ "$FRESH_SET" -eq 0 ] \
+    && [ "$FRESH_ANCESTORS_SAFE" -eq 1 ] \
     && [ ! -e "$DEST" ] && [ ! -L "$DEST" ] \
     && [ ! -e "$STATE" ] && [ ! -L "$STATE" ] \
     && { [ ! -e "$HOME/.claude" ] || { [ -d "$HOME/.claude" ] && [ ! -L "$HOME/.claude" ]; }; } \

@@ -56,6 +56,7 @@ function Invoke-VerifiedLocalHelper {
     param([string]$Path, [string]$Receipt, [string]$Repository, [string]$Current, [string]$Transaction, [string]$Git, [hashtable]$Python, [string]$HomePath, [string[]]$InstallerArguments)
     $code = @'
 import configparser
+import ctypes
 import json
 import os
 import re
@@ -66,8 +67,15 @@ helper, receipt_path, repository, current_path, transaction_path, git = sys.argv
 installer_arguments = sys.argv[7:]
 
 def is_pointer(path):
-    junction = getattr(os.path, "isjunction", lambda _path: False)
-    return os.path.islink(path) or junction(path)
+    junction = getattr(os.path, "isjunction", None)
+    if junction and junction(path):
+        return True
+    if os.path.islink(path):
+        return True
+    if os.name != "nt" or not os.path.lexists(path):
+        return False
+    attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    return attributes != 0xFFFFFFFF and bool(attributes & 0x400)
 
 def validate_repository(path):
     if is_pointer(path) or not os.path.isdir(path) or os.path.lexists(os.path.join(path, "commondir")):
@@ -142,7 +150,7 @@ try:
             "--no-replace-objects",
             f"--git-dir={repository}",
             "-c", f"core.hooksPath={os.devnull}",
-            "rev-parse", "--verify", f"refs/issue-flow/activated/{commit}^{{commit}}",
+            "show-ref", "--verify", "--hash", f"refs/issue-flow/activated/{commit}",
         ], env=environment, text=True).strip()
         normal_identity = current.get("current") == commit and activated == commit
     except (OSError, subprocess.SubprocessError, ValueError):
@@ -233,8 +241,12 @@ $runtimePresent = @(
     Join-Path $resolvedHome '.codex\skills\issue-flow'
 ) | Where-Object { $null -ne (Get-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue) }
 $runtimeRootUnsafe = @(
+    Join-Path $resolvedHome '.agents'
+    Join-Path $resolvedHome '.agents\skills'
     Join-Path $resolvedHome '.claude'
+    Join-Path $resolvedHome '.claude\skills'
     Join-Path $resolvedHome '.codex'
+    Join-Path $resolvedHome '.codex\skills'
 ) | ForEach-Object { Get-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue } |
     Where-Object { -not $_.PSIsContainer -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) }
 if ($DryRun -and -not $setSpecified -and -not $fromSpecified -and $Command -in @('install', 'sync') -and -not $destinationPresent -and -not $statePresent -and -not $runtimePresent -and -not $runtimeRootUnsafe) {

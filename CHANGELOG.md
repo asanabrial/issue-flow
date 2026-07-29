@@ -58,6 +58,9 @@ All notable changes to Issue Flow are documented here.
 - Refuse Windows quarantine junctions, create installer directories as private `0700` even under
   `umask 000`, validate legacy authority before dry-run object reads, and make dry recovery probe the
   real POSIX lock while accepting only verified stable-policy hard-link temporaries.
+- Apply raw direct-commit activation provenance in installed wrappers, validate both activation
+  endpoints during recovery dry-run, reject linked `skills` ancestors before fresh dry-run success,
+  and recognize verified file-attachment hard-link temporaries with the same dry/live behavior.
 
 ## [1.11.0] - 2026-07-28
 

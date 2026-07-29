@@ -1411,6 +1411,37 @@ def stable_policy_temporaries(paths: Paths) -> set[Path]:
     return temporaries
 
 
+def attachment_link_temporaries(paths: Paths) -> set[Path]:
+    authorized: set[Path] = set()
+    if not paths.bundles.is_dir() or is_pointer(paths.bundles):
+        return authorized
+    bundles = [
+        bundle
+        for bundle in paths.bundles.iterdir()
+        if bundle.is_dir() and not is_pointer(bundle) and not bundle.name.startswith(".staging-")
+    ]
+    for record in attachment_records(paths):
+        if record["kind"] != "file":
+            continue
+        target = Path(record["target"])
+        expected_links = 1
+        temporaries: set[Path] = set()
+        for bundle in bundles:
+            destination = bundle / record["name"]
+            if is_regular_hardlink(destination, target):
+                expected_links += 1
+            pattern = f".{record['name']}." + "?" * 32 + ".tmp"
+            temporaries.update(
+                candidate for candidate in bundle.glob(pattern) if is_regular_hardlink(candidate, target)
+            )
+        if temporaries:
+            details = os.lstat(target)
+            if not stat.S_ISREG(details.st_mode) or details.st_nlink != expected_links + len(temporaries):
+                fail(f"stable attachment has an invalid replacement temporary: {target}")
+            authorized.update(temporaries)
+    return authorized
+
+
 def complete_policy_switch(paths: Paths, generation: Path) -> None:
     for destination in policy_destinations(paths):
         if is_regular_hardlink(destination, generation):
@@ -1742,7 +1773,7 @@ def cleanup_abandoned(paths: Paths) -> None:
 def validate_abandoned_paths(
     paths: Paths,
     candidates: list[Path],
-    policy_temporaries: frozenset[Path] = frozenset(),
+    hardlink_temporaries: frozenset[Path] = frozenset(),
 ) -> None:
     git_locks = set(git_ref_locks(paths))
     runtime_parents = {runtime.parent for runtime in runtime_paths(paths)}
@@ -1754,9 +1785,9 @@ def validate_abandoned_paths(
             remove_pointer_temporary(paths, candidate, activation=False, dry_run=True)
             continue
         details = os.lstat(candidate)
-        if candidate in policy_temporaries:
+        if candidate in hardlink_temporaries:
             if is_pointer(candidate) or not stat.S_ISREG(details.st_mode):
-                fail(f"policy transaction temporary is not a regular file: {candidate}")
+                fail(f"hard-link replacement temporary is not a regular file: {candidate}")
             continue
         if candidate in git_locks:
             if is_pointer(candidate) or not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
@@ -2371,6 +2402,8 @@ def recover_transaction(
                 activated = direct_ref_target(paths, activation_ref(target))
                 if activated is not None and activated != target:
                     fail(f"activation ref for {target} resolves to conflicting commit {activated}")
+                if previous is not None and direct_ref_target(paths, activation_ref(previous)) != previous:
+                    fail(f"previous activation ref is missing or conflicting: {previous}")
             else:
                 mark_activated(paths, target)
                 record_current(paths, target, None if backup else previous)
@@ -2927,8 +2960,9 @@ def recover(paths: Paths, dry_run: bool) -> None:
             if paths.repository.is_dir():
                 validate_repository_config(paths.repository)
             policy_temporaries = recover_policy_transaction(paths, dry_run=True)
+            hardlink_temporaries = policy_temporaries | attachment_link_temporaries(paths)
             candidates = abandoned_paths(paths)
-            validate_abandoned_paths(paths, candidates, frozenset(policy_temporaries))
+            validate_abandoned_paths(paths, candidates, frozenset(hardlink_temporaries))
             recover_transaction(
                 paths,
                 dry_run=True,

@@ -1278,31 +1278,48 @@ for kind, executable in shells():
             result,
         )
         linked_runtime_home = root / "linked runtime parent home"
-        linked_runtime_home.mkdir()
+        (linked_runtime_home / ".claude").mkdir(parents=True)
         external_runtime_root = root / "external runtime root"
         external_runtime_root.mkdir()
-        create_directory_pointer(linked_runtime_home / ".claude", external_runtime_root)
+        create_directory_pointer(linked_runtime_home / ".claude/skills", external_runtime_root)
+        dry_result = command(
+            kind,
+            executable,
+            external,
+            shell_args(kind, "install", "--dry-run"),
+            linked_runtime_home,
+        )
         result = command(kind, executable, external, shell_args(kind, "install"), linked_runtime_home)
         check(
-            f"{kind} refuses a linked runtime ancestor before writing outside home",
-            result.returncode != 0
+            f"{kind} dry and live install refuse a linked runtime ancestor",
+            dry_result.returncode != 0
+            and result.returncode != 0
             and not (linked_runtime_home / ".agents").exists()
-            and not (external_runtime_root / "skills/issue-flow").exists(),
+            and not (external_runtime_root / "issue-flow").exists(),
             result,
         )
-        remove_directory_pointer(linked_runtime_home / ".claude")
+        remove_directory_pointer(linked_runtime_home / ".claude/skills")
         linked_state_home = root / "linked state parent home"
-        linked_state_home.mkdir()
+        (linked_state_home / ".agents").mkdir(parents=True)
         external_state_root = root / "external state root"
         external_state_root.mkdir()
-        create_directory_pointer(linked_state_home / ".agents", external_state_root)
+        create_directory_pointer(linked_state_home / ".agents/skills", external_state_root)
+        dry_result = command(
+            kind,
+            executable,
+            external,
+            shell_args(kind, "install", "--dry-run"),
+            linked_state_home,
+        )
         result = command(kind, executable, external, shell_args(kind, "install"), linked_state_home)
         check(
-            f"{kind} refuses a linked installer-state ancestor before external mutation",
-            result.returncode != 0 and not (external_state_root / "skills/.issue-flow").exists(),
+            f"{kind} dry and live install refuse a linked installer-state ancestor",
+            dry_result.returncode != 0
+            and result.returncode != 0
+            and not (external_state_root / ".issue-flow").exists(),
             result,
         )
-        remove_directory_pointer(linked_state_home / ".agents")
+        remove_directory_pointer(linked_state_home / ".agents/skills")
         lock_only_home = root / "lock-only home"
         lock_only_paths = Paths.for_home(lock_only_home)
         lock_only_paths.skills.mkdir(parents=True)
@@ -2606,6 +2623,8 @@ for kind, executable in shells():
         create_directory_pointer(abandoned_activation, installed.resolve(strict=True))
         abandoned_bundle_link = installed / f".operator.local.md.{temporary_id}.tmp"
         os.link(installer.current_policy_generation(fixture_paths), abandoned_bundle_link)
+        abandoned_attachment_link = installed / f".custom-hook.sh.{temporary_id}.tmp"
+        os.link(fixture_paths.local / "custom-hook.sh", abandoned_attachment_link)
         abandoned_policy = fixture_paths.policies / f".policy.{temporary_id}.tmp"
         abandoned_policy.write_bytes(b"partial")
         abandoned_object = object_store / "objects/pack" / f".object.{temporary_id}.tmp"
@@ -2619,7 +2638,11 @@ for kind, executable in shells():
             ref_lock.parent.mkdir(parents=True, exist_ok=True)
             ref_lock.write_bytes(b"partial ref update")
         dry_cleanup = command(kind, executable, active_script, shell_args(kind, "recover", "--dry-run"), home)
-        dry_cleanup_preserved = dry_cleanup.returncode == 0 and abandoned_bundle_link.exists()
+        dry_cleanup_preserved = (
+            dry_cleanup.returncode == 0
+            and abandoned_bundle_link.exists()
+            and abandoned_attachment_link.exists()
+        )
         result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
         check(
             f"{kind} recovers a post-switch receipt write after lock release",
@@ -2630,6 +2653,7 @@ for kind, executable in shells():
             and not abandoned_json.exists()
             and not os.path.lexists(abandoned_activation)
             and not abandoned_bundle_link.exists()
+            and not abandoned_attachment_link.exists()
             and not abandoned_policy.exists()
             and not abandoned_object.exists()
             and not any(ref_lock.exists() for ref_lock in abandoned_ref_locks)

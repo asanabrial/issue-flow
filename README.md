@@ -144,8 +144,8 @@ POSIX atomically replaces the public symlink; Windows atomically retargets its d
 which needs no elevation. Runtime paths under `~/.claude/skills/` and `~/.codex/skills/` point at the
 stable public path. Independent copies are refused because they would remain on stale policy.
 Intermediate `.agents`, `.claude`, `.codex` and `skills` ancestors must be real directories contained
-under the once-resolved operator home; linked parents are refused before state mutation, runtime
-enumeration, cleanup or uninstall.
+under the once-resolved operator home; fresh dry-run and live commands both refuse linked parents
+before state mutation, runtime enumeration, cleanup or uninstall.
 
 The store retains every activated immutable bundle so an already-running load can keep using the immutable path
 it resolved at activation across any number of later upgrades. Materialization and activation have
@@ -325,11 +325,11 @@ After two immutable
 generations exist, the previous complete bundle remains available through `rollback`; `recover`
 restores the standalone clone or reconciles the bundle journal when an operation was interrupted;
 `recover --dry-run` validates the same journal, authority, provenance and cleanup ownership without mutation.
-It recognizes journal-owned or verified unjournaled stable-policy hard-link replacement temporaries
-without deleting them. An existing
+It recognizes journal-owned or verified unjournaled policy and file-attachment hard-link replacement
+temporaries without deleting them. An existing
 operating-system lock, including a POSIX `flock`, and both pre-switch and post-switch activation refs must pass the same
-identity checks as live recovery; installer refs must point directly to commits rather than blobs,
-trees or annotated tags.
+identity checks as live recovery. Shared and wrapper-side verification both require installer refs
+to point directly to commits rather than blobs, trees or annotated tags.
 Never force-add `operator.local.md`: its values are permissions, including whether an agent may
 publish or merge without asking.
 
