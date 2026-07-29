@@ -21,14 +21,16 @@ All notable changes to Issue Flow are documented here.
   required for reference fsync support, Windows POSIX layers require native Windows Python, and the
   wrapper-selected absolute Git identity is reused after every directory change. Python runs in
   UTF-8 mode, and later bootstraps recover owner-marked quarantines only after acquiring their
-  released lifetime lock; a stable guard serializes owner publication through final quarantine deletion. Bare repositories
+  released lifetime lock; a stable guard serializes owner publication through final quarantine
+  deletion, where the repository is durably removed before its owner marker. Bare repositories
   reject redirected common directories, alternates, linked reference authority and symbolic refs;
-  installer refs use no-dereference compare-and-swap updates.
+  installer refs use raw direct-commit reads and no-dereference compare-and-swap updates.
 - Publish Git objects, policy generations and migrated local files through durable atomic
   replacements; recover abandoned attachment temporaries and reject linked object-store parents,
   symlinked policy generations, unowned installer-shaped cleanup candidates and unexplained
   pointer/state drift, including a missing canonical pointer with durable activation state but no
-  recovery journal. Target trees reject case-only collisions at every path prefix. A stable
+  recovery journal. Target trees reject case-only collisions, Windows control characters and all
+  reserved device aliases at every path prefix. A stable
   pre-state lock serializes first install with first uninstall. POSIX fsyncs each newly created
   directory entry and persists cross-directory destinations before source deletion; Windows uses
   write-through atomic file and junction replacements. Runtime
@@ -36,15 +38,21 @@ All notable changes to Issue Flow are documented here.
   recovers private stale Git ref lockfiles and rejects read-only Windows attachment sources.
 - Keep `operator.local.md` as an independently editable private file while bundles expose immutable
   content-addressed snapshots. `config` adopts arbitrary manual instructions, and recovery dry-run
-  validates journals, cleanup ownership, existing lock identity and activation refs without mutation.
+  validates journals, owned hard-link temporaries, cleanup ownership, existing lock identity and
+  raw activation refs without mutation.
   Policy recovery accepts only journal endpoints while repairing first publication and both sides of
   an authorized in-place visible edit. Legacy migration rejects reserved
-  attachment names, linked policy, config includes and promisor/partial-clone authority before publishing state.
+  attachment names, linked policy, config includes, worktree-scoped config and
+  promisor/partial-clone authority before publishing state. Migration preserves a concurrent v1.11
+  policy write, and `config` normalizes BOM-marked PowerShell 5.1 UTF-16 edits to UTF-8.
 - Retain every activated bundle for resolved readers, verify retained bytes and attachments in
   `status`, atomically tombstone never-activated targets for crash-resumable cleanup, and report
   deduplicated storage including corrupt, unactivated, incoming and auxiliary installer state.
 - Revalidate rollback targets against canonical `main`; rollback becomes available after the first
   subsequent immutable upgrade creates a safe predecessor.
+- Run the shared installer acceptance state machine once per operating-system lane, with compact
+  wrapper smoke tests for Windows PowerShell 5.1 and Git Bash instead of repeating every case; test
+  scripts now report failures and aggregate totals instead of printing every passing assertion.
 
 ## [1.11.0] - 2026-07-28
 

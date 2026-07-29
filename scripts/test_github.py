@@ -25,13 +25,16 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
 FAILURES: list[str] = []
+CHECKS = 0
 
 
 def check(name: str, got, want) -> None:
+    global CHECKS
+    CHECKS += 1
     ok = got == want
     if not ok:
         FAILURES.append(name)
-    print(f"{'OK  ' if ok else 'FAIL'} {name} -> {got!r} (want {want!r})")
+        print(f"FAIL {name} -> {got!r} (want {want!r})")
 
 
 def comment(body: str, at: str = "2026-01-01T00:00:00Z", trusted: bool = True) -> dict:
@@ -1159,5 +1162,5 @@ check("start-branch resumes the remote head",
       ["git", "branch", "--", "fix/6", "origin/fix/6"] in git_commands, True)
 
 print()
-print(f"{len(FAILURES)} failure(s)" + (f": {FAILURES}" if FAILURES else ""))
+print(f"{CHECKS - len(FAILURES)}/{CHECKS} checks passed" + (f"; failures: {FAILURES}" if FAILURES else ""))
 sys.exit(1 if FAILURES else 0)

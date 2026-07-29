@@ -290,7 +290,41 @@ def make_writable(function, target, _error):
     function(target)
 
 def remove_bootstrap(path):
-    shutil.rmtree(path, onerror=make_writable)
+    owner = path / ".issue-flow-bootstrap-owner"
+    repository_path = path / "repository.git"
+    unexpected = {item.name for item in path.iterdir()} - {owner.name, repository_path.name}
+    if unexpected:
+        raise RuntimeError(f"bootstrap quarantine contains unowned entries: {path}: {sorted(unexpected)}")
+    if repository_path.exists():
+        if repository_path.is_symlink() or not repository_path.is_dir():
+            raise RuntimeError(f"bootstrap repository is not a real directory: {repository_path}")
+        shutil.rmtree(repository_path, onerror=make_writable)
+    if repository_path.exists():
+        raise RuntimeError(f"bootstrap repository cleanup did not complete: {repository_path}")
+    if os.name != "nt":
+        directory = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    if owner.exists():
+        details = os.lstat(owner)
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+            raise RuntimeError(f"bootstrap owner marker is not private: {owner}")
+        owner.unlink()
+    if os.name != "nt":
+        directory = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    path.rmdir()
+    if os.name != "nt":
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     if path.exists():
         raise RuntimeError(f"bootstrap quarantine cleanup did not complete: {path}")
 

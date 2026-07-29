@@ -50,6 +50,7 @@ LOCAL_POLICY = (
     "<!-- issue-flow:config:end -->\r\n"
 ).encode("utf-8")
 FAILURES: list[str] = []
+CHECKS = 0
 
 for unsafe_path in (
     r"..\outside",
@@ -57,6 +58,9 @@ for unsafe_path in (
     "payload:stream",
     "trailing. ",
     "CON/file.md",
+    "COM¹.txt",
+    "LPT².log",
+    "control-\u0001.md",
     "decomposed-e\u0301.md",
 ):
     try:
@@ -76,12 +80,14 @@ else:
 
 
 def check(name: str, condition: bool, result: subprocess.CompletedProcess | None = None) -> None:
+    global CHECKS
+    CHECKS += 1
     if not condition:
         FAILURES.append(name)
         if result:
             print(result.stdout.encode("ascii", "backslashreplace").decode("ascii"))
             print(result.stderr.encode("ascii", "backslashreplace").decode("ascii"))
-    print(f"{'OK  ' if condition else 'FAIL'} {name}")
+        print(f"FAIL {name}")
 
 
 check(
@@ -470,13 +476,58 @@ def shell_args(kind: str, command_name: str, *extra: str) -> list[str]:
     return [command_name, *(translated.get(item, item) for item in extra)]
 
 
-for wrapper_name in ("install.sh", "install.ps1"):
-    wrapper_source = (ROOT / wrapper_name).read_text(encoding="utf-8")
+def secondary_shell_smoke(
+    kind: str,
+    executable: str,
+    root: Path,
+    remote: Path,
+    author: Path,
+    candidate: str,
+    new: str,
+    external: Path,
+) -> None:
+    home = root / f"{kind} smoke home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".codex").mkdir()
+    result = command(kind, executable, external, shell_args(kind, "install", "--dry-run"), home)
     check(
-        f"{wrapper_name} holds the bootstrap guard through quarantine cleanup",
-        wrapper_source.count("bootstrap_guard.close()") == 1
-        and wrapper_source.index("bootstrap_guard.close()") > wrapper_source.rindex("remove_bootstrap(bootstrap)"),
+        f"{kind} smoke dry-run is non-mutating",
+        result.returncode == 0 and not (home / ".agents").exists(),
+        result,
     )
+    result = command(kind, executable, external, shell_args(kind, "install"), home)
+    installed = home / ".agents/skills/issue-flow"
+    script = installed / ("install.sh" if kind == "POSIX" else "install.ps1")
+    check(
+        f"{kind} smoke installs one complete bundle",
+        result.returncode == 0 and current_revision(home) == candidate,
+        result,
+    )
+    result = command(kind, executable, script, shell_args(kind, "config", "--set", "Tracker=linear"), home)
+    check(
+        f"{kind} smoke publishes configuration",
+        result.returncode == 0 and b"| Tracker | linear |" in (installed / "operator.local.md").read_bytes(),
+        result,
+    )
+    publish(author, new)
+    try:
+        result = command(kind, executable, script, shell_args(kind, "sync"), home)
+    finally:
+        publish(author, candidate)
+    check(
+        f"{kind} smoke atomically upgrades the bundle",
+        result.returncode == 0 and current_revision(home) == new,
+        result,
+    )
+    if kind == "Windows PowerShell":
+        iex_home = root / "Windows PowerShell IEX smoke home"
+        iex_home.mkdir()
+        result, sentinel = outer_script_powershell(kind, executable, external, iex_home, root)
+        check(
+            "Windows PowerShell smoke executes through IEX and returns control",
+            result.returncode == 0 and "after-outer-iex" in result.stdout and not sentinel.exists(),
+            result,
+        )
 
 
 for kind, executable in shells():
@@ -487,6 +538,11 @@ for kind, executable in shells():
         home = root / "home with spaces"
         installed = home / ".agents/skills/issue-flow"
         external = external_installer(root, kind, remote.as_uri())
+
+        full_kind = "PowerShell" if os.name == "nt" else "POSIX"
+        if kind != full_kind:
+            secondary_shell_smoke(kind, executable, root, remote, author, candidate, new, external)
+            continue
 
         if kind == "POSIX":
             hostile = root / "hostile cwd"
@@ -856,6 +912,17 @@ for kind, executable in shells():
             result.returncode == 0 and "immutable bundle" in result.stdout and "healthy" in result.stdout,
             result,
         )
+        offline_status_remote = root / "healthy-status-remote-offline.git"
+        remote.rename(offline_status_remote)
+        try:
+            result = command(kind, executable, fresh_script, shell_args(kind, "status"), fresh_install_home)
+        finally:
+            offline_status_remote.rename(remote)
+        check(
+            f"{kind} healthy installed status needs no remote reacquisition",
+            result.returncode == 0 and "immutable bundle" in result.stdout,
+            result,
+        )
         _, _, initial_policy_text = installer.config_block(
             (fresh_canonical / "SKILL.md").read_text(encoding="utf-8"),
             fresh_canonical / "SKILL.md",
@@ -1003,34 +1070,71 @@ for kind, executable in shells():
             protected_transaction = json.loads(failed_activation_paths.transaction.read_text(encoding="utf-8"))
             protected_target = str(protected_transaction["target"])
             conflict_ref = f"refs/issue-flow/activated/{protected_target}"
+            target_tree = git(
+                failed_activation_paths.state,
+                f"--git-dir={failed_activation_paths.repository}",
+                "rev-parse",
+                f"{protected_target}^{{tree}}",
+            )
             git(
                 failed_activation_paths.state,
                 f"--git-dir={failed_activation_paths.repository}",
-                "update-ref",
-                "--no-deref",
-                conflict_ref,
-                legacy,
+                "-c",
+                "user.name=Installer Test",
+                "-c",
+                "user.email=test@example.com",
+                "tag",
+                "-a",
+                "raw-ref-test",
+                "-m",
+                "raw ref test",
+                protected_target,
             )
-            try:
-                try:
-                    installer.recover(failed_activation_paths, True)
-                except InstallError:
-                    first_activation_dry_rejected = True
-                else:
-                    first_activation_dry_rejected = False
-            finally:
+            tag_object = git(
+                failed_activation_paths.state,
+                f"--git-dir={failed_activation_paths.repository}",
+                "rev-parse",
+                "refs/tags/raw-ref-test",
+            )
+            first_activation_rejections: list[bool] = []
+            for raw_target in (legacy, target_tree, tag_object):
                 git(
                     failed_activation_paths.state,
                     f"--git-dir={failed_activation_paths.repository}",
                     "update-ref",
                     "--no-deref",
-                    "-d",
                     conflict_ref,
-                    legacy,
+                    raw_target,
                 )
+                try:
+                    try:
+                        installer.recover(failed_activation_paths, True)
+                    except InstallError:
+                        first_activation_rejections.append(True)
+                    else:
+                        first_activation_rejections.append(False)
+                finally:
+                    git(
+                        failed_activation_paths.state,
+                        f"--git-dir={failed_activation_paths.repository}",
+                        "update-ref",
+                        "--no-deref",
+                        "-d",
+                        conflict_ref,
+                        raw_target,
+                    )
+            git(
+                failed_activation_paths.state,
+                f"--git-dir={failed_activation_paths.repository}",
+                "update-ref",
+                "--no-deref",
+                "-d",
+                "refs/tags/raw-ref-test",
+                tag_object,
+            )
             check(
-                "shared recovery dry-run rejects a conflicting first-activation ref",
-                first_activation_dry_rejected and failed_activation_paths.transaction.exists(),
+                "shared recovery dry-run rejects conflicting and non-commit first-activation refs",
+                all(first_activation_rejections) and failed_activation_paths.transaction.exists(),
             )
             offline_remote = root / "failed-activation-remote-offline.git"
             remote.rename(offline_remote)
@@ -1243,6 +1347,26 @@ for kind, executable in shells():
             result,
         )
 
+        worktree_config_home = root / "worktree config legacy home"
+        worktree_config_legacy = worktree_config_home / ".agents/skills/issue-flow"
+        clone_legacy(remote, worktree_config_legacy, legacy)
+        worktree_sentinel = root / "worktree-config-sentinel"
+        git(worktree_config_legacy, "config", "extensions.worktreeConfig", "true")
+        (worktree_config_legacy / ".git/config.worktree").write_text(
+            "[protocol \"ext\"]\n\tallow = always\n"
+            "[remote \"hidden\"]\n\tpromisor = true\n\tpartialCloneFilter = blob:none\n"
+            f"\turl = ext::touch {worktree_sentinel.as_posix()}\n",
+            encoding="utf-8",
+        )
+        result = command(kind, executable, external, shell_args(kind, "install"), worktree_config_home)
+        check(
+            f"{kind} rejects worktree-scoped legacy Git authority before object reads",
+            result.returncode != 0
+            and not worktree_sentinel.exists()
+            and (worktree_config_legacy / ".git").exists(),
+            result,
+        )
+
         nested_legacy_home = root / "nested empty legacy home"
         nested_legacy = nested_legacy_home / ".agents/skills/issue-flow"
         clone_legacy(remote, nested_legacy, legacy)
@@ -1370,6 +1494,39 @@ for kind, executable in shells():
             and not (recovery_paths.bundles / candidate).exists(),
             result,
         )
+
+        if kind == "PowerShell":
+            concurrent_policy_home = root / "concurrent legacy policy home"
+            concurrent_policy_legacy = concurrent_policy_home / ".agents/skills/issue-flow"
+            clone_legacy(remote, concurrent_policy_legacy, legacy)
+            concurrent_paths = Paths.for_home(concurrent_policy_home)
+            initialize_state(concurrent_paths)
+            concurrent_target = fetch_target(concurrent_paths)
+            concurrent_entries = tree_entries(concurrent_paths, concurrent_target)
+            concurrent_policy = LOCAL_POLICY.replace(b"| Tracker | github |", b"| Tracker | linear |")
+            original_replace_path = installer.replace_path
+
+            def update_policy_before_legacy_move(source: Path, destination: Path) -> None:
+                if source == concurrent_paths.canonical:
+                    (source / "operator.local.md").write_bytes(concurrent_policy)
+                original_replace_path(source, destination)
+
+            installer.replace_path = update_policy_before_legacy_move
+            migration_error: Exception | None = None
+            try:
+                installer.migrate_legacy(concurrent_paths, concurrent_target, concurrent_entries)
+            except Exception as error:
+                migration_error = error
+            finally:
+                installer.replace_path = original_replace_path
+            if migration_error is None:
+                installer.finish_target(concurrent_paths, concurrent_target, keep=True)
+            check(
+                "shared migration preserves a concurrent v1.11 policy update",
+                migration_error is None
+                and concurrent_paths.config.read_bytes() == concurrent_policy
+                and (concurrent_paths.canonical / "operator.local.md").read_bytes() == concurrent_policy,
+            )
 
         clone_legacy(remote, installed, legacy)
         (home / ".claude").mkdir()
@@ -1524,6 +1681,29 @@ for kind, executable in shells():
             result,
         )
 
+        if os.name == "nt":
+            utf16_policy_text = manual_policy.decode("utf-8") + "PowerShell 5.1 instruction: preserve this too.\r\n"
+            visible_policy.write_bytes(utf16_policy_text.encode("utf-16"))
+            result = command(
+                kind,
+                executable,
+                installed / ("install.sh" if kind == "POSIX" else "install.ps1"),
+                shell_args(kind, "config"),
+                home,
+            )
+            configured_policy = visible_policy.read_bytes()
+            manual_policy = utf16_policy_text.encode("utf-8")
+            policy_files = list(fixture_paths.policies.iterdir())
+            check(
+                f"{kind} config normalizes a PowerShell 5.1 UTF-16 policy edit",
+                result.returncode == 0
+                and configured_policy == manual_policy
+                and fixture_paths.config.read_bytes() == manual_policy
+                and len(policy_files) == 1
+                and os.path.samefile(visible_policy, policy_files[0]),
+                result,
+            )
+
         external_policy_link = root / "external-policy-link"
         os.link(policy_files[0], external_policy_link)
         result = command(
@@ -1570,6 +1750,23 @@ for kind, executable in shells():
             ),
             encoding="utf-8",
         )
+        interrupted_temporary = installed / (".operator.local.md." + "c" * 32 + ".tmp")
+        os.link(interrupted_generation, interrupted_temporary)
+        result = command(
+            kind,
+            executable,
+            installed / ("install.sh" if kind == "POSIX" else "install.ps1"),
+            shell_args(kind, "recover", "--dry-run"),
+            home,
+        )
+        check(
+            f"{kind} policy recovery dry-run accepts its owned replacement temporary",
+            result.returncode == 0
+            and interrupted_temporary.exists()
+            and fixture_paths.policy_transaction.exists(),
+            result,
+        )
+        interrupted_temporary.unlink()
         if os.name == "nt":
             installer.complete_policy_switch(fixture_paths, interrupted_generation)
         result = command(
@@ -2565,5 +2762,5 @@ for kind, executable in shells():
 
 
 print()
-print(f"{len(FAILURES)} failure(s)" + (f": {FAILURES}" if FAILURES else ""))
+print(f"{CHECKS - len(FAILURES)}/{CHECKS} checks passed" + (f"; failures: {FAILURES}" if FAILURES else ""))
 raise SystemExit(1 if FAILURES else 0)

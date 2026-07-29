@@ -41,7 +41,16 @@ REFERENCE_DEFINITION = re.compile(r"(?m)^\s{0,3}\[([^\]]+)\]:\s*(\S+)")
 TEMPORARY_NAME = re.compile(r"^\..+\.[0-9a-f]{32}\.tmp$")
 DISCARD_NAME = re.compile(r"^\.discard-([0-9a-f]{40}|[0-9a-f]{64})-[0-9a-f]{32}$")
 WINDOWS_RESERVED = frozenset(
-    {"CON", "PRN", "AUX", "NUL", *(f"COM{index}" for index in range(1, 10)), *(f"LPT{index}" for index in range(1, 10))}
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+        *(f"COM{index}" for index in "¹²³"),
+        *(f"LPT{index}" for index in "¹²³"),
+    }
 )
 MINIMUM_GIT_VERSION = (2, 36)
 _VERIFIED_GIT_EXECUTABLE: str | None = None
@@ -112,7 +121,9 @@ def validate_tree_path(name: str, casefolded: dict[str, str] | None = None) -> P
     if "\\" in name or unicodedata.normalize("NFC", name) != name:
         fail(f"the target tree contains a non-portable path: {name!r}")
     for part in pure.parts:
-        if any(character in part for character in ':<>"|?*') or part.endswith((".", " ")):
+        if any(ord(character) < 32 or character in ':<>"|?*' for character in part) or part.endswith(
+            (".", " ")
+        ):
             fail(f"the target tree contains a Windows-unsafe path: {name!r}")
         if part.split(".", 1)[0].upper() in WINDOWS_RESERVED:
             fail(f"the target tree contains a Windows-reserved path: {name!r}")
@@ -717,16 +728,28 @@ def copy_object_database(source: Path, destination: Path) -> None:
 def direct_ref_target(paths: Paths, reference: str) -> str | None:
     result = git(
         paths,
-        "rev-parse",
-        "--verify",
-        f"{reference}^{{commit}}",
+        "for-each-ref",
+        "--format=%(refname)%00%(objectname)",
+        reference,
         repository=paths.repository,
         check=False,
     )
     if result.returncode:
+        fail(f"cannot inspect installer ref {reference}")
+    matches = [
+        line.split("\0", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.split("\0", 1)[0] == reference
+    ]
+    if not matches:
         return None
-    target = result.stdout.strip()
+    if len(matches) != 1:
+        fail(f"installer ref is ambiguous: {reference}")
+    target = matches[0]
     validate_commit_id(target)
+    kind = git(paths, "cat-file", "-t", target, repository=paths.repository, check=False)
+    if kind.returncode or kind.stdout.strip() != "commit":
+        fail(f"installer ref {reference} does not point directly to a commit")
     return target
 
 
@@ -986,7 +1009,12 @@ def attachment_records(paths: Paths) -> list[dict[str, str]]:
     return records
 
 
-def verify_bundle(paths: Paths, bundle: Path, expected_commit: str | None = None) -> dict:
+def verify_bundle(
+    paths: Paths,
+    bundle: Path,
+    expected_commit: str | None = None,
+    ignored_paths: frozenset[Path] = frozenset(),
+) -> dict:
     if is_pointer(bundle) or not bundle.is_dir():
         fail(f"bundle is not a real directory: {bundle}")
     receipt = read_json(bundle / RECEIPT_FILE)
@@ -1017,6 +1045,8 @@ def verify_bundle(paths: Paths, bundle: Path, expected_commit: str | None = None
     while stack:
         directory, prefix = stack.pop()
         for item in os.scandir(directory):
+            if Path(item.path) in ignored_paths:
+                continue
             relative = prefix / item.name
             name = relative.as_posix()
             if not prefix.parts and item.name in allowed_top:
@@ -1055,9 +1085,10 @@ def verify_bundle_against_git(
     target: str,
     tree: str,
     entries: list[dict[str, str | int]],
+    ignored_paths: frozenset[Path] = frozenset(),
 ) -> dict:
     """Bind a local receipt to authoritative objects, not to hashes it chose itself."""
-    receipt = verify_bundle(paths, bundle, target)
+    receipt = verify_bundle(paths, bundle, target, ignored_paths)
     if receipt.get("tree") != tree:
         fail(f"bundle receipt tree does not match commit {target}")
     files = receipt["files"]
@@ -1193,7 +1224,11 @@ def activate(paths: Paths, bundle: Path) -> None:
     mark_activated(paths, bundle.name)
 
 
-def active_bundle(paths: Paths, verify_policy: bool = True) -> tuple[Path, dict]:
+def active_bundle(
+    paths: Paths,
+    verify_policy: bool = True,
+    ignored_paths: frozenset[Path] = frozenset(),
+) -> tuple[Path, dict]:
     if not is_pointer(paths.canonical):
         fail(f"{paths.canonical} is not an immutable-bundle pointer")
     try:
@@ -1202,13 +1237,17 @@ def active_bundle(paths: Paths, verify_policy: bool = True) -> tuple[Path, dict]
         fail(f"active skill pointer is broken: {error}")
     if bundle.parent.resolve() != paths.bundles.resolve():
         fail(f"active skill points outside the installer bundle store: {bundle}")
-    receipt = verify_stored_bundle(paths, bundle)
+    receipt = verify_stored_bundle(paths, bundle, ignored_paths)
     verify_attachments(paths, bundle, verify_policy=verify_policy)
     return bundle, receipt
 
 
-def active_state(paths: Paths, verify_policy: bool = True) -> tuple[Path, dict, dict]:
-    bundle, receipt = active_bundle(paths, verify_policy=verify_policy)
+def active_state(
+    paths: Paths,
+    verify_policy: bool = True,
+    ignored_paths: frozenset[Path] = frozenset(),
+) -> tuple[Path, dict, dict]:
+    bundle, receipt = active_bundle(paths, verify_policy=verify_policy, ignored_paths=ignored_paths)
     if not paths.current.exists():
         fail(f"active bundle has no activation state: {paths.current}")
     state = read_current_state(paths)
@@ -1217,14 +1256,18 @@ def active_state(paths: Paths, verify_policy: bool = True) -> tuple[Path, dict, 
     return bundle, receipt, state
 
 
-def verify_stored_bundle(paths: Paths, bundle: Path) -> dict:
+def verify_stored_bundle(
+    paths: Paths,
+    bundle: Path,
+    ignored_paths: frozenset[Path] = frozenset(),
+) -> dict:
     commit = bundle.name
     validate_commit_id(commit)
     if bundle.parent.resolve() != paths.bundles.resolve():
         fail(f"bundle escapes the installer store: {bundle}")
     entries = tree_entries(paths, commit, require_entrypoints=False)
     tree = git(paths, "rev-parse", f"{commit}^{{tree}}", repository=paths.repository).stdout.strip()
-    return verify_bundle_against_git(paths, bundle, commit, tree, entries)
+    return verify_bundle_against_git(paths, bundle, commit, tree, entries, ignored_paths)
 
 
 def create_attachment(path: Path, record: dict[str, str]) -> None:
@@ -1333,6 +1376,18 @@ def known_policy_link_count(paths: Paths, generation: Path) -> int:
     return links
 
 
+def policy_link_temporaries(paths: Paths, generation: Path) -> set[Path]:
+    temporaries: set[Path] = set()
+    for destination in policy_destinations(paths):
+        pattern = f".{destination.name}." + "?" * 32 + ".tmp"
+        temporaries.update(
+            candidate
+            for candidate in destination.parent.glob(pattern)
+            if is_regular_hardlink(candidate, generation)
+        )
+    return temporaries
+
+
 def complete_policy_switch(paths: Paths, generation: Path) -> None:
     for destination in policy_destinations(paths):
         if is_regular_hardlink(destination, generation):
@@ -1429,9 +1484,9 @@ def switch_policy(paths: Paths, content: bytes, edited_destination: Path | None 
     fsync_directory(paths.policies)
 
 
-def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> None:
+def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> set[Path]:
     if not paths.policy_transaction.exists():
-        return
+        return set()
     transaction = read_json(paths.policy_transaction)
     if set(transaction) != {"schema", "generation", "previous"} or transaction.get("schema") != STATE_SCHEMA:
         fail(f"invalid policy transaction shape: {paths.policy_transaction}")
@@ -1440,11 +1495,12 @@ def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> None:
         fail(f"invalid policy transaction: {paths.policy_transaction}")
     generation = paths.policies / generation_name
     details = os.lstat(generation) if path_exists(generation) else None
+    generation_temporaries = policy_link_temporaries(paths, generation)
     if (
         not details
         or not stat.S_ISREG(details.st_mode)
         or hashlib.sha256(generation.read_bytes()).hexdigest() != generation_name
-        or details.st_nlink != known_policy_link_count(paths, generation)
+        or details.st_nlink != known_policy_link_count(paths, generation) + len(generation_temporaries)
     ):
         fail(f"policy transaction generation is missing or corrupt: {generation}")
     previous_value = transaction.get("previous")
@@ -1464,6 +1520,7 @@ def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> None:
     else:
         fail(f"stable policy disappeared during an existing-policy transaction: {paths.config}")
     previous = paths.policies / previous_name if previous_name else None
+    previous_temporaries: set[Path] = set()
     if previous:
         previous_details = os.lstat(previous) if path_exists(previous) else None
         if not previous_details or not stat.S_ISREG(previous_details.st_mode):
@@ -1474,7 +1531,8 @@ def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> None:
             stable_name in {previous_name, generation_name} and previous.read_bytes() == generation.read_bytes()
         ):
             fail(f"previous policy generation is corrupt outside the authorized visible edit: {previous}")
-        if previous_details.st_nlink != known_policy_link_count(paths, previous):
+        previous_temporaries = policy_link_temporaries(paths, previous)
+        if previous_details.st_nlink != known_policy_link_count(paths, previous) + len(previous_temporaries):
             fail(f"previous policy generation has an external hard link: {previous}")
     for destination in policy_destinations(paths):
         if not path_exists(destination) and previous is None:
@@ -1487,6 +1545,7 @@ def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> None:
     if not dry_run:
         complete_policy_switch(paths, generation)
         remove_state_file(paths.policy_transaction)
+    return generation_temporaries | previous_temporaries
 
 
 def generated_temporaries(
@@ -1649,7 +1708,11 @@ def cleanup_abandoned(paths: Paths) -> None:
             fsync_directory(candidate.parent)
 
 
-def validate_abandoned_paths(paths: Paths, candidates: list[Path]) -> None:
+def validate_abandoned_paths(
+    paths: Paths,
+    candidates: list[Path],
+    policy_temporaries: frozenset[Path] = frozenset(),
+) -> None:
     git_locks = set(git_ref_locks(paths))
     runtime_parents = {runtime.parent for runtime in runtime_paths(paths)}
     for candidate in candidates:
@@ -1660,6 +1723,10 @@ def validate_abandoned_paths(paths: Paths, candidates: list[Path]) -> None:
             remove_pointer_temporary(paths, candidate, activation=False, dry_run=True)
             continue
         details = os.lstat(candidate)
+        if candidate in policy_temporaries:
+            if is_pointer(candidate) or not stat.S_ISREG(details.st_mode):
+                fail(f"policy transaction temporary is not a regular file: {candidate}")
+            continue
         if candidate in git_locks:
             if is_pointer(candidate) or not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
                 fail(f"stale Git ref lock is not a private regular file: {candidate}")
@@ -1807,7 +1874,13 @@ def validate_legacy_repository(root: Path) -> None:
         fail(f"legacy Git config is invalid: {error}")
     if any(section.casefold() == "include" or section.casefold().startswith('includeif "') for section in parser.sections()):
         fail("legacy migration refuses Git config includes that can hide executable authority")
-    if parser.has_option("extensions", "partialclone"):
+    worktree_config = repository / "config.worktree"
+    extension_sections = [section for section in parser.sections() if section.casefold() == "extensions"]
+    if path_exists(worktree_config) or any(
+        parser.getboolean(section, "worktreeConfig", fallback=False) for section in extension_sections
+    ):
+        fail("legacy migration refuses worktree-scoped Git authority")
+    if any(parser.has_option(section, "partialclone") for section in extension_sections):
         fail("legacy migration refuses a partial-clone object authority")
     for section in parser.sections():
         if section.casefold().startswith('remote "') and (
@@ -2007,15 +2080,7 @@ def mark_activated(paths: Paths, commit: str) -> None:
 
 
 def is_activated(paths: Paths, commit: str) -> bool:
-    result = git(
-        paths,
-        "rev-parse",
-        "--verify",
-        f"{activation_ref(commit)}^{{commit}}",
-        repository=paths.repository,
-        check=False,
-    )
-    return not result.returncode and result.stdout.strip() == commit
+    return direct_ref_target(paths, activation_ref(commit)) == commit
 
 
 def require_activated(paths: Paths, commit: str) -> None:
@@ -2077,17 +2142,10 @@ def reconcile_retained_state(paths: Paths) -> None:
 
 def remove_bundle_ref(paths: Paths, commit: str) -> None:
     reference = f"refs/issue-flow/bundles/{commit}"
-    result = git(
-        paths,
-        "rev-parse",
-        "--verify",
-        f"{reference}^{{commit}}",
-        repository=paths.repository,
-        check=False,
-    )
-    if result.returncode:
+    target = direct_ref_target(paths, reference)
+    if target is None:
         return
-    if result.stdout.strip() != commit:
+    if target != commit:
         fail(f"materialization ref disagrees with bundle identity: {reference}")
     git(
         paths,
@@ -2095,7 +2153,7 @@ def remove_bundle_ref(paths: Paths, commit: str) -> None:
         "--no-deref",
         "-d",
         reference,
-        commit,
+        target,
         repository=paths.repository,
     )
 
@@ -2185,6 +2243,7 @@ def migrate_legacy(paths: Paths, target: str, target_entries: list[dict[str, str
     current = str(legacy["commit"])
     ensure_ancestor(paths, current, target)
     target_bundle = materialize_bundle(paths, target)
+    config: bytes | None = None
     if (paths.canonical / CONFIG_FILE).exists():
         config = (paths.canonical / CONFIG_FILE).read_bytes()
         if paths.config.exists() and paths.config.read_bytes() != config:
@@ -2212,6 +2271,12 @@ def migrate_legacy(paths: Paths, target: str, target_entries: list[dict[str, str
     )
     try:
         replace_path(paths.canonical, backup)
+        if config is not None:
+            moved_config = (backup / CONFIG_FILE).read_bytes()
+            if moved_config != config:
+                # v1.11 has no installer lock. Re-adopt a config write that won the race before
+                # the clone move instead of silently activating the earlier snapshot.
+                switch_policy(paths, moved_config)
         write_json(
             paths.transaction,
             {
@@ -2232,7 +2297,11 @@ def migrate_legacy(paths: Paths, target: str, target_entries: list[dict[str, str
         raise
 
 
-def recover_transaction(paths: Paths, dry_run: bool = False) -> None:
+def recover_transaction(
+    paths: Paths,
+    dry_run: bool = False,
+    ignored_paths: frozenset[Path] = frozenset(),
+) -> None:
     if not paths.transaction.exists():
         return
     transaction = read_json(paths.transaction)
@@ -2258,7 +2327,7 @@ def recover_transaction(paths: Paths, dry_run: bool = False) -> None:
     if backup and backup.exists() and (is_pointer(backup) or not backup.is_dir()):
         fail(f"activation transaction backup is not a real legacy directory: {backup}")
     if is_pointer(paths.canonical):
-        _, receipt = active_bundle(paths)
+        _, receipt = active_bundle(paths, ignored_paths=ignored_paths)
         current = str(receipt["commit"])
         if current == target:
             # Activation may have switched the pointer immediately before interruption.
@@ -2304,7 +2373,7 @@ def recover_transaction(paths: Paths, dry_run: bool = False) -> None:
     previous_bundle = paths.bundles / previous if previous else None
     if previous_bundle and previous_bundle.exists():
         require_activated(paths, previous)
-        verify_stored_bundle(paths, previous_bundle)
+        verify_stored_bundle(paths, previous_bundle, ignored_paths)
         if not dry_run:
             attach_local(paths, previous_bundle)
             activate(paths, previous_bundle)
@@ -2314,7 +2383,7 @@ def recover_transaction(paths: Paths, dry_run: bool = False) -> None:
         return
     target_bundle = paths.bundles / target
     if previous is None and target_bundle.exists():
-        verify_stored_bundle(paths, target_bundle)
+        verify_stored_bundle(paths, target_bundle, ignored_paths)
         if dry_run:
             activated = direct_ref_target(paths, activation_ref(target))
             if activated is not None and activated != target:
@@ -2584,6 +2653,14 @@ def config_block(text: str, origin: Path) -> tuple[int, int, str]:
     return start, end, text[start:end]
 
 
+def decode_policy(content: bytes, origin: Path) -> str:
+    encoding = "utf-16" if content.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+    try:
+        return content.decode(encoding)
+    except UnicodeError as error:
+        fail(f"operator policy is not valid UTF text at {origin}: {error}")
+
+
 def validate_config_assignment(assignment: str | None) -> None:
     if assignment is None:
         return
@@ -2655,7 +2732,7 @@ def configure(paths: Paths, assignment: str | None, dry_run: bool) -> None:
             _, template = dry_run_sync(paths)
             _, _, defaults = config_block(template, Path("fetched SKILL.md"))
             config_exists = paths.config.exists()
-            text = paths.config.read_bytes().decode("utf-8") if config_exists else defaults
+            text = decode_policy(paths.config.read_bytes(), paths.config) if config_exists else defaults
             text = merge_missing_config_rows(text, defaults, paths.config if config_exists else Path("fetched SKILL.md"))
             text = apply_config_assignment(text, assignment, paths.config if config_exists else Path("fetched SKILL.md"))
             if paths.bundles.is_dir():
@@ -2673,10 +2750,13 @@ def configure(paths: Paths, assignment: str | None, dry_run: bool) -> None:
             expected_target, template = dry_run_sync(paths, announce=False)
             _, _, defaults = config_block(template, Path("fetched SKILL.md"))
             if paths.config.exists():
-                preflight_text = paths.config.read_text(encoding="utf-8")
+                preflight_text = decode_policy(paths.config.read_bytes(), paths.config)
                 preflight_origin = paths.config
             elif path_exists(paths.canonical) and (paths.canonical / CONFIG_FILE).exists():
-                preflight_text = (paths.canonical / CONFIG_FILE).read_text(encoding="utf-8")
+                preflight_text = decode_policy(
+                    (paths.canonical / CONFIG_FILE).read_bytes(),
+                    paths.canonical / CONFIG_FILE,
+                )
                 preflight_origin = paths.canonical / CONFIG_FILE
             else:
                 preflight_text = defaults
@@ -2703,11 +2783,11 @@ def configure(paths: Paths, assignment: str | None, dry_run: bool) -> None:
         _, _, defaults = config_block(template, bundle / "SKILL.md")
         config_exists = paths.config.exists()
         origin = paths.config if config_exists else bundle / "SKILL.md"
-        text = paths.config.read_bytes().decode("utf-8") if config_exists else defaults
+        text = decode_policy(paths.config.read_bytes(), paths.config) if config_exists else defaults
         edited_destination: Path | None = None
         visible_policy = bundle / CONFIG_FILE
         if config_exists and visible_policy.exists():
-            visible_text = visible_policy.read_bytes().decode("utf-8")
+            visible_text = decode_policy(visible_policy.read_bytes(), visible_policy)
             if visible_text != text:
                 text = visible_text
                 origin = visible_policy
@@ -2784,6 +2864,7 @@ def rollback(paths: Paths, dry_run: bool) -> None:
 
 def recover(paths: Paths, dry_run: bool) -> None:
     if dry_run:
+        policy_temporaries: set[Path] = set()
         if path_exists(paths.lock):
             lock = open_safe_lock(paths.lock)
             lock.close()
@@ -2793,13 +2874,21 @@ def recover(paths: Paths, dry_run: bool) -> None:
                 fail(f"installer state is not a real directory: {paths.state}")
             if paths.repository.is_dir():
                 validate_repository_config(paths.repository)
-            recover_policy_transaction(paths, dry_run=True)
-            recover_transaction(paths, dry_run=True)
+            policy_temporaries = recover_policy_transaction(paths, dry_run=True)
+            candidates = abandoned_paths(paths)
+            validate_abandoned_paths(paths, candidates, frozenset(policy_temporaries))
+            recover_transaction(paths, dry_run=True, ignored_paths=frozenset(candidates))
             if not paths.transaction.exists():
                 if is_pointer(paths.canonical):
-                    active_state(paths)
+                    active_state(
+                        paths,
+                        verify_policy=not paths.policy_transaction.exists(),
+                        ignored_paths=frozenset(candidates),
+                    )
                 else:
                     require_layout_provenance(paths)
+        else:
+            candidates = []
         if paths.transaction.exists():
             print(f"would   recover transaction {paths.transaction}")
         if paths.policy_transaction.exists():
@@ -2808,8 +2897,6 @@ def recover(paths: Paths, dry_run: bool) -> None:
             incoming = incoming_target(paths)
             if incoming:
                 print(f"would   remove abandoned incoming acquisition ref {incoming}")
-        candidates = abandoned_paths(paths)
-        validate_abandoned_paths(paths, candidates)
         print(f"would   remove {len(candidates)} abandoned installer temporary path(s)")
         return
     ensure_real_directory(paths.skills)
