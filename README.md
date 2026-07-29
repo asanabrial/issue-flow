@@ -108,7 +108,8 @@ from the host's system trust store. Quarantine cleanup clears Git's read-only pa
 fails if its bootstrap path remains; a later bootstrap removes owner-marked quarantines only when
 their lifetime lock is no longer held, while a stable guard serializes owner-file publication
 through final quarantine deletion. Cleanup removes the repository first, persists that removal,
-and deletes the owner marker last so a crash cannot leave an unowned non-empty quarantine.
+and deletes the owner marker last so a crash cannot leave an unowned non-empty quarantine. Windows
+junctions are refused before stale-quarantine cleanup can traverse them.
 Every Python entrypoint forces UTF-8 mode so non-ASCII operator
 homes survive shell/native-process boundaries. Installed wrappers likewise reverify the local helper against
 its Git blob in the same Python process that executes those bytes; the absolute Git executable
@@ -130,7 +131,9 @@ git clone https://github.com/asanabrial/issue-flow ~/.agents/skills/issue-flow
 An existing v1.11 installation upgrades by rerunning the current one-line bootstrap above, not by
 using v1.11's retired single-file `sync --from` command. Migration rejects included, worktree-scoped,
 promisor and partial-clone Git authority before reading objects, and adopts a v1.11 policy write that
-wins the race immediately before the legacy clone move.
+wins before the legacy clone move or after provisional policy state from an interrupted attempt.
+Stop all v1.11 installer commands before migration: v1.11 has no operating-system lock, so an already
+paused process cannot participate in v1.12 serialization after the public path changes layout.
 
 The stable public path remains `~/.agents/skills/issue-flow/`. Its bundles, Git object store, local
 policy generations, activation receipt, completed-activation refs and retained rollback targets live under
@@ -284,6 +287,8 @@ instructions; run `config` afterward to validate the markers and atomically publ
 
 UTF-8 is canonical. A BOM-marked UTF-16 edit produced by Windows PowerShell 5.1 is accepted by
 `config` and normalized to UTF-8 during publication.
+Recovery treats the BOM-only encoding change as the same authorized visible edit if publication was
+interrupted after journaling.
 
 The installer matches a setting **by its name** and carries no setting list of its own, so a default
 row added to the skill is settable immediately. It verifies every destination, publishes the new
@@ -320,8 +325,9 @@ After two immutable
 generations exist, the previous complete bundle remains available through `rollback`; `recover`
 restores the standalone clone or reconciles the bundle journal when an operation was interrupted;
 `recover --dry-run` validates the same journal, authority, provenance and cleanup ownership without mutation.
-It recognizes a journal-owned hard-link replacement temporary without deleting it. An existing
-operating-system lock and both pre-switch and post-switch activation refs must also pass the same
+It recognizes journal-owned or verified unjournaled stable-policy hard-link replacement temporaries
+without deleting them. An existing
+operating-system lock, including a POSIX `flock`, and both pre-switch and post-switch activation refs must pass the same
 identity checks as live recovery; installer refs must point directly to commits rather than blobs,
 trees or annotated tags.
 Never force-add `operator.local.md`: its values are permissions, including whether an agent may
@@ -336,7 +342,7 @@ something. The installer acceptance suite runs shared migration, authority, cras
 rollback and policy cases once on Windows through PowerShell 7 and once on native Linux. Short smoke
 lanes retain wrapper-specific coverage for Windows PowerShell 5.1 and Git Bash without triplicating
 the shared Python state machine. The Linux lane exercises native symlinks, `flock`, modes and
-directory fsync. Native macOS remains untested.
+directory fsync, including private `0700` creation under a permissive umask. Native macOS remains untested.
 
 The Python and Git executables selected from the operator's `PATH`, the host's system TLS roots and
 canonical GitHub `main` are trust roots. The shell runtime and resolved operator home are part of the

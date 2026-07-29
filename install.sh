@@ -235,8 +235,8 @@ case $FRESH_COMMAND in install|sync) FRESH_DRY_INSTALL=1 ;; *) FRESH_DRY_INSTALL
 if [ "$FRESH_DRY" -eq 1 ] && [ "$FRESH_DRY_INSTALL" -eq 1 ] && [ "$FRESH_SET" -eq 0 ] \
     && [ ! -e "$DEST" ] && [ ! -L "$DEST" ] \
     && [ ! -e "$STATE" ] && [ ! -L "$STATE" ] \
-    && [ ! -e "$HOME/.claude" ] && [ ! -L "$HOME/.claude" ] \
-    && [ ! -e "$HOME/.codex" ] && [ ! -L "$HOME/.codex" ] \
+    && { [ ! -e "$HOME/.claude" ] || { [ -d "$HOME/.claude" ] && [ ! -L "$HOME/.claude" ]; }; } \
+    && { [ ! -e "$HOME/.codex" ] || { [ -d "$HOME/.codex" ] && [ ! -L "$HOME/.codex" ]; }; } \
     && [ ! -e "$CLAUDE_DEST" ] && [ ! -L "$CLAUDE_DEST" ] \
     && [ ! -e "$CODEX_DEST" ] && [ ! -L "$CODEX_DEST" ]; then
     printf 'would   install one complete Git tree at %s\n' "$DEST"
@@ -251,6 +251,7 @@ ISSUE_FLOW_GIT=$GIT; export ISSUE_FLOW_GIT
 
 USERPROFILE=$HOME; ISSUE_FLOW_HOME=$HOME; export USERPROFILE ISSUE_FLOW_HOME
 exec "$PYTHON" -X utf8 -I - "$REPOSITORY_URL" "$GIT" "$@" <<'PY'
+import ctypes
 import json
 import os
 import re
@@ -282,6 +283,15 @@ def lock_owner(handle, blocking):
     except BlockingIOError:
         return False
 
+def is_junction(path):
+    checker = getattr(os.path, "isjunction", None)
+    if checker:
+        return bool(checker(path))
+    if os.name != "nt" or not os.path.lexists(path):
+        return False
+    attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    return attributes != 0xFFFFFFFF and bool(attributes & 0x400)
+
 def make_writable(function, target, _error):
     details = os.lstat(target)
     if stat.S_ISREG(details.st_mode) and details.st_nlink != 1:
@@ -296,7 +306,7 @@ def remove_bootstrap(path):
     if unexpected:
         raise RuntimeError(f"bootstrap quarantine contains unowned entries: {path}: {sorted(unexpected)}")
     if repository_path.exists():
-        if repository_path.is_symlink() or not repository_path.is_dir():
+        if repository_path.is_symlink() or is_junction(repository_path) or not repository_path.is_dir():
             raise RuntimeError(f"bootstrap repository is not a real directory: {repository_path}")
         shutil.rmtree(repository_path, onerror=make_writable)
     if repository_path.exists():
@@ -350,7 +360,7 @@ if not lock_owner(bootstrap_guard, blocking=True):
 for candidate in home.iterdir():
     if not re.fullmatch(r"\.issue-flow-bootstrap-[0-9a-f]{32}", candidate.name):
         continue
-    if candidate.is_symlink() or not candidate.is_dir():
+    if candidate.is_symlink() or is_junction(candidate) or not candidate.is_dir():
         raise RuntimeError(f"installer-shaped bootstrap path is not a real directory: {candidate}")
     owner = candidate / ".issue-flow-bootstrap-owner"
     if not owner.exists():
@@ -375,7 +385,7 @@ for candidate in home.iterdir():
 bootstrap = home / f".issue-flow-bootstrap-{uuid.uuid4().hex}"
 os.mkdir(bootstrap, 0o700)
 details = os.lstat(bootstrap)
-if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
+if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode) or is_junction(bootstrap):
     raise RuntimeError(f"bootstrap quarantine is not a private directory: {bootstrap}")
 owner_path = bootstrap / ".issue-flow-bootstrap-owner"
 owner_handle = owner_path.open("x+b")

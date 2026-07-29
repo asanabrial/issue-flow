@@ -123,13 +123,17 @@ if os.name != "nt":
         fsynced_parents: list[Path] = []
         original_fsync_directory = installer.fsync_directory
         installer.fsync_directory = fsynced_parents.append
+        original_umask = os.umask(0)
         try:
             ensure_real_directory(durable_target)
         finally:
+            os.umask(original_umask)
             installer.fsync_directory = original_fsync_directory
         check(
-            "POSIX directory creation requests durability for every published parent entry",
-            fsynced_parents == [durable_root, durable_root / "first"],
+            "POSIX directory creation is durable and private under a permissive umask",
+            fsynced_parents == [durable_root, durable_root / "first"]
+            and stat.S_IMODE((durable_root / "first").stat().st_mode) == 0o700
+            and stat.S_IMODE(durable_target.stat().st_mode) == 0o700,
         )
         source_parent = durable_root / "source"
         destination_parent = durable_root / "destination"
@@ -613,10 +617,14 @@ for kind, executable in shells():
             )
 
         fresh_home = root / "fresh dry-run home"
+        (fresh_home / ".claude").mkdir(parents=True)
+        (fresh_home / ".codex").mkdir()
         result = command(kind, executable, external, shell_args(kind, "sync", "--dry-run"), fresh_home)
         check(
             f"{kind} fresh dry-run returns before bootstrap mutation",
-            result.returncode == 0 and not (fresh_home / ".agents").exists(),
+            result.returncode == 0
+            and not (fresh_home / ".agents").exists()
+            and not (fresh_home / ".issue-flow-bootstrap.lock").exists(),
             result,
         )
         empty_command_home = root / "empty command home"
@@ -788,6 +796,23 @@ for kind, executable in shells():
         fresh_install_home = root / "fresh install home \u00f1"
         (fresh_install_home / ".claude").mkdir(parents=True)
         (fresh_install_home / ".codex").mkdir()
+        if os.name == "nt" and kind == "PowerShell":
+            junction_home = root / "bootstrap junction home"
+            junction_home.mkdir()
+            junction_target = root / "bootstrap junction target"
+            (junction_target / "repository.git").mkdir(parents=True)
+            (junction_target / ".issue-flow-bootstrap-owner").write_bytes(b"owner")
+            junction_sentinel = junction_target / "repository.git/sentinel"
+            junction_sentinel.write_bytes(b"preserve")
+            junction = junction_home / (".issue-flow-bootstrap-" + "a" * 32)
+            create_directory_pointer(junction, junction_target)
+            result = command(kind, executable, external, shell_args(kind, "install"), junction_home)
+            check(
+                "PowerShell bootstrap refuses a quarantine junction without deleting its target",
+                result.returncode != 0 and junction_sentinel.read_bytes() == b"preserve",
+                result,
+            )
+            remove_directory_pointer(junction)
         stale_bootstrap = fresh_install_home / (".issue-flow-bootstrap-" + "d" * 32)
         (stale_bootstrap / "repository.git").mkdir(parents=True)
         (stale_bootstrap / ".issue-flow-bootstrap-owner").write_bytes(b"\0")
@@ -1358,7 +1383,13 @@ for kind, executable in shells():
             f"\turl = ext::touch {worktree_sentinel.as_posix()}\n",
             encoding="utf-8",
         )
-        result = command(kind, executable, external, shell_args(kind, "install"), worktree_config_home)
+        result = command(
+            kind,
+            executable,
+            external,
+            shell_args(kind, "install", "--dry-run"),
+            worktree_config_home,
+        )
         check(
             f"{kind} rejects worktree-scoped legacy Git authority before object reads",
             result.returncode != 0
@@ -1504,25 +1535,18 @@ for kind, executable in shells():
             concurrent_target = fetch_target(concurrent_paths)
             concurrent_entries = tree_entries(concurrent_paths, concurrent_target)
             concurrent_policy = LOCAL_POLICY.replace(b"| Tracker | github |", b"| Tracker | linear |")
-            original_replace_path = installer.replace_path
-
-            def update_policy_before_legacy_move(source: Path, destination: Path) -> None:
-                if source == concurrent_paths.canonical:
-                    (source / "operator.local.md").write_bytes(concurrent_policy)
-                original_replace_path(source, destination)
-
-            installer.replace_path = update_policy_before_legacy_move
+            policy_generation(concurrent_paths, LOCAL_POLICY)
+            installer.write_bytes_atomic(concurrent_paths.config, LOCAL_POLICY)
+            (concurrent_policy_legacy / "operator.local.md").write_bytes(concurrent_policy)
             migration_error: Exception | None = None
             try:
                 installer.migrate_legacy(concurrent_paths, concurrent_target, concurrent_entries)
             except Exception as error:
                 migration_error = error
-            finally:
-                installer.replace_path = original_replace_path
             if migration_error is None:
                 installer.finish_target(concurrent_paths, concurrent_target, keep=True)
             check(
-                "shared migration preserves a concurrent v1.11 policy update",
+                "shared migration retry adopts policy changed after provisional state",
                 migration_error is None
                 and concurrent_paths.config.read_bytes() == concurrent_policy
                 and (concurrent_paths.canonical / "operator.local.md").read_bytes() == concurrent_policy,
@@ -1684,24 +1708,32 @@ for kind, executable in shells():
         if os.name == "nt":
             utf16_policy_text = manual_policy.decode("utf-8") + "PowerShell 5.1 instruction: preserve this too.\r\n"
             visible_policy.write_bytes(utf16_policy_text.encode("utf-16"))
-            result = command(
-                kind,
-                executable,
-                installed / ("install.sh" if kind == "POSIX" else "install.ps1"),
-                shell_args(kind, "config"),
-                home,
-            )
+            original_complete_policy_switch = installer.complete_policy_switch
+
+            def interrupt_utf16_policy_switch(_paths: Paths, _generation: Path) -> None:
+                raise InstallError("injected UTF-16 policy publication interruption")
+
+            installer.complete_policy_switch = interrupt_utf16_policy_switch
+            try:
+                try:
+                    installer.configure(fixture_paths, None, False)
+                except InstallError:
+                    utf16_interrupted = True
+                else:
+                    utf16_interrupted = False
+            finally:
+                installer.complete_policy_switch = original_complete_policy_switch
+            installer.recover_policy_transaction(fixture_paths)
             configured_policy = visible_policy.read_bytes()
             manual_policy = utf16_policy_text.encode("utf-8")
             policy_files = list(fixture_paths.policies.iterdir())
             check(
                 f"{kind} config normalizes a PowerShell 5.1 UTF-16 policy edit",
-                result.returncode == 0
+                utf16_interrupted
                 and configured_policy == manual_policy
                 and fixture_paths.config.read_bytes() == manual_policy
                 and len(policy_files) == 1
                 and os.path.samefile(visible_policy, policy_files[0]),
-                result,
             )
 
         external_policy_link = root / "external-policy-link"
@@ -2559,9 +2591,10 @@ for kind, executable in shells():
         )
         with InstallerLock(Paths.for_home(home)):
             locked = command(kind, executable, active_script, shell_args(kind, "recover"), home)
+            locked_dry = command(kind, executable, active_script, shell_args(kind, "recover", "--dry-run"), home)
         check(
-            f"{kind} recovery cannot steal a live operating-system lock",
-            locked.returncode != 0,
+            f"{kind} live and dry recovery cannot steal a live operating-system lock",
+            locked.returncode != 0 and locked_dry.returncode != 0,
             locked,
         )
         temporary_id = "d" * 32
@@ -2572,7 +2605,7 @@ for kind, executable in shells():
         abandoned_activation = home / f".agents/skills/.issue-flow.activate-{temporary_id}"
         create_directory_pointer(abandoned_activation, installed.resolve(strict=True))
         abandoned_bundle_link = installed / f".operator.local.md.{temporary_id}.tmp"
-        os.link(fixture_paths.config, abandoned_bundle_link)
+        os.link(installer.current_policy_generation(fixture_paths), abandoned_bundle_link)
         abandoned_policy = fixture_paths.policies / f".policy.{temporary_id}.tmp"
         abandoned_policy.write_bytes(b"partial")
         abandoned_object = object_store / "objects/pack" / f".object.{temporary_id}.tmp"
@@ -2585,10 +2618,13 @@ for kind, executable in shells():
         for ref_lock in abandoned_ref_locks:
             ref_lock.parent.mkdir(parents=True, exist_ok=True)
             ref_lock.write_bytes(b"partial ref update")
+        dry_cleanup = command(kind, executable, active_script, shell_args(kind, "recover", "--dry-run"), home)
+        dry_cleanup_preserved = dry_cleanup.returncode == 0 and abandoned_bundle_link.exists()
         result = command(kind, executable, active_script, shell_args(kind, "recover"), home)
         check(
             f"{kind} recovers a post-switch receipt write after lock release",
-            result.returncode == 0
+            dry_cleanup_preserved
+            and result.returncode == 0
             and not (state_root / "transaction.json").exists()
             and not abandoned_repository.exists()
             and not abandoned_json.exists()
@@ -2599,7 +2635,7 @@ for kind, executable in shells():
             and not any(ref_lock.exists() for ref_lock in abandoned_ref_locks)
             and current_revision(home) == new
             and json.loads((state_root / "current.json").read_text(encoding="utf-8"))["previous"] == candidate,
-            result,
+            dry_cleanup if not dry_cleanup_preserved else result,
         )
         check(
             f"{kind} recovery re-retains active Git objects",

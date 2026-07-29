@@ -44,7 +44,9 @@ All notable changes to Issue Flow are documented here.
   an authorized in-place visible edit. Legacy migration rejects reserved
   attachment names, linked policy, config includes, worktree-scoped config and
   promisor/partial-clone authority before publishing state. Migration preserves a concurrent v1.11
-  policy write, and `config` normalizes BOM-marked PowerShell 5.1 UTF-16 edits to UTF-8.
+  policy write before the clone move and adopts provisional policy after an interrupted attempt;
+  migration now explicitly requires all lockless v1.11 commands to be stopped. `config` normalizes
+  BOM-marked PowerShell 5.1 UTF-16 edits to UTF-8, including journal recovery.
 - Retain every activated bundle for resolved readers, verify retained bytes and attachments in
   `status`, atomically tombstone never-activated targets for crash-resumable cleanup, and report
   deduplicated storage including corrupt, unactivated, incoming and auxiliary installer state.
@@ -53,6 +55,9 @@ All notable changes to Issue Flow are documented here.
 - Run the shared installer acceptance state machine once per operating-system lane, with compact
   wrapper smoke tests for Windows PowerShell 5.1 and Git Bash instead of repeating every case; test
   scripts now report failures and aggregate totals instead of printing every passing assertion.
+- Refuse Windows quarantine junctions, create installer directories as private `0700` even under
+  `umask 000`, validate legacy authority before dry-run object reads, and make dry recovery probe the
+  real POSIX lock while accepting only verified stable-policy hard-link temporaries.
 
 ## [1.11.0] - 2026-07-28
 

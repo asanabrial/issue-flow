@@ -163,7 +163,7 @@ def ensure_real_directory(path: Path) -> None:
                 fail(f"{directory} must be a real directory, not a link or file")
             continue
         try:
-            directory.mkdir()
+            directory.mkdir(mode=0o700)
             fsync_directory(directory.parent)
         except FileExistsError:
             pass
@@ -1388,6 +1388,29 @@ def policy_link_temporaries(paths: Paths, generation: Path) -> set[Path]:
     return temporaries
 
 
+def stable_policy_temporaries(paths: Paths) -> set[Path]:
+    if not path_exists(paths.config):
+        return set()
+    details = os.lstat(paths.config)
+    if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+        fail(f"stable policy is not a private regular file: {paths.config}")
+    content = paths.config.read_bytes()
+    generation = paths.policies / hashlib.sha256(content).hexdigest()
+    if not path_exists(generation):
+        return set()
+    temporaries = policy_link_temporaries(paths, generation)
+    if not temporaries:
+        return set()
+    generation_details = os.lstat(generation)
+    if (
+        not stat.S_ISREG(generation_details.st_mode)
+        or generation.read_bytes() != content
+        or generation_details.st_nlink != known_policy_link_count(paths, generation) + len(temporaries)
+    ):
+        fail(f"stable policy has an invalid replacement temporary: {generation}")
+    return temporaries
+
+
 def complete_policy_switch(paths: Paths, generation: Path) -> None:
     for destination in policy_destinations(paths):
         if is_regular_hardlink(destination, generation):
@@ -1486,7 +1509,7 @@ def switch_policy(paths: Paths, content: bytes, edited_destination: Path | None 
 
 def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> set[Path]:
     if not paths.policy_transaction.exists():
-        return set()
+        return stable_policy_temporaries(paths)
     transaction = read_json(paths.policy_transaction)
     if set(transaction) != {"schema", "generation", "previous"} or transaction.get("schema") != STATE_SCHEMA:
         fail(f"invalid policy transaction shape: {paths.policy_transaction}")
@@ -1527,8 +1550,12 @@ def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> set[Path]
             fail(f"previous policy transaction generation is missing or invalid: {previous}")
         previous_digest = hashlib.sha256(previous.read_bytes()).hexdigest()
         predecessor_was_edited = previous_digest != previous_name
+        previous_content = previous.read_bytes()
+        generation_content = generation.read_bytes()
+        encoding_only_edit = decode_policy(previous_content, previous) == decode_policy(generation_content, generation)
         if predecessor_was_edited and not (
-            stable_name in {previous_name, generation_name} and previous.read_bytes() == generation.read_bytes()
+            stable_name in {previous_name, generation_name}
+            and (previous_content == generation_content or encoding_only_edit)
         ):
             fail(f"previous policy generation is corrupt outside the authorized visible edit: {previous}")
         previous_temporaries = policy_link_temporaries(paths, previous)
@@ -1545,6 +1572,10 @@ def recover_policy_transaction(paths: Paths, dry_run: bool = False) -> set[Path]
     if not dry_run:
         complete_policy_switch(paths, generation)
         remove_state_file(paths.policy_transaction)
+        for candidate in paths.policies.iterdir():
+            if candidate != generation and candidate.is_file() and candidate.stat().st_nlink == 1:
+                candidate.unlink()
+        fsync_directory(paths.policies)
     return generation_temporaries | previous_temporaries
 
 
@@ -2247,7 +2278,11 @@ def migrate_legacy(paths: Paths, target: str, target_entries: list[dict[str, str
     if (paths.canonical / CONFIG_FILE).exists():
         config = (paths.canonical / CONFIG_FILE).read_bytes()
         if paths.config.exists() and paths.config.read_bytes() != config:
-            fail(f"stable operator policy conflicts with the legacy bytes at {paths.canonical / CONFIG_FILE}")
+            if paths.current.exists() or paths.transaction.exists():
+                fail(f"stable operator policy conflicts with the legacy bytes at {paths.canonical / CONFIG_FILE}")
+            # State without activation provenance is provisional from an interrupted migration.
+            attach_local(paths, target_bundle, allow_dangling=True)
+            switch_policy(paths, config)
         if not paths.config.exists():
             policy_generation(paths, config)
             write_bytes_atomic(paths.config, config, mode=stat.S_IRUSR | stat.S_IWUSR)
@@ -2301,6 +2336,7 @@ def recover_transaction(
     paths: Paths,
     dry_run: bool = False,
     ignored_paths: frozenset[Path] = frozenset(),
+    verify_policy: bool = True,
 ) -> None:
     if not paths.transaction.exists():
         return
@@ -2327,7 +2363,7 @@ def recover_transaction(
     if backup and backup.exists() and (is_pointer(backup) or not backup.is_dir()):
         fail(f"activation transaction backup is not a real legacy directory: {backup}")
     if is_pointer(paths.canonical):
-        _, receipt = active_bundle(paths, ignored_paths=ignored_paths)
+        _, receipt = active_bundle(paths, verify_policy=verify_policy, ignored_paths=ignored_paths)
         current = str(receipt["commit"])
         if current == target:
             # Activation may have switched the pointer immediately before interruption.
@@ -2466,6 +2502,7 @@ def dry_run_sync(paths: Paths, announce: bool = True) -> tuple[str, str]:
             current = str(receipt["commit"])
         else:
             # Target entries are validated in the transient object store below.
+            validate_legacy_repository(paths.canonical)
             current = legacy_git(paths, "rev-parse", "HEAD^{commit}").stdout.strip()
     with tempfile.TemporaryDirectory(prefix="issue-flow-dry-run-") as temporary:
         dry = transient_paths(Path(temporary))
@@ -2867,7 +2904,22 @@ def recover(paths: Paths, dry_run: bool) -> None:
         policy_temporaries: set[Path] = set()
         if path_exists(paths.lock):
             lock = open_safe_lock(paths.lock)
-            lock.close()
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                fail(f"another installer holds the operating-system lock {paths.lock}")
+            finally:
+                lock.close()
         print(f"would   acquire operating-system lock {paths.lock}")
         if path_exists(paths.state):
             if is_pointer(paths.state) or not paths.state.is_dir():
@@ -2877,12 +2929,17 @@ def recover(paths: Paths, dry_run: bool) -> None:
             policy_temporaries = recover_policy_transaction(paths, dry_run=True)
             candidates = abandoned_paths(paths)
             validate_abandoned_paths(paths, candidates, frozenset(policy_temporaries))
-            recover_transaction(paths, dry_run=True, ignored_paths=frozenset(candidates))
+            recover_transaction(
+                paths,
+                dry_run=True,
+                ignored_paths=frozenset(candidates),
+                verify_policy=not policy_temporaries,
+            )
             if not paths.transaction.exists():
                 if is_pointer(paths.canonical):
                     active_state(
                         paths,
-                        verify_policy=not paths.policy_transaction.exists(),
+                        verify_policy=not paths.policy_transaction.exists() and not policy_temporaries,
                         ignored_paths=frozenset(candidates),
                     )
                 else:
