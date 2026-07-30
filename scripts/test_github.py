@@ -1649,10 +1649,10 @@ class Clone:
                                    stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    def linked_branches(self, issue, cwd):
+    def branch_linked(self, issue, branch, cwd):
         if self.link_read_fails:
             raise m.ReadFailure("linked-branch GraphQL response is partial or malformed")
-        return set(self.linked)
+        return branch in self.linked
 
     def start(self, *, run_id=ME, issue=6, template=None, registry=None):
         args = SimpleNamespace(issue=issue, run_id=run_id, expect_state="in-progress",
@@ -1660,7 +1660,7 @@ class Clone:
                                branch="fix/6", base="main")
         with patch.multiple(m, run=self.run, do_verify_claim=lambda *_a: {},
                             repo_identity=lambda _cwd: ("owner", "repo"),
-                            linked_branch_names=self.linked_branches,
+                            is_branch_linked=self.branch_linked,
                             registered_worktrees=lambda _cwd: dict(registry or {})):
             return m.cmd_start_branch(args, {}, Path("."))
 
@@ -1785,17 +1785,17 @@ with tempfile_module.TemporaryDirectory() as root:
 
 with tempfile_module.TemporaryDirectory() as root:
     clone = Clone(root, develop_rc=1, linked=["fix/6"])
-    with patch.multiple(m, run=clone.run, linked_branch_names=clone.linked_branches):
+    with patch.multiple(m, run=clone.run, is_branch_linked=clone.branch_linked):
         check("an already-existing branch is read back as linked, not guessed at",
               m.develop_link(6, "fix/6", "main", Path("."))["outcome"], "already-linked")
 
     clone = Clone(root, develop_rc=1, linked=[])
-    with patch.multiple(m, run=clone.run, linked_branch_names=clone.linked_branches):
+    with patch.multiple(m, run=clone.run, is_branch_linked=clone.branch_linked):
         check("a conclusive read that no link exists is allowed to say so",
               m.develop_link(6, "fix/6", "main", Path("."))["linked"], False)
 
     clone = Clone(root, develop_rc=1, link_read_fails=True)
-    with patch.multiple(m, run=clone.run, linked_branch_names=clone.linked_branches):
+    with patch.multiple(m, run=clone.run, is_branch_linked=clone.branch_linked):
         check("a failed read-back is a failed read, not an absent link",
               refused(lambda: m.develop_link(6, "fix/6", "main", Path("."))), "ReadFailure")
 
@@ -1809,29 +1809,39 @@ with tempfile_module.TemporaryDirectory() as root:
     with patch.multiple(m, gh_json=lambda *_a, **_k: sidebar(["fix/6"], False),
                         repo_identity=lambda _cwd: ("o", "r")):
         check("a complete sidebar page answers the question",
-              m.linked_branch_names(6, Path(".")), {"fix/6"})
-    with patch.multiple(m, gh_json=lambda *_a, **_k: sidebar([], True),
+              m.is_branch_linked(6, "fix/6", Path(".")), True)
+    with patch.multiple(m, gh_json=lambda *_a, **_k: sidebar(["other"], False),
                         repo_identity=lambda _cwd: ("o", "r")):
-        check("a truncated sidebar page is a failed read, not an absent link",
-              refused(lambda: m.linked_branch_names(6, Path("."))), "ReadFailure")
+        check("a complete page without the branch is a real absence",
+              m.is_branch_linked(6, "fix/6", Path(".")), False)
+    with patch.multiple(m, gh_json=lambda *_a, **_k: sidebar(["other"], True),
+                        repo_identity=lambda _cwd: ("o", "r")):
+        check("a truncated page that lacks the branch cannot prove it absent",
+              refused(lambda: m.is_branch_linked(6, "fix/6", Path("."))), "ReadFailure")
+    # Only ONE of the two answers needs a complete page. A later page cannot un-link a branch that
+    # is already on this one, so refusing here would turn a definite yes into an unretryable exit 3.
+    with patch.multiple(m, gh_json=lambda *_a, **_k: sidebar(["fix/6"], True),
+                        repo_identity=lambda _cwd: ("o", "r")):
+        check("a truncated page that CONTAINS the branch is still a definite yes",
+              m.is_branch_linked(6, "fix/6", Path(".")), True)
     with patch.multiple(m, gh_json=lambda *_a, **_k: {"data": {"repository": {"issue": {
                             "linkedBranches": {"nodes": []}}}}},
                         repo_identity=lambda _cwd: ("o", "r")):
         check("a sidebar page with no page metadata is a failed read",
-              refused(lambda: m.linked_branch_names(6, Path("."))), "ReadFailure")
+              refused(lambda: m.is_branch_linked(6, "fix/6", Path("."))), "ReadFailure")
 
     clone = Clone(root, develop_timeout=True, linked=[])
-    with patch.multiple(m, run=clone.run, linked_branch_names=clone.linked_branches):
+    with patch.multiple(m, run=clone.run, is_branch_linked=clone.branch_linked):
         check("a timeout whose ref may exist is an ambiguous write, not a no-op",
               refused(lambda: m.develop_link(6, "fix/6", "main", Path("."))), "WriteFailure")
 
     clone = Clone(root, develop_timeout=True, link_read_fails=True)
-    with patch.multiple(m, run=clone.run, linked_branch_names=clone.linked_branches):
+    with patch.multiple(m, run=clone.run, is_branch_linked=clone.branch_linked):
         check("a timeout that cannot be re-read is still an ambiguous write",
               refused(lambda: m.develop_link(6, "fix/6", "main", Path("."))), "WriteFailure")
 
     clone = Clone(root, develop_timeout=True, linked=["fix/6"])
-    with patch.multiple(m, run=clone.run, linked_branch_names=clone.linked_branches):
+    with patch.multiple(m, run=clone.run, is_branch_linked=clone.branch_linked):
         check("a timeout that the sidebar proves landed is success",
               m.develop_link(6, "fix/6", "main", Path("."))["linked"], True)
 
@@ -1872,6 +1882,27 @@ with tempfile_module.TemporaryDirectory() as root:
           lost, "run-scope-lost-to-alias")
     check("a path whose run scope survives is accepted",
           m.same_location(m.canonical_worktree_path(real / "sub", "real"), real / "sub"), True)
+
+    # The check counts components rather than asking "does the name still appear anywhere", and
+    # folds case where the filesystem does. Both matter: `realpath` on Windows restores each
+    # component's ON-DISK case, so an ancestor the operator created as `Real` would otherwise read
+    # as "the run scope disappeared" with no link present at all. A fail-closed false positive is
+    # still a false positive, and this one refuses a legitimate configuration with exit 2.
+    # Reproduce it properly: the run-scoped ancestor is SPELLED lowercase in the template and
+    # exists on disk as `CASED`. On a case-insensitive filesystem `realpath` restores the on-disk
+    # spelling, so a case-sensitive component comparison sees the run scope vanish — with no link
+    # anywhere — and refuses a legitimate configuration with exit 2.
+    cased = Path(root) / "CASED"
+    (cased / "sub").mkdir(parents=True)
+    spelled = Path(root) / "cased" / "sub"
+    if spelled.exists():  # only meaningful where the filesystem folds case
+        case_verdict = refused(lambda: m.canonical_worktree_path(spelled, "cased"))
+    else:
+        case_verdict = "accepted"  # case-sensitive filesystem: the ancestor genuinely is not there
+    check("an on-disk case difference is not mistaken for a resolved-away run scope",
+          case_verdict, "accepted")
+    check("a run ID that also names an unrelated surviving component is not refused",
+          m.same_location(m.canonical_worktree_path(real / "real", "real"), real / "real"), True)
 
 print()
 print(f"{CHECKS - len(FAILURES)}/{CHECKS} checks passed" + (f"; failures: {FAILURES}" if FAILURES else ""))

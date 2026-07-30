@@ -359,10 +359,14 @@ The fourth row is the one worth defending: an unproven claim is not a permissive
 registered checkout of your branch with no marker cannot be told apart from one a run is using right
 now, and the recovery for it is documented below rather than guessed at.
 
-A worktree directory that is itself a symlink or junction is refused as a configuration defect, since
-two run IDs pointing into one real directory defeats every rule above. An *ancestor* being a link —
-a worktree root parked on another volume, `/tmp` on macOS — is ordinary and is resolved rather than
-refused: it redirects every run's directory identically, so it cannot fold two runs together.
+A worktree directory that is itself a symlink or junction is refused as a configuration defect
+(`aliased-worktree-path`), since two run IDs pointing into one real directory defeats every rule
+above. An *ancestor* being a link — a worktree root parked on another volume, `/tmp` on macOS — is
+ordinary and is resolved rather than refused: it redirects every run's directory identically, so it
+cannot fold two runs together. The exception is an ancestor link that resolves the RUN-SCOPED part
+of the path away, which a leaf-only check cannot see; that is refused as `run-scope-lost-to-alias`,
+compared component-wise and case-folded exactly where the filesystem folds, because `realpath` on
+Windows restores each component's on-disk case and a fail-closed false positive is still one.
 
 ### Nothing is created remotely until the local checkout is reserved
 
@@ -387,6 +391,12 @@ the Development sidebar** and let the read decide:
 | conclusively not linked, after a **timeout** | ambiguous write, exit `5` — a ref may exist right now |
 | the read itself failed | exit `3`; after a timeout, exit `5` |
 
+One asymmetry inside that table is deliberate: only the ABSENT answer needs a complete page. Finding
+the branch in the sidebar is conclusive whatever else the connection holds, because a later page
+cannot un-link it, while concluding it absent rests on having seen everything. So a truncated
+connection that contains the branch is a yes, and a truncated connection that does not is a failed
+read — refusing both would turn an answered question into an unretryable exit `3`.
+
 Existence probes follow the same rule. `git rev-parse --verify --quiet` was used before and cannot
 answer the question: it exits `1` for "no such ref" AND for a corrupt object store, an unreadable
 `.git`, a broken packed-refs file — every way the question can go unanswered. `git for-each-ref`
@@ -394,14 +404,30 @@ separates them, because a successful exit with no output is a real absence and a
 read that did not answer. A run that reads "absent" from a failed read creates the branch again from
 the base, and a resumed branch silently restarts from zero.
 
+**Its argument is a pattern, not a path, so the refname is matched again on the way out.** A
+`for-each-ref` pattern matches a ref completely OR from the beginning up to a slash, so
+`refs/heads/foo` also matches `refs/heads/foo/bar` — and asking about a branch `foo` that does not
+exist would otherwise return the child's object id. That is not an unhelpful answer but a wrong one:
+`foo` would be reported as present at a commit belonging to another branch. Only an exact refname
+counts; children are ignored rather than mistaken for the parent.
+
 Finally, **a successful native creation must tell one story.** `gh issue develop` branches from the
 base as the SERVER sees it, which is not necessarily the base this run fetched and recorded. If the
 base moved in between, the branch starts at a commit the run never saw while the command reports the
 recorded base as its own — and every later `Reviewed-Base:` claim inherits that. So a fresh creation
 requires local head, published head and recorded base to be equal, and a resume requires the
-published head to be reachable from the local head. Local ahead of remote is ordinary unpushed work;
-remote ahead of local means somebody else pushed and continuing would build on a head this checkout
-has never seen. An ancestry that could not be established is not a pass.
+published head to be reachable from the local head. Local ahead of remote is ordinary unpushed work.
+A published head that is NOT reachable from the local one is refused as
+`remote-not-reachable-from-local` — named for what was established rather than for the likeliest
+cause, because it covers both somebody pushing ahead of you and somebody rebasing or force-pushing
+the branch out from under you, and pointing the reader at commits to fast-forward that may not exist
+is worse than saying less. Either way, continuing would build on a head this checkout has never seen.
+An ancestry that could not be established is not a pass.
+
+A coherence stop is the one refusal that comes *after* a remote write, necessarily: the disagreement
+cannot be seen until the branch has been published. Nothing is reported as delivered, but the branch
+does exist remotely, so the payload says so rather than implying a clean slate — re-running resumes
+it as it now stands.
 
 ### Recovering a worktree or a branch lock
 
@@ -428,7 +454,9 @@ same on Windows and POSIX except where noted.
    file under `<common-git-dir>/issue-flow/branch-locks/`. Only after step 3.
 6. **Re-run `start-branch` unchanged.** It is idempotent: it re-reads everything and either creates
    the checkout or tells you what still refuses it. A lock naming your OWN run is your own retry and
-   never blocks you.
+   never blocks you — it is *adopted*, so the attempt that succeeds is also the one that releases
+   it. A run that merely stepped past its own leftover lock would leave nobody entitled to remove
+   it, and the next different run would be blocked by it forever.
 
 Windows: `git worktree remove` fails while any process holds a handle in the directory — an editor,
 a terminal, an antivirus scan. Close them rather than forcing. POSIX: a worktree whose path contains

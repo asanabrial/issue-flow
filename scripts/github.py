@@ -2297,10 +2297,14 @@ def canonical_worktree_path(path: Path, run_id: str | None = None) -> Path:
     # The leaf check above covers a template whose run-scoped part IS the last component, which is
     # every template this command produces. A hand-written `…/<run-id>/checkout` puts it in an
     # ancestor, where a junction could redirect it while the leaf resolves cleanly — and the
-    # surviving evidence is that the run ID stops appearing in the real path at all. Cheap to
-    # check, and it is the only symptom an ancestor redirection cannot hide.
-    if run_id and run_id in str(path).replace("\\", "/").split("/") \
-            and run_id not in str(canonical).replace("\\", "/").split("/"):
+    # surviving evidence is that the run ID stops appearing in the real path at all.
+    #
+    # Compared component-wise and case-folded exactly where `same_location` folds, because
+    # `realpath` on Windows restores each component's ON-DISK case: an ancestor the operator
+    # created as `Run-A` would otherwise read as "the run scope disappeared" with no link present
+    # anywhere. A fail-closed false positive is still a false positive.
+    if run_id and path_components(path).count(fold_case(run_id)) \
+            > path_components(canonical).count(fold_case(run_id)):
         raise ConfigDefect(
             {
                 "ok": False,
@@ -2334,6 +2338,16 @@ def normalise_path(path) -> str:
     return text.lower() if os.name == "nt" else text
 
 
+def fold_case(text: str) -> str:
+    """Fold case exactly where the filesystem does, and nowhere else. See `normalise_path`."""
+    return text.lower() if os.name == "nt" else text
+
+
+def path_components(path) -> list[str]:
+    """A path split into components, spelled the way this module compares paths."""
+    return [fold_case(part) for part in str(path).replace("\\", "/").split("/")]
+
+
 def same_location(left, right) -> bool:
     """Do two already-spelled paths name the same place, WITHOUT resolving either?
 
@@ -2343,8 +2357,7 @@ def same_location(left, right) -> bool:
     exactly where the filesystem does, for the same reason `normalise_path` does.
     """
     def spell(value) -> str:
-        text = str(value).replace("\\", "/").rstrip("/")
-        return text.lower() if os.name == "nt" else text
+        return fold_case(str(value).replace("\\", "/").rstrip("/"))
 
     return spell(left) == spell(right)
 
@@ -2795,18 +2808,20 @@ query($owner: String!, $name: String!, $number: Int!) {
 """
 
 
-def linked_branch_names(issue: int, cwd: Path) -> set[str]:
-    """The branches GitHub records in the issue's Development sidebar, or a failed read.
+def is_branch_linked(issue: int, branch: str, cwd: Path) -> bool:
+    """Is this branch in the issue's Development sidebar? Answers, or fails the read.
 
-    This is the read-back that turns an ambiguous `gh issue develop` into a fact. Every shape that
-    is not a complete answer is refused, because the caller uses "not in this set" to conclude the
-    link does not exist, and that conclusion may not rest on a response that simply omitted it.
+    This is the read-back that turns an ambiguous `gh issue develop` into a fact.
 
-    Incompleteness includes a TRUNCATED page, for exactly the reason issue #28 established for
-    closing references: a connection that still advertises another page has not answered "is this
-    branch linked", it has answered "here are some links". One page of 100 is far more than any
-    real issue carries, so this is not expected to fire — but the shape that must never happen is
-    a `hasNextPage: true` read as a complete absence.
+    It takes the branch rather than returning the set, and that asymmetry is the point. Only ONE of
+    the two answers needs the page to be complete. Finding the branch present is conclusive
+    whatever else the connection holds — a later page cannot un-link it. Concluding it ABSENT rests
+    on having seen everything, so a connection still advertising another page has not answered the
+    question; it has answered "here are some links", which is the shape issue #28 established must
+    never be read as an absence. Refusing both ways would turn a definite yes into an unretryable
+    exit `3`, which is a fail-closed answer to a question that was already answered.
+
+    One page of 100 is far more than any real issue carries, so neither branch is expected to fire.
     """
     owner, name = repo_identity(cwd)
     data = gh_json(["api", "graphql", "-f", f"query={LINKED_BRANCHES_QUERY}",
@@ -2821,15 +2836,18 @@ def linked_branch_names(issue: int, cwd: Path) -> set[str]:
     page_info = connection.get("pageInfo")
     if not isinstance(page_info, dict) or not isinstance(page_info.get("hasNextPage"), bool):
         raise ReadFailure("linked-branch response carried no boolean hasNextPage")
-    if page_info["hasNextPage"]:
-        raise ReadFailure("linked-branch connection advertises another page; the answer is partial")
     names = set()
     for node in connection["nodes"]:
         ref = (node or {}).get("ref") if isinstance(node, dict) else None
         if not isinstance(ref, dict) or not isinstance(ref.get("name"), str):
             raise ReadFailure("linked-branch response contains a malformed ref node")
         names.add(ref["name"])
-    return names
+    if branch in names:
+        return True
+    if page_info["hasNextPage"]:
+        raise ReadFailure("linked-branch connection advertises another page, and the branch was "
+                          "not on it; the absence is unproven")
+    return False
 
 
 def develop_link(issue: int, branch: str, base: str, cwd: Path) -> dict:
@@ -2864,7 +2882,7 @@ def develop_link(issue: int, branch: str, base: str, cwd: Path) -> dict:
         timed_out, detail = True, str(exc)
 
     try:
-        linked = branch in linked_branch_names(issue, cwd)
+        linked = is_branch_linked(issue, branch, cwd)
     except ReadFailure:
         if timed_out:
             # The wait expired AND the state is unreadable. The one thing that must not happen is
