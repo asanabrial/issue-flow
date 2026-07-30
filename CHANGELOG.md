@@ -11,12 +11,17 @@ All notable changes to Issue Flow are documented here.
   with one digest over it. Given a reviewer's own target with `--native-start` it fails closed on
   any disagreement, naming the paths that would otherwise ship without authority. Mode is part of
   the identity, so a file becoming executable or replaced by a symlink is a change even when every
-  content byte is identical. It uses `ls-tree`, `status` and `hash-object` without `-w`, writing no
-  object, ref, index or file, because it runs on a tree somebody is still working in.
+  content byte is identical — and where the filesystem carries no executable bit, the committed
+  mode is kept rather than inferred from a permission check that answers "yes" to everything.
+  Symlinks are hashed as their link text, which is what mode 120000 stores. It writes no object and
+  leaves the index, worktree and refs untouched, including `--no-optional-locks` so that reading a
+  status does not take the index lock of a tree somebody is still working in.
 - `base-movement`, a read-only operation that classifies later base movement as none, compatible,
   overlapping, conflicting or unknown, from exact refs, changed paths and `git merge-tree
-  --write-tree`, which merges in memory. An unestablished merge is never compatible, and semantic
-  impact is reported as the caller's judgement rather than settled by textual disjointness.
+  --write-tree` (git 2.38 or newer; below that the answer is `unknown`). It touches no index,
+  worktree or branch, though it does fetch and does write the merged tree into the object store.
+  An unestablished merge is never compatible, and semantic impact is reported as the caller's
+  judgement rather than settled by textual disjointness.
 
 ### Fixed
 
@@ -31,8 +36,10 @@ All notable changes to Issue Flow are documented here.
 
 ### Changed
 
-- `start-branch` records the base TREE alongside the base commit, so a later movement check
-  compares against what the base contained rather than resolving it a second time.
+- `start-branch` records the base TREE alongside the base commit. The commit says which revision
+  was branched from; the tree says what it contained, as durable evidence in the marker and the
+  readback. Nothing consumes it yet — `base-movement` classifies from commits — and it is recorded
+  now so that later checks have it without re-deriving it from a repository that may have moved.
 - Document the default transport behaviour and name `~/.agents/AGENTS.md` as the canonical operator
   override when it exists, without copying its text: review the whole delivery rather than the half
   in front of you, branch from an exact fetched base, and classify later movement instead of

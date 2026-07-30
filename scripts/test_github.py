@@ -2311,6 +2311,49 @@ with tempfile_module.TemporaryDirectory() as area:
     else:
         under_scoped = agrees = mode_only = live_ok
 
+    # Run from a SUBDIRECTORY. `ls-tree` and `status` both emit repository-root-relative paths
+    # whatever directory they were run from, so joining them onto the passed worktree mislocates
+    # every file — the hash then fails, and the overlay reads that failure as "deleted". The target
+    # silently shrinks and still reports success, which is the #70 shape produced by the fix for it.
+    if live_ok is True:
+        (live / "sub").mkdir(exist_ok=True)
+        (live / "sub" / "deep.py").write_text("deep" + NL, encoding="utf-8")
+        git("add", "-A", cwd=live)
+        git("commit", "-qm", "a subdirectory", cwd=live)
+        (live / "sub" / "deep.py").write_text("deeper" + NL, encoding="utf-8")
+        from_sub = m.cmd_expected_target(
+            SimpleNamespace(base=base_sha, worktree=str(live / "sub"), native_start=None),
+            {}, live / "sub")
+        sub_paths = {e["path"] for e in from_sub["manifest"]}
+        # Every mode must be a real git mode, and on a filesystem with no executable bit nothing
+        # may be reported 100755 that the committed tree did not already record that way.
+        modes = {e["mode"] for e in from_sub["manifest"]}
+        subdir_ok = ("sub/deep.py" in sub_paths, sorted(modes))
+    else:
+        subdir_ok = live_ok
+
+    check("running from a subdirectory does not silently drop paths from the target",
+          subdir_ok, (True, ["100644"]))
+
+    # The command promises it can be run against a tree somebody is still working in. A plain
+    # `git status` refreshes and REWRITES `.git/index` and takes `index.lock` to do it, which
+    # breaks that promise for a cache update nobody asked for. Measured, not asserted in prose.
+    if live_ok is True:
+        index = live / ".git" / "index"
+        # Make the index STALE first: a tracked file whose mtime moved but whose content did not is
+        # exactly what makes `git status` refresh and rewrite the cache. Against a freshly written
+        # index there is nothing to refresh, and the check would pass without testing anything.
+        keep = live / "keep.py"
+        os.utime(keep, (os.path.getatime(keep) + 120, os.path.getmtime(keep) + 120))
+        before = index.read_bytes() if index.exists() else None
+        m.cmd_expected_target(
+            SimpleNamespace(base=base_sha, worktree=str(live), native_start=None), {}, live)
+        after = index.read_bytes() if index.exists() else None
+        untouched = before == after
+    else:
+        untouched = live_ok
+    check("deriving the target leaves the index byte-for-byte alone", untouched, True)
+
     check("a review over the committed prefix alone cannot authorise the delivery",
           under_scoped, "review-target-mismatch")
     check("a review over the complete target is accepted", agrees, "matches")

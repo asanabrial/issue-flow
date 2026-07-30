@@ -225,7 +225,8 @@ class Timeout(Exception):
 
 
 def run(args: list[str], cwd: Path | None = None, check: bool = True, writes: bool = False,
-        binary: bool = False, timeout: float | None = None) -> subprocess.CompletedProcess:
+        binary: bool = False, timeout: float | None = None,
+        stdin: str | None = None) -> subprocess.CompletedProcess:
     """Run a command with an argument LIST and no shell.
 
     No shell means no PowerShell backtick expansion, no word splitting, no quoting rules — the
@@ -248,6 +249,9 @@ def run(args: list[str], cwd: Path | None = None, check: bool = True, writes: bo
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             timeout=timeout,
+            # Only ever a value the caller supplies deliberately; `input=None` is exactly the
+            # previous behaviour, so no existing call changes.
+            input=stdin,
             **({} if binary else {"text": True, "encoding": "utf-8", "errors": "replace"}),
         )
     except FileNotFoundError as exc:
@@ -3397,6 +3401,11 @@ def cmd_publish_review(args, config, cwd) -> dict:
     # Everything reported from here on comes from the READ-BACK, never from the write path or the
     # list that preceded it. `pr` is now only an identifier.
     local_head = run(["git", "rev-parse", "HEAD"], cwd=worktree).stdout.strip()
+    # Fetch before resolving the base. GitHub's `baseRefOid` is the CURRENT tip of the base branch,
+    # not the commit this branch was cut from, so comparing it against a stale `origin/<base>` fails
+    # on every delivery whose base has advanced — which `references/repository-delivery.md` calls
+    # normal and expects to be left alone. The readback would then blame a phantom pusher.
+    run(["git", "fetch", "origin", "--", args.base], cwd=worktree)
     expected_base = run(["git", "rev-parse", f"origin/{args.base}^{{commit}}"],
                         cwd=worktree).stdout.strip()
     published = confirm_published(pr["number"], local_head, expected_base, cwd)
@@ -3444,7 +3453,7 @@ def cmd_publish_review(args, config, cwd) -> dict:
 
 
 def cmd_expected_target(args, config, cwd) -> dict:
-    """Emit the COMPLETE intended review target, read-only, before any reviewer runs.
+    """Emit the COMPLETE intended review target before any reviewer runs, without disturbing it.
 
     A reviewer authorises a diff. If what they were shown is a subset of what the pull request
     delivers, their approval is evidence for something that was never reviewed — and nothing
@@ -3470,13 +3479,25 @@ def cmd_expected_target(args, config, cwd) -> dict:
         if not OBJECT_ID_RE.fullmatch(oid):
             raise ReadFailure(f"git did not resolve the {label} to an object id: {oid!r}")
 
+    # Every path below is repository-root relative, because that is what `ls-tree --full-tree` and
+    # `status --porcelain` both emit — regardless of which directory the command was run from.
+    # Joining them onto `--worktree` silently mislocates every file when that is a SUBDIRECTORY,
+    # and the hash then fails, and the overlay reads that failure as "the file was deleted": the
+    # target quietly shrinks and reports success. Resolve against the top level instead.
+    top = Path(run(["git", "rev-parse", "--show-toplevel"], cwd=worktree).stdout.strip())
+
     listing = run(["git", "ls-tree", "-r", "-z", "--full-tree", "HEAD"],
                   cwd=worktree, binary=True).stdout.decode("utf-8", "surrogateescape")
     if listing and not listing.endswith("\0"):
         raise ReadFailure("git ls-tree ended mid-entry")
     committed = tree_manifest(listing.split("\0")[:-1] if listing else [])
 
-    status_out = run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    # `--no-optional-locks` because a plain `git status` refreshes and REWRITES `.git/index` and
+    # takes `index.lock` to do it. This command's whole promise is that it can be run against a
+    # tree somebody is still working in, and taking their index lock breaks that promise for the
+    # sake of a cache update nobody asked for.
+    status_out = run(["git", "--no-optional-locks", "status", "--porcelain=v1", "-z",
+                      "--untracked-files=all"],
                      cwd=worktree, binary=True).stdout.decode("utf-8", "surrogateescape")
     status, fields = [], status_out.split("\0")[:-1] if status_out else []
     index = 0
@@ -3495,17 +3516,39 @@ def cmd_expected_target(args, config, cwd) -> dict:
         status.append((code, path))
         index += 1
 
+    # Does this filesystem carry an executable bit at all? Git answers for itself, and on Windows
+    # the answer is no. `os.access(X_OK)` cannot decide it: on Windows it returns True for EVERY
+    # existing file — measured on a plain `.md` — so inferring from it reports `100755` for every
+    # overlaid path, makes the digest disagree with the same tree checked out on Linux, and turns
+    # a cross-platform review into a guaranteed false mismatch.
+    file_mode = run(["git", "config", "--get", "core.fileMode"], cwd=worktree,
+                    check=False).stdout.strip().lower()
+    honours_exec_bit = file_mode != "false" and os.name != "nt"
+
     def blob_of(path: str):
-        target = worktree / path
-        if not target.exists() and not target.is_symlink():
+        entry = top / path
+        if not entry.is_symlink() and not entry.exists():
             return None
-        probe = run(["git", "hash-object", "--", str(target)], cwd=worktree, check=False)
+        if entry.is_symlink():
+            # Hash the LINK TEXT, which is what git stores behind mode 120000. `hash-object` on
+            # the path follows the link and records the blob of whatever it points at — a
+            # different object, and one that changes when the target changes rather than the link.
+            link = run(["git", "hash-object", "--stdin"], cwd=worktree, check=False,
+                       stdin=os.readlink(entry))
+            oid = link.stdout.strip()
+            if link.returncode != 0 or not OBJECT_ID_RE.fullmatch(oid):
+                raise ReadFailure(f"could not hash the symlink {path!r}")
+            return ("120000", oid)
+        probe = run(["git", "hash-object", "--", str(entry)], cwd=worktree, check=False)
         oid = probe.stdout.strip()
         if probe.returncode != 0 or not OBJECT_ID_RE.fullmatch(oid):
             raise ReadFailure(f"could not hash {path!r}: {probe.stderr.strip()}")
-        mode = "120000" if target.is_symlink() else ("100755" if os.access(target, os.X_OK)
-                                                     else "100644")
-        return (mode, oid)
+        if honours_exec_bit:
+            return ("100755" if os.access(entry, os.X_OK) else "100644", oid)
+        # No executable bit to read, so keep whatever the committed tree recorded: a file that is
+        # 100755 in the repository stays 100755 rather than being downgraded by the filesystem it
+        # happens to be checked out on.
+        return (committed.get(path, ("100644", None))[0], oid)
 
     target = overlay_worktree(committed, status, blob_of)
     digest = manifest_digest(target)
@@ -3557,10 +3600,19 @@ def cmd_base_movement(args, config, cwd) -> dict:
     script can establish exactly (which refs, which paths, whether a merge conflicts) rather than
     an impression.
 
-    `git merge-tree --write-tree` performs the merge entirely in memory: no index, no worktree, no
-    ref. Its exit status reports conflicts. Semantic impact — two disjoint files that must change
-    together — is not visible to any merge algorithm, so this says so and leaves that judgement
-    with the caller instead of implying textual cleanliness settles it.
+    `git merge-tree --write-tree` performs the merge without touching the index, the worktree or
+    any branch; its exit status reports conflicts. It is not, however, side-effect free, and saying
+    so plainly matters because an adversarial reviewer is repository read-only: it writes the merged
+    tree into the object store, and this command fetches first, which updates remote-tracking refs.
+    Neither changes a branch, the index or a file, so nothing a run is working on moves — but
+    "read-only" here means *does not modify the delivery*, not *writes nothing at all*.
+
+    Semantic impact — two disjoint files that must change together — is not visible to any merge
+    algorithm, so this says so and leaves that judgement with the caller instead of implying
+    textual cleanliness settles it.
+
+    `--write-tree` needs git 2.38. Below that the merge cannot be established and the answer is
+    `unknown`, which integrates rather than assuming compatibility.
     """
     worktree = Path(args.worktree) if args.worktree else cwd
     run(["git", "fetch", "origin"], cwd=worktree)
