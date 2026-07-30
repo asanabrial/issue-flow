@@ -312,7 +312,7 @@ with any extension.
 
 **What the path must guarantee is that no two live runs share a directory.** Every template is now
 made to carry that guarantee: one without `<run-id>` is migrated **in memory** to a run-scoped
-sibling — `…/<branch>` becomes `…/<branch>-<run-id>` — and `operator.local.md` is never rewritten. A
+sibling — `…/<branch>` becomes `…/<branch>~<run-id>` — and `operator.local.md` is never rewritten. A
 transport command that silently edits the operator's own policy file is a worse failure than the one
 it fixes, and that file may be shared across machines where the migration is not wanted. The result
 reports `template_migrated` so the substitution is visible rather than assumed.

@@ -26,7 +26,8 @@ All notable changes to Issue Flow are documented here.
   no remote state behind.
 - Re-read the Development sidebar instead of believing a nonzero or timed-out `gh issue develop`,
   and report an outcome that cannot be established as an ambiguous write. A truncated sidebar page
-  is a failed read rather than an absent link. Ref existence is probed with `git for-each-ref` and
+  can still prove the branch linked, but never prove it absent. Ref existence is probed with
+  `git for-each-ref` and
   matched on the exact refname, so a real absence is told apart both from a failed read and from a
   child ref that the pattern would otherwise match; a successful native creation must prove local
   head, published head and recorded base agree before reporting success.

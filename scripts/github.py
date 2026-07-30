@@ -2296,15 +2296,24 @@ def canonical_worktree_path(path: Path, run_id: str | None = None) -> Path:
         )
     # The leaf check above covers a template whose run-scoped part IS the last component, which is
     # every template this command produces. A hand-written `…/<run-id>/checkout` puts it in an
-    # ancestor, where a junction could redirect it while the leaf resolves cleanly — and the
-    # surviving evidence is that the run ID stops appearing in the real path at all.
+    # ancestor, where a junction could redirect it while the leaf resolves cleanly — and the only
+    # symptom such a redirection cannot hide is that the run ID stops appearing in the real path.
     #
-    # Compared component-wise and case-folded exactly where `same_location` folds, because
-    # `realpath` on Windows restores each component's ON-DISK case: an ancestor the operator
-    # created as `Run-A` would otherwise read as "the run scope disappeared" with no link present
-    # anywhere. A fail-closed false positive is still a false positive.
-    if run_id and path_components(path).count(fold_case(run_id)) \
-            > path_components(canonical).count(fold_case(run_id)):
+    # The question is exactly that, and nothing narrower: **is the run ID still somewhere in the
+    # resolved path?** Two sharper-looking forms were tried and each was wrong in its own
+    # direction. Requiring the run ID to survive as a whole COMPONENT refuses `…/<w>/repo/fix-6~w`,
+    # where a junction at `w` redirects every run identically and the scope plainly survives inside
+    # the leaf. Counting occurrences refuses a path that merely mentions the run ID twice and
+    # resolves an unrelated one away. Substring containment asks the real question and has one
+    # residual, in the safe direction: a very short run ID may appear in the resolved path by
+    # coincidence, which makes the check permissive rather than refusing.
+    #
+    # Case-folded where the filesystem folds, because `realpath` on Windows restores each
+    # component's ON-DISK case: an ancestor the operator created as `Run-A` would otherwise read as
+    # "the run scope disappeared" with no link present anywhere, and a fail-closed false positive
+    # is still a false positive.
+    if run_id and fold_case(run_id) in fold_case(str(path).replace("\\", "/")) \
+            and fold_case(run_id) not in fold_case(str(canonical).replace("\\", "/")):
         raise ConfigDefect(
             {
                 "ok": False,
@@ -2341,11 +2350,6 @@ def normalise_path(path) -> str:
 def fold_case(text: str) -> str:
     """Fold case exactly where the filesystem does, and nowhere else. See `normalise_path`."""
     return text.lower() if os.name == "nt" else text
-
-
-def path_components(path) -> list[str]:
-    """A path split into components, spelled the way this module compares paths."""
-    return [fold_case(part) for part in str(path).replace("\\", "/").split("/")]
 
 
 def same_location(left, right) -> bool:

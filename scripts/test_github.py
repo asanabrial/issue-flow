@@ -1829,6 +1829,18 @@ with tempfile_module.TemporaryDirectory() as root:
                         repo_identity=lambda _cwd: ("o", "r")):
         check("a sidebar page with no page metadata is a failed read",
               refused(lambda: m.is_branch_linked(6, "fix/6", Path("."))), "ReadFailure")
+    # Every node is validated before membership decides anything, so a malformed neighbour cannot
+    # ride along unnoticed just because the branch we asked about happened to appear first.
+    for label, nodes in (("a node with no ref", [{"ref": None}]),
+                         ("a ref with no name", [{"ref": {}}]),
+                         ("a name that is not a string", [{"ref": {"name": 7}}])):
+        malformed = {"data": {"repository": {"issue": {"linkedBranches": {
+            "nodes": [{"ref": {"name": "fix/6"}}] + nodes,
+            "pageInfo": {"hasNextPage": False}}}}}}
+        with patch.multiple(m, gh_json=lambda *_a, _m=malformed, **_k: _m,
+                            repo_identity=lambda _cwd: ("o", "r")):
+            check(f"{label} is a failed read even when the branch is present",
+                  refused(lambda: m.is_branch_linked(6, "fix/6", Path("."))), "ReadFailure")
 
     clone = Clone(root, develop_timeout=True, linked=[])
     with patch.multiple(m, run=clone.run, is_branch_linked=clone.branch_linked):
@@ -1869,40 +1881,46 @@ with tempfile_module.TemporaryDirectory() as root:
         aliased = f"this platform refused to create the link: {exc}"
     check("a run directory that is itself a link is refused", aliased, "aliased-worktree-path")
 
-    # A hand-written `…/<run-id>/checkout` template puts the run scope in an ANCESTOR, where the
-    # leaf resolves cleanly and a junction above it still redirects the run's own directory. The
-    # surviving symptom is that the run ID stops appearing in the real path.
-    nested = Path(root) / "alias" / "checkout"
-    try:
-        link.exists()  # created above, or the except below already reported why not
-        lost = refused(lambda: m.canonical_worktree_path(nested, "alias"))
-    except OSError as exc:
-        lost = f"this platform refused to create the link: {exc}"
-    check("a link that resolves the run scope out of the path is refused",
-          lost, "run-scope-lost-to-alias")
     check("a path whose run scope survives is accepted",
           m.same_location(m.canonical_worktree_path(real / "sub", "real"), real / "sub"), True)
 
-    # The check counts components rather than asking "does the name still appear anywhere", and
-    # folds case where the filesystem does. Both matter: `realpath` on Windows restores each
-    # component's ON-DISK case, so an ancestor the operator created as `Real` would otherwise read
-    # as "the run scope disappeared" with no link present at all. A fail-closed false positive is
-    # still a false positive, and this one refuses a legitimate configuration with exit 2.
-    # Reproduce it properly: the run-scoped ancestor is SPELLED lowercase in the template and
-    # exists on disk as `CASED`. On a case-insensitive filesystem `realpath` restores the on-disk
-    # spelling, so a case-sensitive component comparison sees the run scope vanish — with no link
-    # anywhere — and refuses a legitimate configuration with exit 2.
-    cased = Path(root) / "CASED"
-    (cased / "sub").mkdir(parents=True)
+    # The run-scope check asks one question — is the run ID still SOMEWHERE in the resolved path —
+    # and the two sharper-looking forms tried before it were each wrong in a different direction.
+    # These three checks pin all three behaviours, because every previous form passed some of them.
+    #
+    # (a) The ancestor IS named after the run ID and IS a link, but the run ID also survives inside
+    #     the leaf. The link redirects every run identically — `fix-6~wrun` and `fix-6~other` stay
+    #     two directories under it — so nothing is folded together and refusing is a false
+    #     positive. Requiring the run ID to survive as a whole COMPONENT refuses exactly this.
+    run_link = Path(root) / "wrun"
+    try:
+        run_link.symlink_to(real, target_is_directory=True)
+        survives_in_leaf = refused(
+            lambda: m.canonical_worktree_path(run_link / "repo" / "fix-6~wrun", "wrun"))
+    except (OSError, NotImplementedError) as exc:
+        survives_in_leaf = f"this platform refused to create the link: {exc}"
+    check("a run scope surviving inside the leaf is not a resolved-away run scope",
+          survives_in_leaf, "accepted")
+
+    # (b) An on-disk case difference with NO link present anywhere. `realpath` on Windows restores
+    #     the on-disk spelling, so a case-sensitive comparison sees the run scope vanish and
+    #     refuses a legitimate configuration with exit 2. A fail-closed false positive is still one.
+    (Path(root) / "CASED" / "sub").mkdir(parents=True)
     spelled = Path(root) / "cased" / "sub"
-    if spelled.exists():  # only meaningful where the filesystem folds case
-        case_verdict = refused(lambda: m.canonical_worktree_path(spelled, "cased"))
-    else:
-        case_verdict = "accepted"  # case-sensitive filesystem: the ancestor genuinely is not there
+    folds_case = spelled.exists()
     check("an on-disk case difference is not mistaken for a resolved-away run scope",
-          case_verdict, "accepted")
-    check("a run ID that also names an unrelated surviving component is not refused",
-          m.same_location(m.canonical_worktree_path(real / "real", "real"), real / "real"), True)
+          refused(lambda: m.canonical_worktree_path(spelled, "cased")) if folds_case else "accepted",
+          "accepted")
+
+    # (c) The genuine defect it exists to catch: the run-scoped part is resolved away entirely.
+    lost = Path(root) / "alias" / "checkout"
+    try:
+        link.exists()
+        lost_verdict = refused(lambda: m.canonical_worktree_path(lost, "alias"))
+    except OSError as exc:
+        lost_verdict = f"this platform refused to create the link: {exc}"
+    check("a link that resolves the run scope out of the path entirely is refused",
+          lost_verdict, "run-scope-lost-to-alias")
 
 print()
 print(f"{CHECKS - len(FAILURES)}/{CHECKS} checks passed" + (f"; failures: {FAILURES}" if FAILURES else ""))
