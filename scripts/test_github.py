@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -1381,33 +1382,561 @@ except m.ReadFailure as exc:
     live_parses = f"the live registry was refused: {exc}"
 check("the live repository registry passes through the new parser", live_parses, True)
 
+# Same reasoning for the ref probe and the admin directories: `for-each-ref` answering an ABSENT
+# ref with exit 0 and no output is the entire basis for telling absence apart from a failed read,
+# and a fixture asserting it only restates the assumption. This asks the git that is installed.
+try:
+    live_refs = [
+        m.ref_object(REPO_ROOT, "refs/heads/issue-flow-no-such-ref-ever") is None,
+        m.ref_object(REPO_ROOT, "refs/heads/main") is not None,
+        m.common_git_dir(REPO_ROOT).is_dir(),
+        m.ownership_path(REPO_ROOT).parent.is_dir(),
+    ]
+except (m.ReadFailure, OSError) as exc:
+    live_refs = f"the live repository refused a probe: {exc}"
+check("the installed git answers absence, presence and both admin directories",
+      live_refs, [True, True, True, True])
+
 operation_parsers = m.build_parser()._subparsers._group_actions[0].choices
 check("ownership writers require operation identity", [next(a for a in operation_parsers[command]._actions if a.dest == "operation_id").required for command in ("claim", "reclaim", "unassign")], [True, True, True])
 check("target discovery remains a read-only first call", [next(a for a in operation_parsers[command]._actions if a.dest == "target_operation").required for command in ("reclaim", "unassign")], [False, False])
-git_commands, fetched = [], [False]
-def fake_git_run(argv, cwd=None, check=True, writes=False):
-    git_commands.append(list(argv))
-    if argv[:3] == ["gh", "issue", "develop"]:
-        return SimpleNamespace(returncode=1, stdout="", stderr="exists")
-    if argv == ["git", "fetch", "origin"]:
-        fetched[0] = True
-    if argv[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
-        exists = fetched[0] and argv[4] == "refs/remotes/origin/fix/6"
-        return SimpleNamespace(returncode=0 if exists else 1, stdout="", stderr="")
-    stdout = "remote-head\n" if argv[:2] == ["git", "rev-parse"] else ""
-    return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
-with patch.multiple(m, run=fake_git_run, do_verify_claim=lambda *_args: {},
-                    repo_identity=lambda _cwd: ("owner", "repo")):
-    with __import__("tempfile").TemporaryDirectory() as root:
-        m.cmd_start_branch(SimpleNamespace(issue=6, run_id=ME, expect_state="in-progress",
-                                           worktree_root=f"{root}/<branch>", branch="fix/6",
-                                           base="main"), {}, Path("."))
-remote_check = next(i for i, command in enumerate(git_commands)
-                    if "refs/remotes/origin/fix/6" in command)
-full_fetch = git_commands.index(["git", "fetch", "origin"])
-check("start-branch fetches before remote-only branch discovery", full_fetch < remote_check, True)
-check("start-branch resumes the remote head",
-      ["git", "branch", "--", "fix/6", "origin/fix/6"] in git_commands, True)
+
+# --------------------------------------------------------------------------------------
+# Run-to-path identity. The defect: every substituted value was FLATTENED, and flattening is
+# not injective — `a/b` and `a-b` are two valid run IDs that name one directory, so the second
+# run finds a registered worktree carrying its own branch at its own path and "resumes" into a
+# checkout another process is writing.
+# --------------------------------------------------------------------------------------
+
+def refused(call):
+    """Run `call` and name how it refused, so a check reads as prose rather than as a try block.
+
+    Returns the `reason` for a stop and the class name for a failure. It deliberately does NOT
+    distinguish `ConfigDefect` from `Stop` in that string: the two share a payload shape and differ
+    only in the exit code, which `exit_code_for` below asserts directly against `main`. Naming the
+    class here would let a reason check quietly stand in for an exit-code check.
+    """
+    try:
+        call()
+    except m.Stop as stop:  # ConfigDefect is a Stop; the exit code is asserted separately
+        return stop.payload.get("reason")
+    except (m.ReadFailure, m.WriteFailure, m.Timeout) as failure:
+        return type(failure).__name__
+    return "accepted"
+
+
+check("a valid run ID reaches the path unchanged", m.run_component("claude-code-0730"), "claude-code-0730")
+check("run IDs are never flattened onto each other",
+      sorted({refused(lambda: m.run_component(value)) for value in ("a/b", "a\\b")}),
+      ["unsafe-run-id"])
+check("case folding cannot fold two run IDs into one directory",
+      refused(lambda: m.run_component("Run-A")), "unsafe-run-id")
+check("a run ID may not carry dot segments Windows would strip or traverse",
+      [refused(lambda: m.run_component(value)) for value in ("run..a", "run-a.", ".run-a")],
+      ["unsafe-run-id"] * 3)
+check("a degenerate run ID spelling is refused before it names a directory",
+      [refused(lambda: m.run_component(value)) for value in ("", "-run", "run-", "run--a", "run a")],
+      ["unsafe-run-id"] * 5)
+check("a run ID may not name a Windows device",
+      [refused(lambda: m.run_component(value)) for value in ("con", "com1", "lpt9", "nul")],
+      ["reserved-device-component"] * 4)
+check("a device name is refused in any substituted component, not only the run ID",
+      refused(lambda: m.worktree_path("/w/<repo>/<branch>", "aux", "fix/1", "run-a", 1)),
+      "reserved-device-component")
+# Windows resolves `con.txt` to the device just as it resolves `con`; the extension is not a name.
+check("a device name with an extension is still a device",
+      [refused(lambda: m.worktree_path("/w/<repo>", value, "fix/1", "run-a", 1))
+       for value in ("con.txt", "NUL.log", "com1.anything")],
+      ["reserved-device-component"] * 3)
+check("template defects are configuration errors, not lost races",
+      [issubclass(m.ConfigDefect, m.Stop),
+       refused(lambda: m.worktree_path("/w/<branch>", "r", "..", "run-a", 1))],
+      [True, "unsafe-worktree-component"])
+
+
+def exit_code_for(exception):
+    """What `main` actually returns for a raised exception — the contract callers read.
+
+    `ConfigDefect` IS a `Stop`, so the whole distinction lives in handler ORDER inside `main`, and
+    asserting the class relationship proves nothing about the number a caller sees. This raises
+    each one through the real dispatch and reads the exit code back.
+    """
+    import io, contextlib as _contextlib
+    with patch.dict(m.COMMANDS, {"config": lambda *_a: (_ for _ in ()).throw(exception)}), \
+            _contextlib.redirect_stdout(io.StringIO()):
+        return m.main(["--repo-dir", str(REPO_ROOT), "config"])
+
+
+check("the exit code separates a configuration defect from a lost race and a failed write",
+      [exit_code_for(m.ConfigDefect({"ok": False, "reason": "unsafe-run-id"})),
+       exit_code_for(m.Stop({"ok": False, "reason": "lost-race"})),
+       exit_code_for(m.ReadFailure("nothing answered")),
+       exit_code_for(m.Timeout("gh issue develop did not finish")),
+       exit_code_for(m.WriteFailure("it may have landed"))],
+      [2, 1, 3, 5, 5])
+check("the branch still flattens, because uniqueness is the run ID's job",
+      m.worktree_path("/w/<branch>-<run-id>", "r", "fix/6", "run-a", 6).as_posix(),
+      "/w/fix-6-run-a")
+
+# A branch-only template is persisted operator policy, not a mistake to reject.
+check("a branch-only template gains a run-scoped sibling in memory",
+      m.run_scoped_template("/w/<repo>/<branch>"), ("/w/<repo>/<branch>~<run-id>", True))
+# Joining with `-` makes the COMPOSED name ambiguous even though each half is not: these are two
+# different branches, so they take two different branch locks and nothing downstream would notice
+# them sharing one directory.
+check("two different branches cannot compose onto one run-scoped directory",
+      m.worktree_path(m.run_scoped_template("/w/<branch>")[0], "r", "fix/6", "a-b", 6)
+      == m.worktree_path(m.run_scoped_template("/w/<branch>")[0], "r", "fix/6-a", "b", 6),
+      False)
+check("a template that is already run-scoped is left exactly alone",
+      m.run_scoped_template("/w/<branch>/<run-id>"), ("/w/<branch>/<run-id>", False))
+check("the migrated sibling is never a child of the legacy directory",
+      m.worktree_path(m.run_scoped_template("/w/<branch>")[0], "r", "fix/6", "run-a", 6).as_posix()
+      .startswith(m.worktree_path("/w/<branch>", "r", "fix/6", "run-a", 6).as_posix() + "/"),
+      False)
+
+# --------------------------------------------------------------------------------------
+# Ref probes. The defect: `git rev-parse --verify --quiet` exits 1 for "no such ref" AND for
+# every way the question can go unanswered, so a corrupt object store read as "absent" restarts
+# a resumed branch from the base and drops its commits.
+# --------------------------------------------------------------------------------------
+
+def ref_run(returncode: int, stdout: str):
+    return lambda argv, cwd=None, check=True, writes=False, binary=False, timeout=None: \
+        SimpleNamespace(returncode=returncode, stdout=stdout, stderr="boom")
+
+
+def git_ref_run(*refs: str):
+    """Model `for-each-ref`'s PATTERN semantics, not a dict lookup keyed on the argument.
+
+    The distinction is the whole point of the check below. A fake that answers
+    `self.refs.get(pattern)` encodes the assumption under test — that the argument is an exact ref
+    path — and would report every one of these checks as passing while git returned a child ref.
+    Real rule, from the man page and confirmed against git 2.55: a pattern matches a ref completely
+    OR from the beginning up to a slash.
+    """
+    def fake(argv, cwd=None, check=True, writes=False, binary=False, timeout=None):
+        pattern = argv[-1]
+        matched = [name for name in refs
+                   if name == pattern or name.startswith(pattern.rstrip("/") + "/")]
+        stdout = "".join(f"{name}\t{OID}\n" for name in matched)
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+    return fake
+
+
+OID = "c" * 40
+with patch.object(m, "run", ref_run(0, "")):
+    check("an empty answer from a successful probe is a real absence",
+          m.ref_object(Path("."), "refs/heads/x"), None)
+with patch.object(m, "run", ref_run(0, f"refs/heads/x\t{OID}\n")):
+    check("a single object id is a real presence", m.ref_object(Path("."), "refs/heads/x"), OID)
+with patch.object(m, "run", ref_run(128, "")):
+    check("a failed probe is a failed read, never an absence",
+          refused(lambda: m.ref_object(Path("."), "refs/heads/x")), "ReadFailure")
+with patch.object(m, "run", ref_run(0, f"refs/heads/x\t{OID}\nrefs/heads/x\t{OID}\n")):
+    check("an ambiguous probe answer is a failed read",
+          refused(lambda: m.ref_object(Path("."), "refs/heads/x")), "ReadFailure")
+with patch.object(m, "run", ref_run(0, f"refs/heads/x\tnot-an-object\n")):
+    check("an unparseable probe answer is a failed read",
+          refused(lambda: m.ref_object(Path("."), "refs/heads/x")), "ReadFailure")
+with patch.object(m, "run", ref_run(0, f"refs/heads/x {OID}\n")):
+    check("an answer in an unexpected format is a failed read",
+          refused(lambda: m.ref_object(Path("."), "refs/heads/x")), "ReadFailure")
+
+# The argument is a PATTERN. `refs/heads/foo` also matches `refs/heads/foo/bar`, so a probe that
+# trusted the output would report a branch that does not exist as present — at another branch's
+# commit. Confirmed against real git before this check was written.
+with patch.object(m, "run", git_ref_run("refs/heads/foo/bar")):
+    check("a child ref is not mistaken for the parent that does not exist",
+          m.ref_object(Path("."), "refs/heads/foo"), None)
+with patch.object(m, "run", git_ref_run("refs/heads/foo", "refs/heads/foo/bar")):
+    check("a parent that does exist is read past its children",
+          m.ref_object(Path("."), "refs/heads/foo"), OID)
+with patch.object(m, "run", git_ref_run("refs/heads/foo/a", "refs/heads/foo/b")):
+    check("several children still do not manufacture a parent",
+          m.ref_object(Path("."), "refs/heads/foo"), None)
+
+# --------------------------------------------------------------------------------------
+# Branch identity. `gh issue develop` branches from the base as the SERVER sees it, which is not
+# necessarily the base this run fetched — so a fresh branch can start at a commit the run never
+# saw while the command reports the recorded base as its own.
+# --------------------------------------------------------------------------------------
+
+A, B = "a" * 40, "b" * 40
+check("a fresh branch is coherent only at the base this run recorded",
+      m.branch_identity_verdict(fresh=True, local=A, remote=A, base=A,
+                                remote_reachable_from_local=True)["coherent"], True)
+check("a base that moved during native creation is reported, not absorbed",
+      m.branch_identity_verdict(fresh=True, local=A, remote=B, base=A,
+                                remote_reachable_from_local=False),
+      {"coherent": False, "reason": "base-moved-during-creation"})
+check("a local-only branch has nothing to disagree with",
+      m.branch_identity_verdict(fresh=False, local=A, remote=None, base=B,
+                                remote_reachable_from_local=None)["coherent"], True)
+check("unpushed local work on a resumed branch is ordinary",
+      m.branch_identity_verdict(fresh=False, local=A, remote=B, base=B,
+                                remote_reachable_from_local=True)["reason"], "resumed-local-ahead")
+# Named for what was actually established — unreachable covers "ahead" AND "force-pushed away
+# from under us", and pointing the reader at commits to fast-forward that may not exist is worse
+# than saying less.
+check("an unreachable remote head would build on a commit this checkout never saw",
+      m.branch_identity_verdict(fresh=False, local=A, remote=B, base=B,
+                                remote_reachable_from_local=False),
+      {"coherent": False, "reason": "remote-not-reachable-from-local"})
+check("an unestablished ancestry is not a pass",
+      m.branch_identity_verdict(fresh=False, local=A, remote=B, base=B,
+                                remote_reachable_from_local=None),
+      {"coherent": False, "reason": "ancestry-unknown"})
+
+# --------------------------------------------------------------------------------------
+# start-branch, end to end against an in-memory git. The review probe for this issue produced
+# two successful concurrent `git worktree add` calls for ONE branch on Git 2.55.0.windows.3, so
+# git's own "already used by worktree at" check cannot be the thing that serializes them.
+# --------------------------------------------------------------------------------------
+
+tempfile_module = __import__("tempfile")
+
+
+class Clone:
+    """A throwaway clone: real directories for the lock and the ownership marker, faked git."""
+
+    def __init__(self, root: str, *, refs=None, develop_rc=0, develop_timeout=False,
+                 linked=(), link_read_fails=False, base=A, publish=None, ancestor=True,
+                 fail_worktree_add=False):
+        self.root = Path(root)
+        self.common = self.root / "clone" / ".git"
+        self.admin = self.root / "clone" / ".git" / "worktrees" / "wt"
+        self.admin.mkdir(parents=True, exist_ok=True)
+        self.worktrees = self.root / "trees"
+        self.refs = dict(refs or {})
+        self.develop_rc, self.develop_timeout = develop_rc, develop_timeout
+        self.linked, self.link_read_fails = set(linked), link_read_fails
+        self.base, self.publish, self.ancestor = base, publish, ancestor
+        self.fail_worktree_add = fail_worktree_add
+        self.log: list[list[str]] = []
+
+    def run(self, argv, cwd=None, check=True, writes=False, binary=False, timeout=None):
+        self.log.append(list(argv))
+        if argv[:3] == ["git", "rev-parse", "--path-format=absolute"]:
+            target = self.common if argv[3] == "--git-common-dir" else self.admin
+            return SimpleNamespace(returncode=0, stdout=f"{target}\n", stderr="")
+        if argv[:2] == ["git", "for-each-ref"]:
+            # Pattern semantics here too, for the same reason `git_ref_run` has them: a dict
+            # lookup on the argument would quietly re-introduce the assumption under test.
+            pattern = argv[-1]
+            stdout = "".join(f"{name}\t{oid}\n" for name, oid in sorted(self.refs.items())
+                             if name == pattern or name.startswith(pattern.rstrip("/") + "/"))
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        if argv[:3] == ["gh", "issue", "develop"]:
+            if self.develop_timeout:
+                raise m.Timeout("gh issue develop did not finish within 120s")
+            if self.develop_rc == 0:
+                self.linked.add(argv[argv.index("--name") + 1])
+                self.refs[f"refs/remotes/origin/{argv[argv.index('--name') + 1]}"] = (
+                    self.publish or self.base)
+            return SimpleNamespace(returncode=self.develop_rc, stdout="", stderr="already exists")
+        if argv[:3] == ["git", "worktree", "add"]:
+            if self.fail_worktree_add:
+                raise m.WriteFailure("git worktree add failed (128): already used by worktree")
+            Path(argv[-2]).mkdir(parents=True, exist_ok=True)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if argv[:2] == ["git", "merge-base"]:
+            return SimpleNamespace(returncode=0 if self.ancestor else 1, stdout="", stderr="")
+        if argv[:2] == ["git", "rev-parse"]:
+            head = self.refs.get("refs/heads/fix/6") or self.base
+            return SimpleNamespace(returncode=0,
+                                   stdout=(head if argv[2] == "HEAD" else self.base) + "\n",
+                                   stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def branch_linked(self, issue, branch, cwd):
+        if self.link_read_fails:
+            raise m.ReadFailure("linked-branch GraphQL response is partial or malformed")
+        return branch in self.linked
+
+    def start(self, *, run_id=ME, issue=6, template=None, registry=None):
+        args = SimpleNamespace(issue=issue, run_id=run_id, expect_state="in-progress",
+                               worktree_root=template or f"{self.worktrees}/<branch>",
+                               branch="fix/6", base="main")
+        with patch.multiple(m, run=self.run, do_verify_claim=lambda *_a: {},
+                            repo_identity=lambda _cwd: ("owner", "repo"),
+                            is_branch_linked=self.branch_linked,
+                            registered_worktrees=lambda _cwd: dict(registry or {})):
+            return m.cmd_start_branch(args, {}, Path("."))
+
+    def index_of(self, prefix):
+        return next((i for i, argv in enumerate(self.log) if argv[:len(prefix)] == prefix), None)
+
+
+with tempfile_module.TemporaryDirectory() as root:
+    clone = Clone(root)
+    result = clone.start()
+    check("a branch-only template delivers a run-scoped worktree",
+          (Path(result["worktree"]).name, result["template_migrated"]), (f"fix-6~{ME}", True))
+    check("the local checkout is reserved before the first remote mutation",
+          clone.index_of(["git", "worktree", "add"]) < clone.index_of(["gh", "issue", "develop"]),
+          True)
+    check("a fresh native creation proves local, remote and base tell one story",
+          (result["identity"], result["natively_linked"]), ("fresh-at-base", True))
+    with patch.object(m, "run", clone.run):
+        check("the run records durable ownership of the checkout it created",
+              m.read_ownership(Path(result["worktree"]))["run_id"], ME)
+        check("the branch lock is released once the reservation ends",
+              m.branch_lock_path(Path("."), "fix/6").exists(), False)
+
+# A local reservation that fails must leave NOTHING on GitHub — the old order created the
+# server-side branch and the sidebar link first, then stopped on the local check.
+with tempfile_module.TemporaryDirectory() as root:
+    clone = Clone(root, fail_worktree_add=True)
+    check("a failed local reservation is a failed local reservation",
+          refused(lambda: clone.start()), "WriteFailure")
+    check("a failed local reservation leaves no remote state",
+          clone.index_of(["gh", "issue", "develop"]), None)
+
+# Resume needs PROOF, and "registered for this branch at this path" is not proof: two runs of one
+# branch satisfy it equally well.
+with tempfile_module.TemporaryDirectory() as root:
+    clone = Clone(root)
+    path = clone.worktrees / f"fix-6~{ME}"
+    path.mkdir(parents=True)
+    registry = {m.normalise_path(path): "fix/6"}
+    check("a registered checkout with no ownership marker is not clearance",
+          refused(lambda: clone.start(registry=registry)), "worktree-ownership-unproven")
+    with patch.object(m, "run", clone.run):
+        m.write_ownership(path, "another-run", 6, "fix/6")
+    check("a checkout another run owns is refused rather than shared",
+          refused(lambda: clone.start(registry=registry)), "worktree-owned-by-another-run")
+    with patch.object(m, "run", clone.run):
+        m.write_ownership(path, ME, 6, "fix/6")
+    resumed = clone.start(registry=registry)
+    check("a checkout this run owns resumes without a second checkout",
+          (resumed["resumed_existing_worktree"], clone.index_of(["git", "worktree", "add"])),
+          (True, None))
+    check("a path holding somebody else's branch is still refused outright",
+          refused(lambda: clone.start(registry={m.normalise_path(path): "fix/other"})),
+          "worktree-path-occupied")
+
+# The branch-only migration's one hard case: a legacy checkout that is still registered.
+with tempfile_module.TemporaryDirectory() as root:
+    clone = Clone(root)
+    legacy = clone.worktrees / "fix-6"
+    legacy.mkdir(parents=True)
+    check("a registered legacy checkout stops instead of being silently orphaned",
+          refused(lambda: clone.start(registry={m.normalise_path(legacy): "fix/6"})),
+          "legacy-worktree-registered")
+    check("nothing was created remotely while that decision was pending",
+          clone.index_of(["gh", "issue", "develop"]), None)
+    check("an unregistered leftover directory does not block the migration",
+          clone.start(registry={})["template_migrated"], True)
+
+# --------------------------------------------------------------------------------------
+# The branch lock. A stale lock is never broken on elapsed time: the case a timeout gets wrong is
+# a slow-but-live run whose checkout is taken while it is writing into it.
+# --------------------------------------------------------------------------------------
+
+with tempfile_module.TemporaryDirectory() as root:
+    clone = Clone(root)
+    with patch.object(m, "run", clone.run):
+        lock_file = m.branch_lock_path(Path("."), "fix/6")
+        with m.branch_reservation(Path("."), "fix/6", ME, 6):
+            check("a held lock exists while the reservation is held", lock_file.exists(), True)
+            check("a second run cannot take a held branch lock",
+                  refused(lambda: m.branch_reservation(Path("."), "fix/6", OTHER, 6).__enter__()),
+                  "branch-locked-by-another-run")
+        check("the lock is released when the reservation ends", lock_file.exists(), False)
+
+        # A crashed run leaves its lock behind. The retry must be able to proceed AND must end up
+        # owning the cleanup — proceeding without adopting is how that lock outlives every retry
+        # and blocks a different run forever, with nobody left entitled to remove it.
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        lock_file.write_text(json.dumps({"run_id": ME, "branch": "fix/6", "pid": 1,
+                                         "acquired_at": "2026-07-30T00:00:00Z"}), encoding="utf-8")
+        with m.branch_reservation(Path("."), "fix/6", ME, 6):
+            check("a run's own leftover lock is its own retry, not a race it lost",
+                  lock_file.exists(), True)
+        check("an adopted lock is released rather than leaked", lock_file.exists(), False)
+
+        # A raise inside the reservation must not strand the lock either.
+        try:
+            with m.branch_reservation(Path("."), "fix/6", ME, 6):
+                raise RuntimeError("the work blew up")
+        except RuntimeError:
+            pass
+        check("the lock is released when the work inside it raises", lock_file.exists(), False)
+
+        # Age is not evidence. This lock is a year old and still stops the next run.
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        lock_file.write_text(json.dumps({"run_id": OTHER, "branch": "fix/6", "pid": 1,
+                                         "acquired_at": "2025-01-01T00:00:00Z"}), encoding="utf-8")
+        check("an old lock is still a held lock",
+              refused(lambda: m.branch_reservation(Path("."), "fix/6", ME, 6).__enter__()),
+              "branch-locked-by-another-run")
+        lock_file.write_text("{ not json", encoding="utf-8")
+        check("an unreadable lock is an unknown holder, not an absent one",
+              refused(lambda: m.branch_reservation(Path("."), "fix/6", ME, 6).__enter__()),
+              "branch-locked-by-another-run")
+        lock_file.unlink()
+
+# --------------------------------------------------------------------------------------
+# `gh issue develop` mutates a ref AND a link. Its nonzero exit used to mean "not linked", which
+# is false for the two states where it matters: created-the-ref-but-not-the-link, and
+# committed-both-then-dropped-the-connection.
+# --------------------------------------------------------------------------------------
+
+with tempfile_module.TemporaryDirectory() as root:
+    clone = Clone(root, develop_rc=1, linked=["fix/6"])
+    with patch.multiple(m, run=clone.run, is_branch_linked=clone.branch_linked):
+        check("an already-existing branch is read back as linked, not guessed at",
+              m.develop_link(6, "fix/6", "main", Path("."))["outcome"], "already-linked")
+
+    clone = Clone(root, develop_rc=1, linked=[])
+    with patch.multiple(m, run=clone.run, is_branch_linked=clone.branch_linked):
+        check("a conclusive read that no link exists is allowed to say so",
+              m.develop_link(6, "fix/6", "main", Path("."))["linked"], False)
+
+    clone = Clone(root, develop_rc=1, link_read_fails=True)
+    with patch.multiple(m, run=clone.run, is_branch_linked=clone.branch_linked):
+        check("a failed read-back is a failed read, not an absent link",
+              refused(lambda: m.develop_link(6, "fix/6", "main", Path("."))), "ReadFailure")
+
+    # The sidebar read decides "not linked", so a TRUNCATED page has not answered the question —
+    # the same completeness contract issue #28 established for closing references.
+    def sidebar(nodes, has_next):
+        return {"data": {"repository": {"issue": {"linkedBranches": {
+            "nodes": [{"ref": {"name": name}} for name in nodes],
+            "pageInfo": {"hasNextPage": has_next}}}}}}
+
+    with patch.multiple(m, gh_json=lambda *_a, **_k: sidebar(["fix/6"], False),
+                        repo_identity=lambda _cwd: ("o", "r")):
+        check("a complete sidebar page answers the question",
+              m.is_branch_linked(6, "fix/6", Path(".")), True)
+    with patch.multiple(m, gh_json=lambda *_a, **_k: sidebar(["other"], False),
+                        repo_identity=lambda _cwd: ("o", "r")):
+        check("a complete page without the branch is a real absence",
+              m.is_branch_linked(6, "fix/6", Path(".")), False)
+    with patch.multiple(m, gh_json=lambda *_a, **_k: sidebar(["other"], True),
+                        repo_identity=lambda _cwd: ("o", "r")):
+        check("a truncated page that lacks the branch cannot prove it absent",
+              refused(lambda: m.is_branch_linked(6, "fix/6", Path("."))), "ReadFailure")
+    # Only ONE of the two answers needs a complete page. A later page cannot un-link a branch that
+    # is already on this one, so refusing here would turn a definite yes into an unretryable exit 3.
+    with patch.multiple(m, gh_json=lambda *_a, **_k: sidebar(["fix/6"], True),
+                        repo_identity=lambda _cwd: ("o", "r")):
+        check("a truncated page that CONTAINS the branch is still a definite yes",
+              m.is_branch_linked(6, "fix/6", Path(".")), True)
+    with patch.multiple(m, gh_json=lambda *_a, **_k: {"data": {"repository": {"issue": {
+                            "linkedBranches": {"nodes": []}}}}},
+                        repo_identity=lambda _cwd: ("o", "r")):
+        check("a sidebar page with no page metadata is a failed read",
+              refused(lambda: m.is_branch_linked(6, "fix/6", Path("."))), "ReadFailure")
+    # Every node is validated before membership decides anything, so a malformed neighbour cannot
+    # ride along unnoticed just because the branch we asked about happened to appear first.
+    for label, nodes in (("a node with no ref", [{"ref": None}]),
+                         ("a ref with no name", [{"ref": {}}]),
+                         ("a name that is not a string", [{"ref": {"name": 7}}])):
+        malformed = {"data": {"repository": {"issue": {"linkedBranches": {
+            "nodes": [{"ref": {"name": "fix/6"}}] + nodes,
+            "pageInfo": {"hasNextPage": False}}}}}}
+        with patch.multiple(m, gh_json=lambda *_a, _m=malformed, **_k: _m,
+                            repo_identity=lambda _cwd: ("o", "r")):
+            check(f"{label} is a failed read even when the branch is present",
+                  refused(lambda: m.is_branch_linked(6, "fix/6", Path("."))), "ReadFailure")
+
+    clone = Clone(root, develop_timeout=True, linked=[])
+    with patch.multiple(m, run=clone.run, is_branch_linked=clone.branch_linked):
+        check("a timeout whose ref may exist is an ambiguous write, not a no-op",
+              refused(lambda: m.develop_link(6, "fix/6", "main", Path("."))), "WriteFailure")
+
+    clone = Clone(root, develop_timeout=True, link_read_fails=True)
+    with patch.multiple(m, run=clone.run, is_branch_linked=clone.branch_linked):
+        check("a timeout that cannot be re-read is still an ambiguous write",
+              refused(lambda: m.develop_link(6, "fix/6", "main", Path("."))), "WriteFailure")
+
+    clone = Clone(root, develop_timeout=True, linked=["fix/6"])
+    with patch.multiple(m, run=clone.run, is_branch_linked=clone.branch_linked):
+        check("a timeout that the sidebar proves landed is success",
+              m.develop_link(6, "fix/6", "main", Path("."))["linked"], True)
+
+# A concurrent push to the base means the server branched from a commit this run never fetched.
+with tempfile_module.TemporaryDirectory() as root:
+    clone = Clone(root, base=A, publish=B)
+    check("a branch published at a head this run never saw is refused, not reported delivered",
+          refused(lambda: clone.start()), "base-moved-during-creation")
+
+# --------------------------------------------------------------------------------------
+# Aliasing. An ancestor link redirects every run identically and is fine; the run's OWN directory
+# being a link is two run IDs resolving into one checkout.
+# --------------------------------------------------------------------------------------
+
+with tempfile_module.TemporaryDirectory() as root:
+    real = Path(root) / "real"
+    real.mkdir()
+    check("a plain directory is canonicalised, not refused",
+          m.same_location(m.canonical_worktree_path(real), real), True)
+    link = Path(root) / "alias"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+        aliased = refused(lambda: m.canonical_worktree_path(link))
+    except (OSError, NotImplementedError) as exc:
+        aliased = f"this platform refused to create the link: {exc}"
+    check("a run directory that is itself a link is refused", aliased, "aliased-worktree-path")
+
+    # No platform guard here: `link` either exists by now or the check above already reported why
+    # not, and nothing in this block creates one. A guard that cannot fire is a claim of robustness
+    # the code does not make.
+    try:
+        ancestor_link = m.same_location(m.canonical_worktree_path(link / "sub"), real / "sub")
+    except m.Stop as stop:
+        ancestor_link = f"an ordinary ancestor link was refused: {stop.payload.get('reason')}"
+    check("an ancestor link is resolved rather than refused", ancestor_link, True)
+
+# The collapse a single path CANNOT prove, and the layer that can. Two junctions — `run-a` and
+# `run-b` both pointing at one directory — fold two runs together while every leaf resolves
+# cleanly, and no amount of inspecting ONE run's spelling can see the other run's junction. Three
+# path-only heuristics were tried here and each shipped a defect in a different direction.
+#
+# What decides it is resolution followed by ownership, and resolution happens TWICE on purpose:
+# `canonical_worktree_path` before anything is created, and `normalise_path` when the registry is
+# consulted. Neither is load-bearing alone — established by mutating them, not by argument: break
+# either one and the collapse is still refused; break BOTH and it degrades only to
+# `worktree-path-occupied`, which is still a refusal. Both steps are asserted below.
+with tempfile_module.TemporaryDirectory() as root:
+    shared = Path(root) / "shared"
+    shared.mkdir()
+    clone = Clone(root)
+    try:
+        (Path(root) / "run-a").symlink_to(shared, target_is_directory=True)
+        (Path(root) / "run-b").symlink_to(shared, target_is_directory=True)
+        (shared / "fix-6").mkdir()
+        # The first of the two resolutions, asserted directly: two aliased SPELLINGS of one
+        # directory canonicalise to one identical string, so `git worktree add` and the registry
+        # are handed one key rather than two keys for one directory. `normalise_path` would also
+        # supply this at lookup time; asserting it here pins the earlier one, which is the only
+        # place the CREATED checkout's spelling is decided.
+        one_spelling = (m.canonical_worktree_path(Path(root) / "run-a" / "fix-6")
+                        == m.canonical_worktree_path(Path(root) / "run-b" / "fix-6"))
+    except m.Stop as stop:
+        # Reported rather than raised: a canonicaliser that refuses these paths outright is a
+        # failure of this check, and a crashing test says less than a failing one.
+        one_spelling = f"canonicalisation refused the path: {stop.payload.get('reason')}"
+    except (OSError, NotImplementedError) as exc:
+        one_spelling = f"this platform refused to create the link: {exc}"
+    check("two aliased spellings of one directory canonicalise to one string", one_spelling, True)
+
+    try:
+        with patch.object(m, "run", clone.run):
+            m.write_ownership(shared / "fix-6", "run-a", 6, "fix/6")
+        # `run-b` computes `<root>/run-b/fix-6` — a different spelling of run-a's real directory.
+        # Its own path betrays nothing; the registry lookup resolves onto run-a's checkout.
+        with patch.multiple(m, run=clone.run, registered_worktrees=lambda _cwd: {
+                m.normalise_path(shared / "fix-6"): "fix/6"}):
+            collapsed = refused(lambda: m.resolve_worktree_ownership(
+                Path("."), m.canonical_worktree_path(Path(root) / "run-b" / "fix-6"),
+                SimpleNamespace(run_id="run-b", branch="fix/6")))
+    except (OSError, NotImplementedError) as exc:
+        collapsed = f"this platform refused to create the link: {exc}"
+    check("two junctions folding two runs into one checkout are caught by ownership, not by the path",
+          collapsed, "worktree-owned-by-another-run")
 
 print()
 print(f"{CHECKS - len(FAILURES)}/{CHECKS} checks passed" + (f"; failures: {FAILURES}" if FAILURES else ""))
