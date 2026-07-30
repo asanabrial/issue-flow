@@ -71,6 +71,43 @@ and local settings before tests or tools depend on them. Reuse a proven interpre
 environment when safe, but keep the worktree as the working directory and ensure it loads that
 worktree's code.
 
+## Review the whole delivery, not the part you were looking at
+
+**The review target is the exact recorded base through `HEAD`, plus whatever is still uncommitted.**
+Those two halves are easy to review separately and disastrous to review separately: an approval over
+the committed prefix authorises nothing about the dirty suffix, and an approval over the suffix
+authorises nothing about the commits already on the branch. Seen live (Investora #70): the approved
+lineage covered 12 workspace paths while the pull request delivered 15, and 35 of 65 final hunks
+carried no authority at all — while every artefact looked exactly like a reviewed delivery.
+
+Derive the target once, mechanically, before any reviewer runs, and compare it against whatever the
+reviewer is actually being given. Where the binding scripts it, that is `expected-target`: it emits
+the path/mode/blob manifest and one digest over it, and fails closed when a supplied target differs
+— naming the paths that would ship unreviewed. Mode is part of it, because a file that becomes
+executable, or a regular file replaced by a symlink, changes the delivery while every content byte
+stays identical.
+
+## Do not merge the base as a routine step
+
+**Branch from an exact, freshly fetched base and leave it there.** Merging the base branch back in
+"to stay current" rewrites the review target for no reason, and invalidates a head that review and
+CI are already bound to. What is required instead is to CLASSIFY later movement:
+
+| The base moved and… | Then |
+|---|---|
+| it did not move | nothing to decide |
+| every path it touched is disjoint from this delivery, and a read-only merge reports no conflict | leave the candidate branch alone |
+| it touched paths this delivery also touches, or the merge conflicts | integrate before final review |
+| the merge result could not be established | integrate; an unanswered merge is never "compatible" |
+
+Textual disjointness is evidence, not proof: two files that never overlap can still have to change
+together. The script reports refs, changed paths and the read-only merge result; whether the change
+still MEANS what it did is a judgement, and it stays with the reviewer.
+
+An operator may override any of this. When `~/.agents/AGENTS.md` exists it is the canonical
+cross-runtime policy and it wins; this section is the default for when it does not. Its text is
+deliberately not copied here — a second copy is a second owner, and the two drift.
+
 ## Integrate before publishing
 
 Fetch and integrate the current base immediately before publication. Resolve conflicts as code
