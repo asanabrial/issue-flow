@@ -242,15 +242,29 @@ publishing the skill cannot disclose permissions, machine paths or tracker ident
 ## Layout
 
 ```
-SKILL.md                          the workflow: roles, states, claiming, delivery
-bindings/github.md                how each operation is performed, per tracker
+SKILL.md                             the runtime contract: activation, rules, gates, steps
+references/domain-composition.md     handoff, priority scales, routing, autonomous fallback
+references/repository-delivery.md    isolation, integration, review units, cleanup — the fallback
+references/safety-incidents.md       the incident ledger: what failed, and the rule it justifies
+references/runtime-notes.md          invocation sigils, delegation, agent teams, honest limits
+references/migration-inventory.md    where every original section went, and whether it is retired
+assets/analyst-issue-template.md     the issue body contract an analyst fills
+bindings/github.md                   how each operation is performed, per tracker
 bindings/linear.md
 bindings/trello.md
-scripts/github.py                 the GitHub binding's reversible operations, executable
-examples/domain-test-coverage.md  a worked domain rule book
-install.sh / install.ps1          thin self-acquiring bootstrap adapters
-scripts/install_bundle.py         shared immutable-bundle transaction implementation
+scripts/github.py                    the GitHub binding's reversible operations, executable
+examples/domain-test-coverage.md     a worked domain rule book
+install.sh / install.ps1             thin self-acquiring bootstrap adapters
+scripts/install_bundle.py            shared immutable-bundle transaction implementation
 ```
+
+**Why the contract is short and the references are not.** `SKILL.md` is loaded on every single
+invocation, so everything in it is paid for every time — which makes it the wrong home for
+rationale, incident history and situational procedure. It keeps only what a run must decide on
+every activation; each companion above owns one subject once and is loaded when its condition
+holds. `references/migration-inventory.md` is the ledger that made that split auditable rather than
+lossy: every original section is listed with its final owner and whether its old source has been
+retired, so knowledge could not quietly disappear during the move.
 
 **Why an operation is a script and not a paragraph.** The failures this workflow keeps recording are
 not wrong decisions — they are steps that were never executed. A run moved labels correctly through

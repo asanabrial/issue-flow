@@ -110,7 +110,7 @@ type — resolve both at setup and store both ids.
 | `list_state` | `issues(filter: { state: { id: { eq: <state> } }, assignee: { null: true } })` |
 | `claim` | check state is not `started`-type → `issueUpdate(id, input: { assigneeId, stateId: <in-progress> })` → write the claim comment → **re-read comments for an earlier claim** |
 | `reclaim` | unsupported / fail-closed |
-| `verify_claim` | one read — `issue(id) { state { id type } comments { nodes { createdAt body } } }` — then three checks, any failed check is a stop instruction, not a retry: the state type is not `completed`/`canceled`; the state id is the one you are working under (ids, not types — `in-progress` and `review` share `started`); and no comment created after your own claim comment names your run-id in a stand-down, reclaim or adjudication. Semantics in `SKILL.md`, *A heartbeat is a claim renewal* |
+| `verify_claim` | one read — `issue(id) { state { id type } comments { nodes { createdAt body } } }` — then three checks, any failed check is a stop instruction, not a retry: the state type is not `completed`/`canceled`; the state id is the one you are working under (ids, not types — `in-progress` and `review` share `started`); and no comment created after your own claim comment names your run-id in a stand-down, reclaim or adjudication. Semantics in `references/safety-incidents.md`, *Renewal and reclaim procedure* |
 | `heartbeat` | unsupported / fail-closed |
 | `transition` | `issueUpdate(id, input: { stateId })` — single-valued, so nothing to remove |
 | `comment` | `commentCreate(input: { issueId, body })` |

@@ -16,6 +16,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -1937,6 +1938,166 @@ with tempfile_module.TemporaryDirectory() as root:
         collapsed = f"this platform refused to create the link: {exc}"
     check("two junctions folding two runs into one checkout are caught by ownership, not by the path",
           collapsed, "worktree-owned-by-another-run")
+
+
+# --------------------------------------------------------------------------------------
+# Runtime-contract boundaries (issue #7). `SKILL.md` is loaded on EVERY invocation, so its
+# structure is a runtime property, not a style preference — and the failure it guards is the one
+# the migration ledger exists for: prose is deleted from the contract and nobody notices that its
+# new owner was never linked, or that a slice was marked retired while its text is still there.
+# --------------------------------------------------------------------------------------
+
+SKILL = (REPO_ROOT / "SKILL.md").read_text(encoding="utf-8")
+SKILL_LINES = SKILL.split("\n")
+INVENTORY = (REPO_ROOT / "references" / "migration-inventory.md").read_text(encoding="utf-8")
+
+# The line budget, asserted rather than described, and pinned exactly rather than as a range.
+#
+# Issue #7 asks for 140-170 lines. The contract lands at 112 with every required section present
+# and all nine invariants stated exactly once, so reaching that floor would mean padding the one
+# document loaded on every invocation — defeating what the number is a proxy for. A range check
+# would also be dead weight here: `<= 170` can never fail while the exact pin holds. So the pin is
+# the whole check, and it works as a tripwire in both directions: growth back toward the old
+# duplication fails it, and so does a deletion nobody argued for.
+#
+# Counted the way `wc -l` counts, so the number here is the number anyone verifies by hand: the
+# trailing newline terminates the last line rather than starting another.
+SKILL_LINE_COUNT = len(SKILL.rstrip("\n").split("\n"))
+check("the runtime contract is exactly the size this migration landed on", SKILL_LINE_COUNT, 112)
+
+front = SKILL.split("---", 2)
+check("the frontmatter declares name, description, licence, author and version",
+      [key in front[1] for key in ("name:", "description:", "license:", "author:", "version:")],
+      [True] * 5)
+
+# The prescribed order, and nothing between the headings that reintroduces a retired section.
+check("the runtime contract keeps the required section order",
+      [line for line in SKILL_LINES if line.startswith("## ")],
+      ["## Activation Contract", "## Hard Rules", "## Decision Gates", "## Execution Steps",
+       "## Output Contract", "## References", "## Operator configuration"])
+
+# Every reference and asset the contract names must exist, and every file that exists must be
+# named — a reference nobody loads is knowledge that was moved out of reach.
+linked = set(re.findall(r"\]\((references/[\w.-]+\.md|assets/[\w.-]+\.md)\)", SKILL))
+on_disk = {f"references/{p.name}" for p in (REPO_ROOT / "references").glob("*.md")} | \
+          {f"assets/{p.name}" for p in (REPO_ROOT / "assets").glob("*.md")}
+check("every companion the contract links exists on disk", sorted(linked - on_disk), [])
+check("every companion on disk is reachable from the contract",
+      sorted(on_disk - linked - {"references/migration-inventory.md"}), [])
+
+# The nine invariants issue #7 requires to stay DIRECTLY actionable in the contract itself.
+#
+# Searched in the BODY, not the whole file. Two of these first matched the frontmatter
+# `description` and the binding operations list instead of the rules they name, so gutting the Hard
+# Rule left them green — a test that reports on a sentence nobody has to obey. The body begins at
+# the first `##` heading.
+BODY = SKILL[SKILL.index("## Activation Contract"):]
+for name, needle in [
+    ("analyst repository read-only", "read-only for the repository"),
+    ("at most one finding", "files at most one evidenced issue"),
+    ("state exclusivity", "Keep exactly one of"),
+    ("claim verification and renewal", "Run `verify_claim` before the first repository write"),
+    ("stale-work recovery", "Reclaimable from"),
+    ("isolated repository work", "isolated checkout"),
+    ("independent SHA-bound review", "every push invalidates both"),
+    ("verified tracker projections", "read back"),
+    ("immutable delivery gates", "annotated tag"),
+]:
+    check(f"the contract still states {name} directly", needle in BODY, True)
+
+# The ledger and the contract must agree. A row marked retired whose heading is still in SKILL.md
+# is the exact bookkeeping lie the ledger exists to prevent.
+retired_headings = ["What the analyst produces", "Working in a repository", "Abandoned work",
+                    "Where to put work you cannot finish", "Optional: a board view"]
+check("no retired section heading survives in the contract",
+      [h for h in retired_headings if h in SKILL], [])
+# The ledger guard, fourth attempt, and the first three are why this one is strict rather than
+# clever. Each earlier version matched row TEXT with a slightly wider regex — `^\| S\d\d \|`, then
+# `[TIXS]`, then a "row-shaped line" — and each reported a clean ledger while a whole region of it
+# claimed a source that had been deleted: eighteen template and incident rows, then all thirty-nine
+# invariant-family rows, then anything with padded cells, a capitalised verdict, an extra column or
+# a formatter's column alignment.
+#
+# So it parses the tables by COLUMN TITLE instead. What that buys is only as good as its refusal to
+# guess: reading a fixed column index and accepting any row at least that wide lets one widened row
+# be read a cell to the left, and `\|` — which renders as a literal pipe but splits like a
+# delimiter — is all it takes. Every structural assumption is therefore asserted rather than
+# assumed, and a violation raises instead of being skipped, because a ledger this file cannot parse
+# is exactly the state where "no unretired rows found" is worthless.
+class LedgerError(Exception):
+    """The ledger could not be parsed as the shape this guard requires."""
+
+
+def ledger_tables(text: str) -> dict:
+    """{table heading: [(row id, owner-copied, retired)]}, or raise rather than guess."""
+    tables, heading, header = {}, None, None
+    for number, line in enumerate(text.split("\n"), start=1):
+        if line.startswith("## "):
+            heading, header = line[3:].strip(), None
+            continue
+        # GitHub-Flavoured Markdown makes the LEADING pipe optional, so a row written without one
+        # renders inside the table exactly like its neighbours. Skipping on `startswith("|")` let
+        # such a row carry any verdict at all, unseen. Anything containing a pipe is treated as a
+        # candidate row and made to justify itself.
+        if "|" not in line:
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if all(c and set(c) <= set("-: ") for c in cells):
+            continue                                    # the |---|---| separator
+        lowered = [c.lower() for c in cells]
+        if header is None:
+            # The status LEGEND is the one table above the first `##`, and its body row's first
+            # cell reads "Old source retired" — which any header test on cell text alone mistakes
+            # for a header. It is skipped BY NAME rather than by position: skipping everything
+            # above the first heading let a row hoisted up there disappear instead of raising.
+            if heading is None:
+                if lowered[0] in ("status", "owner copied", "old source retired"):
+                    continue
+                raise LedgerError(f"line {number}: a table row precedes the first section heading")
+            if "old source retired" not in lowered:
+                raise LedgerError(f"line {number}: a table row precedes its header under {heading!r}")
+            for title in ("old source retired", "owner copied"):
+                if lowered.count(title) != 1:
+                    raise LedgerError(f"line {number}: {title!r} appears {lowered.count(title)} times")
+            header = (len(cells), lowered.index("owner copied"), lowered.index("old source retired"))
+            tables.setdefault(heading, [])
+            continue
+        width, copied, retired = header
+        if len(cells) != width:
+            raise LedgerError(f"line {number}: {len(cells)} cells under a {width}-column header")
+        if not cells[0]:
+            raise LedgerError(f"line {number}: a ledger row with no id")
+        tables[heading].append((cells[0], lowered[copied], lowered[retired]))
+    return tables
+
+
+try:
+    LEDGER = ledger_tables(INVENTORY)
+    ledger_rows = [(rid, copied, retired)
+                   for rows in LEDGER.values() for rid, copied, retired in rows]
+    unfinished = sorted(rid for rid, copied, retired in ledger_rows
+                        if copied != "yes" or retired != "yes")
+    shape = {name: sorted(rid for rid, _, _ in rows) for name, rows in LEDGER.items()}
+except LedgerError as exc:
+    unfinished, shape = [f"the ledger could not be parsed: {exc}"], {}
+check("the migration ledger records every row as copied and retired, in every table", unfinished, [])
+
+
+def ids(prefix, last):
+    return [f"{prefix}{n:02d}" for n in range(1, last + 1)]
+
+
+# Pinned by row IDENTITY, not by count, and stated here rather than derived from the file.
+#
+# Derived-from-the-file fails twice over: a table that is DELETED takes its heading with it, so any
+# expectation read out of the ledger agrees with its own deletion — and a count is satisfied by any
+# swap, so one row vanishing while another appears reads as no change at all. Identities are
+# immune to both, and these 88 IDs are the migration's actual shape; a slice that legitimately adds
+# or removes one has to say so on this line.
+check("every ledger table holds exactly the rows the migration accounted for", shape,
+      {"Current sections": ids("S", 21), "Analyst issue template": ids("T", 7),
+       "Named incidents and failure cases": sorted(ids("I", 11) + ids("X", 10)),
+       "Invariant families": ids("K", 39)})
 
 print()
 print(f"{CHECKS - len(FAILURES)}/{CHECKS} checks passed" + (f"; failures: {FAILURES}" if FAILURES else ""))

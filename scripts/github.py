@@ -6,12 +6,13 @@ WHY THIS FILE EXISTS
 `SKILL.md` and `bindings/github.md` already described every step below correctly, in prose,
 and runs still skipped them. The two incidents this script was written against:
 
-  * SKILL.md "Optional: a board view over this workflow" (2026-07-25, issues #61/#62) — a run
+  * Incident I11 in references/safety-incidents.md (2026-07-25, issues #61/#62) — a run
     moved labels correctly through the whole state machine, closed, merged and tagged, and
     mirrored the project board ZERO times in an entire session with the `project` scope present
     the whole way. Not a missing permission, not an unclear config: the instruction was present
     and the run never executed it.
-  * SKILL.md "Abandoned work" — five issues claimed and commented, none ever relabeled, because
+  * Incident I06 in references/safety-incidents.md — five issues claimed and commented, none ever
+    relabeled, because
     `claim` and `transition` are two separate calls and nothing forced the second.
 
 Prose cannot fix a run that does not execute prose. Everything here is a step that is
@@ -38,7 +39,7 @@ would drift, which is the exact failure this file exists to remove.
 OUTPUT CONTRACT
 ---------------
 Every subcommand prints exactly one JSON object on stdout and nothing else. Exit codes carry the
-distinction `SKILL.md` calls "a failed read is not a failed answer":
+distinction this workflow calls "a failed read is not a failed answer":
 
   0  the operation completed AND its read-back verified
   1  STOP — a check answered "stop" (lost race, stand-down, wrong state, closed issue).
@@ -1418,9 +1419,9 @@ def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
                     allow_closed_by_pr: int | None = None) -> dict:
     """One ownership read, four checks. A failed CHECK is a stop; a failed READ is nothing.
 
-    That distinction is the whole point: SKILL.md records a run that lost a claim race by five
-    seconds, was told so 33 seconds later, and then worked another ~48 minutes because nothing in
-    its heartbeat loop ever read the timeline again.
+    That distinction is the whole point: incident I07 in references/safety-incidents.md records a
+    run that lost a claim race by five seconds, was told so 33 seconds later, and then worked
+    another ~48 minutes because nothing in its heartbeat loop ever read the timeline again.
 
     `allow_closed_by_pr` exists for exactly one moment: the renewal that runs immediately before
     `close`, after your own merge. Under `gh issue develop` the merge auto-closes the issue, so a

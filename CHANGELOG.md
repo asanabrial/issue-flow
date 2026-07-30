@@ -2,6 +2,44 @@
 
 All notable changes to Issue Flow are documented here.
 
+## [1.13.0] - 2026-07-30
+
+### Changed
+
+- Complete the runtime-contract migration by retiring the last six duplicated sources from
+  `SKILL.md`, which drops from 526 lines to 112. The analyst body template, the repository default
+  flow, the abandoned-run narrative, the incomplete-work narrative, the board-view rationale and a
+  detailed review gate left standing for this slice were all already copied into
+  `assets/analyst-issue-template.md`, `references/repository-delivery.md` and
+  `references/safety-incidents.md`; each was verified present in its surviving owner before the
+  source was removed. `references/migration-inventory.md` now records every row of every table as
+  retired — sections, template parts, named incidents and failure cases, and invariant families.
+  The later tables cite subranges of the same text, so flipping only the section rows would have
+  left ten named incidents and thirty-nine invariant families claiming a source that no longer
+  exists. Repository instructions are named again (`AGENTS.md`, `CLAUDE.md`) in the delivery
+  fallback, and every citation that pointed into a deleted heading now points at its new owner.
+- Keep the contract self-sufficient for the decisions a run makes on every activation. What a
+  renewal's stop answer requires, what a failed read forbids, when a holder becomes reclaimable and
+  what a reclaimer must preserve, and when work should be put down are decision gates rather than
+  rationale, so they are stated in `SKILL.md` and their evidence stays in the incident ledger. A
+  `References` section gives each companion an explicit load condition.
+- Add boundary tests for the contract itself: frontmatter completeness, the required section order,
+  that every linked companion exists and every companion on disk is reachable, that the nine
+  invariants issue #7 requires remain directly actionable — searched in the body, so a rule cannot
+  be satisfied by the frontmatter that merely describes it — that no retired heading reappears, and
+  that no ledger row is left uncopied or unretired, and the contract's exact line count. The ledger
+  guard parses the tables by their column titles rather than matching row text, so cell padding,
+  alignment, casing and extra columns cannot hide a row from it, and it refuses to guess: a row
+  wider or narrower than its header, a duplicated column title, a row preceding any header, and a
+  row with no id all raise rather than being skipped, because a ledger that cannot be parsed is
+  exactly the state in which "no unretired rows found" is worthless. A row is recognised without
+  its leading pipe, which GitHub-Flavoured Markdown allows and which otherwise renders identically
+  while being invisible to the guard. The tables and the identity of every row in them are pinned
+  explicitly rather than counted: a deleted table takes its heading with it, so an expectation read
+  out of the ledger would agree with its own deletion, and a count is satisfied by any swap.
+- Show `references/` and `assets/` in the README layout, since they now own most of the knowledge,
+  and say why the always-loaded contract is short while its companions are not.
+
 ## [1.12.3] - 2026-07-30
 
 ### Changed
