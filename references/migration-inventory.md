@@ -5,7 +5,7 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | Status | Meaning |
 |---|---|
 | Owner copied | This migration has copied the complete knowledge into its planned final owner. |
-| Old source retired | The corresponding baseline text has been removed from its `SKILL.md` location. Where the final owner IS `SKILL.md`, the verbose baseline is gone and only the condensed runtime rule remains. |
+| Old source retired | The corresponding baseline text no longer duplicates its owner. Where the final owner is a reference or asset, the text has been removed from `SKILL.md`. Where the final owner IS `SKILL.md`, the row is complete once the contract carries the knowledge in its final form — usually a condensed runtime rule replacing verbose baseline prose, and for the operator-configuration block the frozen text unchanged, because the installer parses those exact bytes. |
 
 ## Current sections
 

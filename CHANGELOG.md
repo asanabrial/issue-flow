@@ -27,9 +27,11 @@ All notable changes to Issue Flow are documented here.
   that every linked companion exists and every companion on disk is reachable, that the nine
   invariants issue #7 requires remain directly actionable — searched in the body, so a rule cannot
   be satisfied by the frontmatter that merely describes it — that no retired heading reappears, and
-  that no row of any ledger table still claims a live source. The ledger guard matches rows by
-  shape rather than by an allowlist of ID letters, and a second check pins that no verdict-bearing
-  row escapes it, so a table added later cannot be silently outside its scope.
+  that no row of any ledger table still claims a live source, and the contract's line budget. The
+  ledger guard parses the tables by their `Old source retired` column rather than matching row
+  text, so cell padding, alignment, casing and extra columns cannot hide a row from it, and the set
+  of tables and their row counts is pinned explicitly — a table that is deleted takes its heading
+  with it, so any expectation read out of the ledger would agree with its own deletion.
 - Show `references/` and `assets/` in the README layout, since they now own most of the knowledge,
   and say why the always-loaded contract is short while its companions are not.
 
