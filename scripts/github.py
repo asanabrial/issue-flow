@@ -2121,6 +2121,11 @@ WINDOWS_DEVICE_NAMES = frozenset(
 # checkouts has to survive a filesystem that folds case — see `run_component`.
 RUN_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
+# What joins a branch to a run ID when a branch-only template is migrated. Git rejects `~` in a ref
+# name and `RUN_ID_RE` rejects it in a run ID, so it appears in neither half and the composed name
+# has exactly one split point — see `run_scoped_template` for the collision that motivates it.
+RUN_SCOPE_JOIN = "~"
+
 
 def run_component(run_id: str) -> str:
     """Validate a run ID as a directory component, returning it UNCHANGED, or refuse it.
@@ -2167,8 +2172,14 @@ def run_component(run_id: str) -> str:
 
 
 def assert_safe_component(value: str, kind: str) -> None:
-    """Refuse a path component that does not name a plain directory on every supported platform."""
-    if value.lower() in WINDOWS_DEVICE_NAMES:
+    """Refuse a path component that does not name a plain directory on every supported platform.
+
+    The device check is on the part BEFORE the first dot, because Windows resolves `con.txt`,
+    `nul.log` and `com1.anything` to the device just as it resolves the bare name. A run ID can
+    never reach that branch — dots are not in its alphabet — but a flattened branch or repository
+    name can, and this function is shared by all of them.
+    """
+    if value.split(".", 1)[0].lower() in WINDOWS_DEVICE_NAMES:
         raise ConfigDefect(
             {
                 "ok": False,
@@ -2196,10 +2207,17 @@ def run_scoped_template(template: str) -> tuple[str, bool]:
     exists, stays exactly where it is and is neither a parent of nor a child of the new one. Runs
     that collide inside a directory another run owns is the whole defect; making the new path a
     descendant of the old one would reproduce it.
+
+    **The join character is `~`, and it is not cosmetic.** Joining with `-` makes the COMPOSED name
+    ambiguous even though each half is unambiguous: branch `fix/6` with run `a-b` and branch
+    `fix/6-a` with run `b` both spell `fix-6-a-b`. Those are two different branches, so they take
+    two different branch locks, and nothing downstream would catch them sharing one directory. Git
+    forbids `~` in a ref name and `RUN_ID_RE` forbids it in a run ID, so it cannot occur inside
+    either half — which makes the split point unique and the composition injective.
     """
     if "<run-id>" in template:
         return template, False
-    return template.rstrip("/\\") + "-<run-id>", True
+    return template.rstrip("/\\") + f"{RUN_SCOPE_JOIN}<run-id>", True
 
 
 def worktree_path(template: str, repo: str, branch: str, run_id: str, issue: int) -> Path:
@@ -2240,7 +2258,7 @@ def worktree_path(template: str, repo: str, branch: str, run_id: str, issue: int
     return Path(resolved)
 
 
-def canonical_worktree_path(path: Path) -> Path:
+def canonical_worktree_path(path: Path, run_id: str | None = None) -> Path:
     """One real spelling for the run's directory, and a refusal when the directory itself is a link.
 
     Two separate jobs, because the two kinds of link are not the same problem.
@@ -2274,6 +2292,25 @@ def canonical_worktree_path(path: Path) -> Path:
                 "action": "this run's worktree directory is itself a symlink or junction pointing "
                           "somewhere else, so two distinct run IDs can land in one real directory. "
                           "Remove the link, or point the worktree template at a real directory tree",
+            }
+        )
+    # The leaf check above covers a template whose run-scoped part IS the last component, which is
+    # every template this command produces. A hand-written `…/<run-id>/checkout` puts it in an
+    # ancestor, where a junction could redirect it while the leaf resolves cleanly — and the
+    # surviving evidence is that the run ID stops appearing in the real path at all. Cheap to
+    # check, and it is the only symptom an ancestor redirection cannot hide.
+    if run_id and run_id in str(path).replace("\\", "/").split("/") \
+            and run_id not in str(canonical).replace("\\", "/").split("/"):
+        raise ConfigDefect(
+            {
+                "ok": False,
+                "reason": "run-scope-lost-to-alias",
+                "path": str(path),
+                "resolves_to": str(canonical),
+                "run_id": run_id,
+                "action": "a link above this directory resolves the run-scoped part of the path "
+                          "away, so the real directory is not this run's own. Point the worktree "
+                          "template at a real directory tree",
             }
         )
     return canonical
@@ -2367,17 +2404,34 @@ def ref_object(cwd: Path, ref: str) -> str | None:
     pseudo-refs are outside what it can see and would be reported as absent — which is the one
     wrong answer this function exists to avoid. Every caller passes `refs/heads/…` or
     `refs/remotes/…`; the current checkout's head comes from `git rev-parse HEAD` instead.
+
+    **The argument is a pattern, not a path, and the refname is therefore matched again here.** A
+    `for-each-ref` pattern matches a ref completely OR from the beginning up to a slash, so
+    `refs/heads/foo` also matches `refs/heads/foo/bar` — and asking about a branch `foo` that does
+    not exist would otherwise return the child's object id, which is not merely an unhelpful answer
+    but the wrong one: `foo` would be reported as present at a commit that belongs to another
+    branch. Verified against git 2.55: with only `foo/bar` present, the pattern `refs/heads/foo`
+    prints `refs/heads/foo/bar`. So the refname is requested alongside the object id and only an
+    EXACT match counts; children are ignored rather than mistaken for the parent.
     """
-    proc = run(["git", "for-each-ref", "--format=%(objectname)", "--end-of-options", ref],
-               cwd=cwd, check=False)
+    proc = run(["git", "for-each-ref", "--format=%(refname)%09%(objectname)",
+                "--end-of-options", ref], cwd=cwd, check=False)
     if proc.returncode != 0:
         raise ReadFailure(f"git for-each-ref {ref} failed ({proc.returncode}): {proc.stderr.strip()}")
-    lines = [line for line in proc.stdout.splitlines() if line.strip()]
-    if not lines:
+    matched = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        name, tab, oid = line.partition("\t")
+        if not tab:
+            raise ReadFailure(f"git for-each-ref {ref} answered in an unexpected format: {line!r}")
+        if name == ref:
+            matched.append(oid.strip())
+    if not matched:
         return None
-    if len(lines) > 1 or not OBJECT_ID_RE.fullmatch(lines[0].strip()):
-        raise ReadFailure(f"git for-each-ref {ref} answered ambiguously: {lines!r}")
-    return lines[0].strip()
+    if len(matched) > 1 or not OBJECT_ID_RE.fullmatch(matched[0]):
+        raise ReadFailure(f"git for-each-ref {ref} answered ambiguously: {matched!r}")
+    return matched[0]
 
 
 def branch_identity_verdict(*, fresh: bool, local: str | None, remote: str | None,
@@ -2415,9 +2469,13 @@ def branch_identity_verdict(*, fresh: bool, local: str | None, remote: str | Non
         return {"coherent": True, "reason": "resumed-in-sync"}
     if remote_reachable_from_local is True:
         return {"coherent": True, "reason": "resumed-local-ahead"}
+    # Deliberately not called "remote is ahead": unreachable covers a remote that is ahead AND a
+    # remote that diverged, most commonly because somebody force-pushed or rebased it. Naming the
+    # narrower case in the payload would send the reader looking for commits to fast-forward that
+    # may not exist. Either way, continuing would build on a head this checkout has never seen.
     return {
         "coherent": False,
-        "reason": "remote-ahead-of-local" if remote_reachable_from_local is False
+        "reason": "remote-not-reachable-from-local" if remote_reachable_from_local is False
                   else "ancestry-unknown",
     }
 
@@ -2465,7 +2523,10 @@ def branch_reservation(cwd: Path, branch: str, run_id: str, issue: int):
     checkout taken while it is writing into it, which is the corruption this whole issue exists to
     prevent. So a held lock STOPS, reports who holds it and where, and points at the recovery
     procedure that requires proving the holder is gone. The one exception needs no proof about
-    anyone else: a lock naming THIS run is this run's own retry.
+    anyone else: a lock naming THIS run is this run's own retry, and it is adopted so that the
+    retry that succeeds is also the one that cleans up. A run that merely proceeded past its own
+    leftover lock would leave nobody entitled to remove it, and a different run would be blocked by
+    it forever — a leak dressed as caution.
     """
     lock = branch_lock_path(cwd, branch)
     lock.parent.mkdir(parents=True, exist_ok=True)
@@ -2482,7 +2543,15 @@ def branch_reservation(cwd: Path, branch: str, run_id: str, issue: int):
         handle = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
         existing = read_lock_record(lock)
-        if existing.get("run_id") != run_id:
+        if existing.get("run_id") == run_id:
+            # Our own lock, left by an earlier attempt of this same run that did not get to
+            # release it. ADOPT it — `held` stays true through the exit — rather than merely
+            # proceeding past it. Proceeding without adopting is how a crashed run's lock outlives
+            # every retry and blocks a different run forever: nobody is left who is entitled to
+            # remove it. Adoption is safe precisely because the lock names us, which is the one
+            # holder we can be certain about without inspecting anybody's process.
+            held = True
+        else:
             raise Stop(
                 {
                     "ok": False,
@@ -2505,8 +2574,9 @@ def branch_reservation(cwd: Path, branch: str, run_id: str, issue: int):
     try:
         yield lock
     finally:
-        # Only the acquirer removes it. A run that found its OWN stale lock and proceeded keeps it
-        # in place for the run that is still using it, if there is one.
+        # The acquirer removes it — and a run that ADOPTED its own leftover lock is an acquirer,
+        # which is why adoption sets `held`. `start-branch` never nests this scope, so there is no
+        # inner scope whose exit could take a lock an outer one still needs.
         if held:
             try:
                 lock.unlink()
@@ -2715,7 +2785,10 @@ LINKED_BRANCHES_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
-      linkedBranches(first: 100) { nodes { ref { name target { oid } } } }
+      linkedBranches(first: 100) {
+        nodes { ref { name target { oid } } }
+        pageInfo { hasNextPage }
+      }
     }
   }
 }
@@ -2728,6 +2801,12 @@ def linked_branch_names(issue: int, cwd: Path) -> set[str]:
     This is the read-back that turns an ambiguous `gh issue develop` into a fact. Every shape that
     is not a complete answer is refused, because the caller uses "not in this set" to conclude the
     link does not exist, and that conclusion may not rest on a response that simply omitted it.
+
+    Incompleteness includes a TRUNCATED page, for exactly the reason issue #28 established for
+    closing references: a connection that still advertises another page has not answered "is this
+    branch linked", it has answered "here are some links". One page of 100 is far more than any
+    real issue carries, so this is not expected to fire — but the shape that must never happen is
+    a `hasNextPage: true` read as a complete absence.
     """
     owner, name = repo_identity(cwd)
     data = gh_json(["api", "graphql", "-f", f"query={LINKED_BRANCHES_QUERY}",
@@ -2739,6 +2818,11 @@ def linked_branch_names(issue: int, cwd: Path) -> set[str]:
     connection = (issue_node or {}).get("linkedBranches")
     if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
         raise ReadFailure("linked-branch response omitted the branch connection")
+    page_info = connection.get("pageInfo")
+    if not isinstance(page_info, dict) or not isinstance(page_info.get("hasNextPage"), bool):
+        raise ReadFailure("linked-branch response carried no boolean hasNextPage")
+    if page_info["hasNextPage"]:
+        raise ReadFailure("linked-branch connection advertises another page; the answer is partial")
     names = set()
     for node in connection["nodes"]:
         ref = (node or {}).get("ref") if isinstance(node, dict) else None
@@ -2832,7 +2916,7 @@ def cmd_start_branch(args, config, cwd) -> dict:
     path = worktree_path(scoped, repo_name, args.branch, args.run_id, args.issue)
     legacy = (worktree_path(template, repo_name, args.branch, args.run_id, args.issue)
               if migrated else None)
-    path = canonical_worktree_path(path)
+    path = canonical_worktree_path(path, args.run_id)
 
     with branch_reservation(cwd, args.branch, args.run_id, args.issue):
         # A branch-only template that ALREADY has a checkout is the migration's one hard case. The
@@ -2914,8 +2998,9 @@ def cmd_start_branch(args, config, cwd) -> dict:
                     "action": "the local head, the published head and the recorded base do not "
                               "tell one story — most likely the base moved while the branch was "
                               "being created, or someone else pushed to it. Nothing was reported "
-                              "as delivered. Re-run this command to resume the branch as it now "
-                              "stands, or reconcile the heads by hand first",
+                              "as delivered. The branch DOES now exist remotely, so this is not a "
+                              "clean slate: re-run this command to resume it as it now stands, or "
+                              "reconcile the heads by hand first",
                 }
             )
 

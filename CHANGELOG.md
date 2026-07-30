@@ -10,20 +10,26 @@ All notable changes to Issue Flow are documented here.
   flattened, so two distinct IDs can no longer fold onto one path through separators, case folding,
   dot segments or reserved device names; a branch-only worktree template gains a run-scoped sibling
   in memory without rewriting `operator.local.md`, and a still-registered legacy checkout stops with
-  migration guidance rather than being orphaned. A worktree directory that is itself a symlink or
-  junction is refused, while an ancestor link is resolved rather than rejected.
+  migration guidance rather than being orphaned. The migrated sibling joins branch and run ID with
+  `~`, which neither half can contain, so two different branches cannot compose onto one directory.
+  A worktree directory that is itself a symlink or junction is refused, and a link that resolves the
+  run-scoped part of the path away is refused, while an ordinary ancestor link is resolved rather
+  than rejected.
 - Resume a checkout only against durable ownership evidence written by the run that created it.
   Branch and path equality no longer authorise a resume, and an unproven or foreign claim stops with
   documented recovery instead of being treated as a permissive default.
 - Serialize concurrent `start-branch` calls for one branch on an exclusive branch-scoped lock, since
   Git's own "already used by worktree" check loses the race it exists to win. Stale locks require
-  proof that the holding process is stopped and are never broken on elapsed time.
+  proof that the holding process is stopped and are never broken on elapsed time; a run that finds
+  its own leftover lock adopts it, so a crashed attempt cannot leave a lock nobody may remove.
 - Reserve the entire local checkout before the first GitHub mutation, so a failed reservation leaves
   no remote state behind.
 - Re-read the Development sidebar instead of believing a nonzero or timed-out `gh issue develop`,
-  and report an outcome that cannot be established as an ambiguous write. Ref existence is probed
-  with `git for-each-ref`, which separates a real absence from a failed read, and a successful native
-  creation must prove local head, published head and recorded base agree before reporting success.
+  and report an outcome that cannot be established as an ambiguous write. A truncated sidebar page
+  is a failed read rather than an absent link. Ref existence is probed with `git for-each-ref` and
+  matched on the exact refname, so a real absence is told apart both from a failed read and from a
+  child ref that the pattern would otherwise match; a successful native creation must prove local
+  head, published head and recorded base agree before reporting success.
 - Return exit `2` for configuration and template defects, keeping exit `1` for authority loss, `3`
   for a failed read and `5` for an ambiguous write.
 - Document worktree and branch-lock recovery, branch-only template migration, and the existing

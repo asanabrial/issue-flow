@@ -320,6 +320,14 @@ reports `template_migrated` so the substitution is visible rather than assumed.
 A sibling and not a child (`…/<branch>/<run-id>`), so that a legacy checkout is neither a parent nor
 a child of the new one — runs colliding inside a directory another run owns is the entire defect.
 
+**The migration joins the two halves with `~`, and that is not cosmetic.** Joining with `-` makes
+the composed name ambiguous even though each half is unambiguous on its own: branch `fix/6` with run
+`a-b` and branch `fix/6-a` with run `b` both spell `fix-6-a-b`. Those are two *different* branches,
+so they take two different branch locks, and nothing downstream would notice them sharing one
+directory. Git rejects `~` in a ref name and the run-ID alphabet rejects it too, so it appears in
+neither half and the split point is unique. If you write your own template, join `<branch>` and
+`<run-id>` with a character that cannot occur in either — `~` is the one this binding uses.
+
 Relying on git to catch the collision instead was tried and does not hold. `worktree add` refuses a
 branch already checked out elsewhere (`fatal: '<branch>' is already used by worktree at …`), but that
 is a read followed by a write with no lock between them: the review probe for issue #31 produced two

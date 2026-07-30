@@ -1408,13 +1408,17 @@ check("target discovery remains a read-only first call", [next(a for a in operat
 # checkout another process is writing.
 # --------------------------------------------------------------------------------------
 
-def refused(call, *, want_reason=None):
-    """Run `call` and name how it refused, so a check reads as prose rather than as a try block."""
+def refused(call):
+    """Run `call` and name how it refused, so a check reads as prose rather than as a try block.
+
+    Returns the `reason` for a stop and the class name for a failure. It deliberately does NOT
+    distinguish `ConfigDefect` from `Stop` in that string: the two share a payload shape and differ
+    only in the exit code, which `exit_code_for` below asserts directly against `main`. Naming the
+    class here would let a reason check quietly stand in for an exit-code check.
+    """
     try:
         call()
-    except m.ConfigDefect as stop:
-        return stop.payload.get("reason") if want_reason is None else stop.payload.get("reason")
-    except m.Stop as stop:
+    except m.Stop as stop:  # ConfigDefect is a Stop; the exit code is asserted separately
         return stop.payload.get("reason")
     except (m.ReadFailure, m.WriteFailure, m.Timeout) as failure:
         return type(failure).__name__
@@ -1439,6 +1443,11 @@ check("a run ID may not name a Windows device",
 check("a device name is refused in any substituted component, not only the run ID",
       refused(lambda: m.worktree_path("/w/<repo>/<branch>", "aux", "fix/1", "run-a", 1)),
       "reserved-device-component")
+# Windows resolves `con.txt` to the device just as it resolves `con`; the extension is not a name.
+check("a device name with an extension is still a device",
+      [refused(lambda: m.worktree_path("/w/<repo>", value, "fix/1", "run-a", 1))
+       for value in ("con.txt", "NUL.log", "com1.anything")],
+      ["reserved-device-component"] * 3)
 check("template defects are configuration errors, not lost races",
       [issubclass(m.ConfigDefect, m.Stop),
        refused(lambda: m.worktree_path("/w/<branch>", "r", "..", "run-a", 1))],
@@ -1471,7 +1480,14 @@ check("the branch still flattens, because uniqueness is the run ID's job",
 
 # A branch-only template is persisted operator policy, not a mistake to reject.
 check("a branch-only template gains a run-scoped sibling in memory",
-      m.run_scoped_template("/w/<repo>/<branch>"), ("/w/<repo>/<branch>-<run-id>", True))
+      m.run_scoped_template("/w/<repo>/<branch>"), ("/w/<repo>/<branch>~<run-id>", True))
+# Joining with `-` makes the COMPOSED name ambiguous even though each half is not: these are two
+# different branches, so they take two different branch locks and nothing downstream would notice
+# them sharing one directory.
+check("two different branches cannot compose onto one run-scoped directory",
+      m.worktree_path(m.run_scoped_template("/w/<branch>")[0], "r", "fix/6", "a-b", 6)
+      == m.worktree_path(m.run_scoped_template("/w/<branch>")[0], "r", "fix/6-a", "b", 6),
+      False)
 check("a template that is already run-scoped is left exactly alone",
       m.run_scoped_template("/w/<branch>/<run-id>"), ("/w/<branch>/<run-id>", False))
 check("the migrated sibling is never a child of the legacy directory",
@@ -1490,21 +1506,55 @@ def ref_run(returncode: int, stdout: str):
         SimpleNamespace(returncode=returncode, stdout=stdout, stderr="boom")
 
 
+def git_ref_run(*refs: str):
+    """Model `for-each-ref`'s PATTERN semantics, not a dict lookup keyed on the argument.
+
+    The distinction is the whole point of the check below. A fake that answers
+    `self.refs.get(pattern)` encodes the assumption under test — that the argument is an exact ref
+    path — and would report every one of these checks as passing while git returned a child ref.
+    Real rule, from the man page and confirmed against git 2.55: a pattern matches a ref completely
+    OR from the beginning up to a slash.
+    """
+    def fake(argv, cwd=None, check=True, writes=False, binary=False, timeout=None):
+        pattern = argv[-1]
+        matched = [name for name in refs
+                   if name == pattern or name.startswith(pattern.rstrip("/") + "/")]
+        stdout = "".join(f"{name}\t{OID}\n" for name in matched)
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+    return fake
+
+
 OID = "c" * 40
 with patch.object(m, "run", ref_run(0, "")):
     check("an empty answer from a successful probe is a real absence",
           m.ref_object(Path("."), "refs/heads/x"), None)
-with patch.object(m, "run", ref_run(0, OID + "\n")):
+with patch.object(m, "run", ref_run(0, f"refs/heads/x\t{OID}\n")):
     check("a single object id is a real presence", m.ref_object(Path("."), "refs/heads/x"), OID)
 with patch.object(m, "run", ref_run(128, "")):
     check("a failed probe is a failed read, never an absence",
           refused(lambda: m.ref_object(Path("."), "refs/heads/x")), "ReadFailure")
-with patch.object(m, "run", ref_run(0, f"{OID}\n{OID}\n")):
+with patch.object(m, "run", ref_run(0, f"refs/heads/x\t{OID}\nrefs/heads/x\t{OID}\n")):
     check("an ambiguous probe answer is a failed read",
           refused(lambda: m.ref_object(Path("."), "refs/heads/x")), "ReadFailure")
-with patch.object(m, "run", ref_run(0, "not-an-object\n")):
+with patch.object(m, "run", ref_run(0, f"refs/heads/x\tnot-an-object\n")):
     check("an unparseable probe answer is a failed read",
           refused(lambda: m.ref_object(Path("."), "refs/heads/x")), "ReadFailure")
+with patch.object(m, "run", ref_run(0, f"refs/heads/x {OID}\n")):
+    check("an answer in an unexpected format is a failed read",
+          refused(lambda: m.ref_object(Path("."), "refs/heads/x")), "ReadFailure")
+
+# The argument is a PATTERN. `refs/heads/foo` also matches `refs/heads/foo/bar`, so a probe that
+# trusted the output would report a branch that does not exist as present — at another branch's
+# commit. Confirmed against real git before this check was written.
+with patch.object(m, "run", git_ref_run("refs/heads/foo/bar")):
+    check("a child ref is not mistaken for the parent that does not exist",
+          m.ref_object(Path("."), "refs/heads/foo"), None)
+with patch.object(m, "run", git_ref_run("refs/heads/foo", "refs/heads/foo/bar")):
+    check("a parent that does exist is read past its children",
+          m.ref_object(Path("."), "refs/heads/foo"), OID)
+with patch.object(m, "run", git_ref_run("refs/heads/foo/a", "refs/heads/foo/b")):
+    check("several children still do not manufacture a parent",
+          m.ref_object(Path("."), "refs/heads/foo"), None)
 
 # --------------------------------------------------------------------------------------
 # Branch identity. `gh issue develop` branches from the base as the SERVER sees it, which is not
@@ -1526,10 +1576,13 @@ check("a local-only branch has nothing to disagree with",
 check("unpushed local work on a resumed branch is ordinary",
       m.branch_identity_verdict(fresh=False, local=A, remote=B, base=B,
                                 remote_reachable_from_local=True)["reason"], "resumed-local-ahead")
-check("a remote ahead of local would build on a head this checkout never saw",
+# Named for what was actually established — unreachable covers "ahead" AND "force-pushed away
+# from under us", and pointing the reader at commits to fast-forward that may not exist is worse
+# than saying less.
+check("an unreachable remote head would build on a commit this checkout never saw",
       m.branch_identity_verdict(fresh=False, local=A, remote=B, base=B,
                                 remote_reachable_from_local=False),
-      {"coherent": False, "reason": "remote-ahead-of-local"})
+      {"coherent": False, "reason": "remote-not-reachable-from-local"})
 check("an unestablished ancestry is not a pass",
       m.branch_identity_verdict(fresh=False, local=A, remote=B, base=B,
                                 remote_reachable_from_local=None),
@@ -1568,8 +1621,12 @@ class Clone:
             target = self.common if argv[3] == "--git-common-dir" else self.admin
             return SimpleNamespace(returncode=0, stdout=f"{target}\n", stderr="")
         if argv[:2] == ["git", "for-each-ref"]:
-            oid = self.refs.get(argv[-1])
-            return SimpleNamespace(returncode=0, stdout="" if oid is None else oid + "\n", stderr="")
+            # Pattern semantics here too, for the same reason `git_ref_run` has them: a dict
+            # lookup on the argument would quietly re-introduce the assumption under test.
+            pattern = argv[-1]
+            stdout = "".join(f"{name}\t{oid}\n" for name, oid in sorted(self.refs.items())
+                             if name == pattern or name.startswith(pattern.rstrip("/") + "/"))
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
         if argv[:3] == ["gh", "issue", "develop"]:
             if self.develop_timeout:
                 raise m.Timeout("gh issue develop did not finish within 120s")
@@ -1615,7 +1672,7 @@ with tempfile_module.TemporaryDirectory() as root:
     clone = Clone(root)
     result = clone.start()
     check("a branch-only template delivers a run-scoped worktree",
-          (Path(result["worktree"]).name, result["template_migrated"]), (f"fix-6-{ME}", True))
+          (Path(result["worktree"]).name, result["template_migrated"]), (f"fix-6~{ME}", True))
     check("the local checkout is reserved before the first remote mutation",
           clone.index_of(["git", "worktree", "add"]) < clone.index_of(["gh", "issue", "develop"]),
           True)
@@ -1640,7 +1697,7 @@ with tempfile_module.TemporaryDirectory() as root:
 # branch satisfy it equally well.
 with tempfile_module.TemporaryDirectory() as root:
     clone = Clone(root)
-    path = clone.worktrees / f"fix-6-{ME}"
+    path = clone.worktrees / f"fix-6~{ME}"
     path.mkdir(parents=True)
     registry = {m.normalise_path(path): "fix/6"}
     check("a registered checkout with no ownership marker is not clearance",
@@ -1686,12 +1743,26 @@ with tempfile_module.TemporaryDirectory() as root:
             check("a second run cannot take a held branch lock",
                   refused(lambda: m.branch_reservation(Path("."), "fix/6", OTHER, 6).__enter__()),
                   "branch-locked-by-another-run")
-            with m.branch_reservation(Path("."), "fix/6", ME, 6):
-                check("a run's own lock is its own retry, not a race it lost", lock_file.exists(), True)
-            check("a reentrant exit does not release the lock the outer scope holds",
+        check("the lock is released when the reservation ends", lock_file.exists(), False)
+
+        # A crashed run leaves its lock behind. The retry must be able to proceed AND must end up
+        # owning the cleanup — proceeding without adopting is how that lock outlives every retry
+        # and blocks a different run forever, with nobody left entitled to remove it.
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        lock_file.write_text(json.dumps({"run_id": ME, "branch": "fix/6", "pid": 1,
+                                         "acquired_at": "2026-07-30T00:00:00Z"}), encoding="utf-8")
+        with m.branch_reservation(Path("."), "fix/6", ME, 6):
+            check("a run's own leftover lock is its own retry, not a race it lost",
                   lock_file.exists(), True)
-        check("the lock is released even though the inner scope exited first",
-              lock_file.exists(), False)
+        check("an adopted lock is released rather than leaked", lock_file.exists(), False)
+
+        # A raise inside the reservation must not strand the lock either.
+        try:
+            with m.branch_reservation(Path("."), "fix/6", ME, 6):
+                raise RuntimeError("the work blew up")
+        except RuntimeError:
+            pass
+        check("the lock is released when the work inside it raises", lock_file.exists(), False)
 
         # Age is not evidence. This lock is a year old and still stops the next run.
         lock_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1727,6 +1798,27 @@ with tempfile_module.TemporaryDirectory() as root:
     with patch.multiple(m, run=clone.run, linked_branch_names=clone.linked_branches):
         check("a failed read-back is a failed read, not an absent link",
               refused(lambda: m.develop_link(6, "fix/6", "main", Path("."))), "ReadFailure")
+
+    # The sidebar read decides "not linked", so a TRUNCATED page has not answered the question —
+    # the same completeness contract issue #28 established for closing references.
+    def sidebar(nodes, has_next):
+        return {"data": {"repository": {"issue": {"linkedBranches": {
+            "nodes": [{"ref": {"name": name}} for name in nodes],
+            "pageInfo": {"hasNextPage": has_next}}}}}}
+
+    with patch.multiple(m, gh_json=lambda *_a, **_k: sidebar(["fix/6"], False),
+                        repo_identity=lambda _cwd: ("o", "r")):
+        check("a complete sidebar page answers the question",
+              m.linked_branch_names(6, Path(".")), {"fix/6"})
+    with patch.multiple(m, gh_json=lambda *_a, **_k: sidebar([], True),
+                        repo_identity=lambda _cwd: ("o", "r")):
+        check("a truncated sidebar page is a failed read, not an absent link",
+              refused(lambda: m.linked_branch_names(6, Path("."))), "ReadFailure")
+    with patch.multiple(m, gh_json=lambda *_a, **_k: {"data": {"repository": {"issue": {
+                            "linkedBranches": {"nodes": []}}}}},
+                        repo_identity=lambda _cwd: ("o", "r")):
+        check("a sidebar page with no page metadata is a failed read",
+              refused(lambda: m.linked_branch_names(6, Path("."))), "ReadFailure")
 
     clone = Clone(root, develop_timeout=True, linked=[])
     with patch.multiple(m, run=clone.run, linked_branch_names=clone.linked_branches):
@@ -1766,6 +1858,20 @@ with tempfile_module.TemporaryDirectory() as root:
     except (OSError, NotImplementedError) as exc:
         aliased = f"this platform refused to create the link: {exc}"
     check("a run directory that is itself a link is refused", aliased, "aliased-worktree-path")
+
+    # A hand-written `…/<run-id>/checkout` template puts the run scope in an ANCESTOR, where the
+    # leaf resolves cleanly and a junction above it still redirects the run's own directory. The
+    # surviving symptom is that the run ID stops appearing in the real path.
+    nested = Path(root) / "alias" / "checkout"
+    try:
+        link.exists()  # created above, or the except below already reported why not
+        lost = refused(lambda: m.canonical_worktree_path(nested, "alias"))
+    except OSError as exc:
+        lost = f"this platform refused to create the link: {exc}"
+    check("a link that resolves the run scope out of the path is refused",
+          lost, "run-scope-lost-to-alias")
+    check("a path whose run scope survives is accepted",
+          m.same_location(m.canonical_worktree_path(real / "sub", "real"), real / "sub"), True)
 
 print()
 print(f"{CHECKS - len(FAILURES)}/{CHECKS} checks passed" + (f"; failures: {FAILURES}" if FAILURES else ""))
