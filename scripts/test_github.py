@@ -1133,6 +1133,163 @@ except m.Stop as exc:
 check("unassign cannot borrow mismatched runtime metadata",
       (wrong_runtime, len(wrong_runtime_release.comments)), ("unassign-metadata-mismatch", 1))
 
+
+# --------------------------------------------------------------------------------------
+# Closing-reference pagination. The defect: GitHub returns a connection, but the binding read only
+# five nodes, so the exact PR that auto-closed a long-running issue disappeared from renewal.
+# --------------------------------------------------------------------------------------
+def closing_page(nodes, has_next=False, cursor=None):
+    return {"data": {"repository": {"issue": {"closedByPullRequestsReferences": {
+        "nodes": nodes,
+        "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+    }}}}}
+
+
+closing_queries = []
+closing_responses = iter([
+    closing_page([{"number": number, "state": "MERGED"} for number in range(1, 6)],
+                 True, "page-2"),
+    closing_page([
+        {"number": 6, "state": "MERGED"},
+        {"number": 7, "state": "MERGED"},
+        {"number": 7, "state": "MERGED"},
+    ]),
+])
+def fake_closing_json(args, **_kwargs):
+    closing_queries.append(args)
+    return next(closing_responses)
+
+
+with patch.multiple(m, repo_identity=lambda _cwd: ("owner", "repo"),
+                    gh_json=fake_closing_json):
+    complete_refs = m.closing_refs(7, Path("."))
+check("closing references paginate and deduplicate beyond the first page",
+      [ref["number"] for ref in complete_refs], list(range(1, 8)))
+check("closing-reference pagination sends the advertised continuation cursor",
+      "cursor=page-2" in closing_queries[1], True)
+
+for name, response in (
+    ("missing page metadata rejects an incomplete closing-reference read",
+     {"data": {"repository": {"issue": {
+         "closedByPullRequestsReferences": {"nodes": []},
+     }}}}),
+    ("a missing continuation cursor rejects an incomplete closing-reference read",
+     closing_page([], True, None)),
+    ("GraphQL errors reject a partial closing-reference read",
+     {**closing_page([], False), "errors": [{"message": "partial"}]}),
+):
+    rejected = False
+    try:
+        with patch.multiple(m, repo_identity=lambda _cwd: ("owner", "repo"),
+                            gh_json=lambda *_args, **_kwargs: response):
+            m.closing_refs(7, Path("."))
+    except m.ReadFailure:
+        rejected = True
+    check(name, rejected, True)
+
+bounded = False
+try:
+    with patch.multiple(m, CLOSING_REFS_MAX_PAGES=1,
+                        repo_identity=lambda _cwd: ("owner", "repo"),
+                        gh_json=lambda *_args, **_kwargs: closing_page([], True, "more")):
+        m.closing_refs(7, Path("."))
+except m.ReadFailure:
+    bounded = True
+check("closing-reference pagination fails closed at its page bound", bounded, True)
+
+closed_issue = {
+    "state": "CLOSED",
+    "labels": [{"name": "status:review"}],
+    "comments": [comment(m.marker(
+        "claim", run_id="opencode-owner", runtime="opencode",
+        horizon="2099-01-01T00:00Z"))],
+}
+with patch.multiple(m, issue_view=lambda *_args, **_kwargs: closed_issue,
+                    closing_refs=lambda *_args: complete_refs):
+    exact_closer = False
+    try:
+        exact_closer = m.do_verify_claim(
+            7, "opencode-owner", "review", Path("."), allow_closed_by_pr=7)["ok"]
+    except m.Stop:
+        pass
+    wrong_closer = None
+    try:
+        m.do_verify_claim(7, "opencode-owner", "review", Path("."), allow_closed_by_pr=8)
+    except m.Stop as exc:
+        wrong_closer = exc.payload["reason"]
+    arbitrary_close = None
+    try:
+        m.do_verify_claim(7, "opencode-owner", "review", Path("."))
+    except m.Stop as exc:
+        arbitrary_close = exc.payload["reason"]
+check("closed-issue renewal accepts the exact closer beyond page one", exact_closer, True)
+check("closed-issue renewal rejects a different PR", wrong_closer, "issue-not-open")
+check("closed-issue renewal rejects a closure without an allowed PR",
+      arbitrary_close, "issue-not-open")
+
+historical_refs = [
+    {"number": 10, "state": "MERGED", "headRefName": "old", "baseRefName": "main"},
+    {"number": 11, "state": "OPEN", "headRefName": "fix/current", "baseRefName": "main"},
+    {"number": 12, "state": "OPEN", "headRefName": "fix/current", "baseRefName": "main"},
+]
+keyword_inputs = []
+with patch.multiple(
+        m,
+        closing_refs=lambda *_args: historical_refs,
+        keyword_sources=lambda _issue, refs, _base, _branch, _cwd: keyword_inputs.extend(refs) or [],
+):
+    current_autoclose = m.assess_autoclose(
+        7, Path("."), base="main", branch="fix/current", current_pr=11)
+check("autoclose assessment ignores historical and non-current PRs",
+      ([ref["number"] for ref in current_autoclose["linked_prs"]],
+       [ref["number"] for ref in keyword_inputs]), ([11], [11]))
+
+with patch.object(m, "closing_refs", return_value=historical_refs[:1]):
+    historical_autoclose = m.assess_autoclose(7, Path("."))
+check("historical-only closing references are not a current autoclose cause",
+      historical_autoclose["will_autoclose"], False)
+
+assessed_prs = []
+def fake_assess(_issue, _cwd, _base=None, _branch=None, current_pr=None):
+    assessed_prs.append(current_pr)
+    return {"will_autoclose": False, "cause": None, "linked_prs": []}
+
+
+with patch.object(m, "assess_autoclose", side_effect=fake_assess):
+    m.cmd_check_closing_keywords(
+        SimpleNamespace(issue=7, base="main", branch="fix/current"), {}, Path("."))
+check("standalone autoclose checks do not invent a current PR", assessed_prs, [None])
+
+published_pr = {
+    "number": 28,
+    "url": "https://example/28",
+    "headRefOid": "head",
+    "baseRefOid": "base",
+}
+with patch.multiple(
+        m,
+        do_verify_claim=lambda *_args: {},
+        gh_json=lambda *_args, **_kwargs: [published_pr],
+        run=lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        assess_autoclose=fake_assess,
+):
+    m.cmd_publish_review(SimpleNamespace(
+        issue=28, run_id="owner", expect_state="in-progress", worktree=None,
+        branch="fix/current", base="main", pr_body_file=None, pr_title=None,
+    ), {}, Path("."))
+check("publish-review assesses only its exact PR", assessed_prs[-1], 28)
+
+read_failed_closed = False
+try:
+    with patch.multiple(m, repo_identity=lambda _cwd: ("owner", "repo"),
+                        gh_json=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            m.ReadFailure("network"))):
+        m.closing_refs(7, Path("."))
+except m.ReadFailure:
+    read_failed_closed = True
+check("closing-reference read failures remain fail closed", read_failed_closed, True)
+
+
 operation_parsers = m.build_parser()._subparsers._group_actions[0].choices
 check("ownership writers require operation identity", [next(a for a in operation_parsers[command]._actions if a.dest == "operation_id").required for command in ("claim", "reclaim", "unassign")], [True, True, True])
 check("target discovery remains a read-only first call", [next(a for a in operation_parsers[command]._actions if a.dest == "target_operation").required for command in ("reclaim", "unassign")], [False, False])
