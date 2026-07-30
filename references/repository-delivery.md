@@ -45,10 +45,10 @@ in its parent path. A shared parent keyed only by branch can collide across repo
 in-tree worktree pollutes status and ignore behavior for every run.
 
 The worktree strategy MUST prevent two live runs from writing the same directory, and the path is
-made unique per run. Relying instead on the version-control registration of one common issue branch
-was tried and does not hold: the registration check is a read followed by a write with no lock
-between them, and two `git worktree add` processes have been observed registering one branch
-concurrently. A path that is unique per run does not depend on winning that race.
+made unique per run. Relying instead on the version-control system's registration of one common
+issue branch was tried and does not hold: that check is a read followed by a write with no lock
+between them, and two checkout processes have been observed registering one branch concurrently. A
+path that is unique per run does not depend on winning that race.
 
 **Registration is not ownership.** "This path holds this branch" is satisfied equally well by two
 runs of the same branch, so a resume additionally requires durable evidence that THIS run created

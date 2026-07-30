@@ -195,8 +195,9 @@ the development sidebar and the merge all key on.
 The worktree path is a different question with a different answer. It is a *local directory* joined
 to nothing, and deriving it purely from the issue means two runs that both want issue 58 compute the
 same path and share one checkout. Git will not save you: `worktree add` refuses a branch already
-checked out elsewhere, but **nothing refuses a second process writing into a directory that already
-exists**. So put the run-id in the path — `<root>/<repo>/<issue>-<slug>~<run-id>`, joined with a
+checked out elsewhere, but that check is a read followed by a write with no lock between them — two
+processes have been observed registering one branch concurrently — and **nothing refuses a second
+process writing into a directory that already exists**. So put the run-id in the path — `<root>/<repo>/<issue>-<slug>~<run-id>`, joined with a
 character neither half can contain — and the collision becomes impossible instead of merely
 unlikely. The cost is one stale directory when a run dies; the cost of the shared path is two
 agents editing one tree with no record anywhere that it happened

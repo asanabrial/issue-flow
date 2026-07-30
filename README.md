@@ -293,10 +293,10 @@ instructions; run `config` afterward to validate the markers and atomically publ
 
 `<run-id>` is what keeps two live runs out of one checkout, so a template without it is completed
 rather than obeyed: `/wt/<repo>/<branch>` is read as `/wt/<repo>/<branch>~<run-id>` **in memory**,
-and your `operator.local.md` is never rewritten. The result reports `template_migrated` so the
-substitution is visible. If a checkout from before run-scoping is still registered at the old path,
-the run stops with preservation guidance rather than quietly starting a sibling beside it — it may
-hold unpushed work.
+and your `operator.local.md` is never rewritten. `start-branch` reports `template_migrated` so the
+substitution is visible in its output rather than only in its effect. If a checkout from before
+run-scoping is still registered to a branch at the old path, the run stops with preservation
+guidance rather than quietly starting a sibling beside it — it may hold unpushed work.
 
 The join is `~` and not `-` because each half being unambiguous does not make the composition
 unambiguous: branch `fix/6` with run `a-b` and branch `fix/6-a` with run `b` both spell `fix-6-a-b`.
