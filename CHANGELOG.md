@@ -2,6 +2,18 @@
 
 All notable changes to Issue Flow are documented here.
 
+## [1.12.1] - 2026-07-30
+
+### Fixed
+
+- Read the local worktree registry through the read-failure contract instead of treating a failed
+  or incoherent `git worktree list` as an empty registry. The registry is parsed from NUL-delimited
+  porcelain, so a path containing spaces or newline bytes stays whole, and a nonzero exit, a stream
+  cut mid-record, a repeated path, a repeated field, an unknown field, an attribute with no record,
+  a checkout missing its HEAD or its branch/detached/bare state, and any bare-plus-checked-out or
+  branch-plus-detached contradiction are all refused rather than interpreted. Path templates,
+  resume behaviour, branch creation, tracker mutation and configuration semantics are unchanged.
+
 ## [1.12.0] - 2026-07-29
 
 ### Changed
