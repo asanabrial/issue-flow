@@ -1,345 +1,505 @@
 <#
 .SYNOPSIS
-    Install, link and upgrade the issue-flow skill. No dependencies beyond Windows itself.
-
-.DESCRIPTION
-    The versioned skill contains portable defaults. Operator values live in the ignored
-    operator.local.md beside it, so upgrades and publications cannot disclose local permissions,
-    machine paths or tracker identifiers.
-
-    Mirror of install.sh. Keep the two in step: they share the marker contract, not code.
+    Bootstrap issue-flow, then delegate to the shared immutable-bundle installer.
 
 .EXAMPLE
-    .\install.ps1 status
-    .\install.ps1 install -DryRun
-    .\install.ps1 sync -From .\downloaded-SKILL.md
+    .\install.ps1 install
+    .\install.ps1 sync
+    .\install.ps1 rollback
+    .\install.ps1 recover
     .\install.ps1 config -Set 'Tracker=linear'
+
+.PARAMETER From
+    Retired. This option always fails because one file cannot prove a complete runtime bundle.
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('install', 'sync', 'uninstall', 'status', 'config')]
+    [ValidateSet('install', 'sync', 'uninstall', 'status', 'config', 'rollback', 'recover')]
     [string]$Command = 'install',
-
     [string]$From,
-
     [string]$Set,
-
     [switch]$DryRun
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$RepositoryUrl = 'https://github.com/asanabrial/issue-flow.git'
+$fromSpecified = $PSBoundParameters.ContainsKey('From')
+$setSpecified = $PSBoundParameters.ContainsKey('Set')
 
-$SkillName = 'issue-flow'
-$SkillFile = 'SKILL.md'
-$ConfigFile = 'operator.local.md'
-$StartMark = '<!-- issue-flow:config:start -->'
-$EndMark   = '<!-- issue-flow:config:end -->'
+function Get-PythonCommand {
+    $expectedPlatform = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'win32' } else { '' }
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($python) {
+        & $python.Source -X utf8 -I -c 'import sys;raise SystemExit(sys.version_info < (3, 10) or (sys.argv[1] and sys.platform != sys.argv[1]))' $expectedPlatform 2>$null
+        if ($LASTEXITCODE -eq 0) { return @{ Executable = $python.Source; Prefix = @() } }
+    }
+    $launcher = Get-Command py -ErrorAction SilentlyContinue
+    if ($launcher) {
+        & $launcher.Source -3 -X utf8 -I -c 'import sys;raise SystemExit(sys.version_info < (3, 10) or (sys.argv[1] and sys.platform != sys.argv[1]))' $expectedPlatform 2>$null
+        if ($LASTEXITCODE -eq 0) { return @{ Executable = $launcher.Source; Prefix = @('-3') } }
+    }
+    throw 'A host-native Python 3.10 or newer is required; install it and retry.'
+}
 
-# The skill's real home is wherever this script sits.
-$Canonical = $PSScriptRoot
+function Get-InstallerArguments {
+    $arguments = @($Command)
+    if ($fromSpecified) { $arguments += @('--from', $From) }
+    if ($setSpecified) { $arguments += @('--set', $Set) }
+    if ($DryRun) { $arguments += '--dry-run' }
+    return $arguments
+}
 
-# Piped (`irm | iex`) there is no script location at all; run from elsewhere, no skill next to it.
-# Either way the installer acquires itself - clone on first contact, upgrade after - and hands over
-# to the on-disk copy, so everything of substance always executes from files you can read. All file
-# shuffling uses Copy-Item and git itself, never PowerShell redirection, which on Windows
-# PowerShell 5.1 re-encodes text (UTF-16, BOMs) and corrupts what it touches.
-if (-not $Canonical -or -not (Test-Path (Join-Path $Canonical 'SKILL.md'))) {
-    $Repo = 'https://github.com/asanabrial/issue-flow.git'
-    $Dest = Join-Path $HOME '.agents\skills\issue-flow'
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-        throw 'git is required - install it (winget install Git.Git) and re-run.'
+function Invoke-VerifiedLocalHelper {
+    param([string]$Path, [string]$Receipt, [string]$Repository, [string]$Current, [string]$Transaction, [string]$Git, [hashtable]$Python, [string]$HomePath, [string[]]$InstallerArguments)
+    $code = @'
+import configparser
+import ctypes
+import json
+import os
+import re
+import subprocess
+import sys
+
+helper, receipt_path, repository, current_path, transaction_path, git = sys.argv[1:7]
+installer_arguments = sys.argv[7:]
+
+def is_pointer(path):
+    junction = getattr(os.path, "isjunction", None)
+    if junction and junction(path):
+        return True
+    if os.path.islink(path):
+        return True
+    if os.name != "nt" or not os.path.lexists(path):
+        return False
+    attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    return attributes != 0xFFFFFFFF and bool(attributes & 0x400)
+
+def validate_repository(path):
+    if is_pointer(path) or not os.path.isdir(path) or os.path.lexists(os.path.join(path, "commondir")):
+        raise ValueError("redirected repository")
+    for name in ("objects", "refs"):
+        candidate = os.path.join(path, name)
+        if is_pointer(candidate) or not os.path.isdir(candidate):
+            raise ValueError("linked repository directory")
+    for name in ("config", "HEAD", "packed-refs"):
+        candidate = os.path.join(path, name)
+        if name == "packed-refs" and not os.path.lexists(candidate):
+            continue
+        details = os.lstat(candidate)
+        if is_pointer(candidate) or not os.path.isfile(candidate) or details.st_nlink != 1:
+            raise ValueError("linked repository authority")
+    for directory, names, files in os.walk(os.path.join(path, "refs"), followlinks=False):
+        for name in names:
+            candidate = os.path.join(directory, name)
+            if is_pointer(candidate) or not os.path.isdir(candidate):
+                raise ValueError("linked ref directory")
+        for name in files:
+            candidate = os.path.join(directory, name)
+            if is_pointer(candidate) or not os.path.isfile(candidate) or os.lstat(candidate).st_nlink != 1:
+                raise ValueError("linked ref")
+            if open(candidate, "rb").read().lstrip().startswith(b"ref:"):
+                raise ValueError("symbolic ref")
+    for name in ("alternates", "http-alternates"):
+        if os.path.lexists(os.path.join(path, "objects", "info", name)):
+            raise ValueError("alternate object database")
+    parser = configparser.RawConfigParser(interpolation=None, strict=True)
+    parser.read(os.path.join(path, "config"), encoding="utf-8")
+    allowed = {"repositoryformatversion", "filemode", "bare", "logallrefupdates", "symlinks", "ignorecase", "precomposeunicode", "fsync", "fsyncmethod"}
+    if parser.sections() != ["core"] or set(parser["core"]) - allowed:
+        raise ValueError("repository config authority")
+    if parser["core"].get("bare", "").casefold() != "true" or parser["core"].get("fsync", "").casefold() != "reference" or parser["core"].get("fsyncmethod", "").casefold() != "fsync":
+        raise ValueError("repository config durability")
+
+try:
+    validate_repository(repository)
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    environment.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_COUNT": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+    })
+    version = subprocess.check_output([git, "--version"], env=environment, text=True)
+    match = re.search(r"\b(\d+)\.(\d+)", version)
+    if not match or tuple(map(int, match.groups())) < (2, 36):
+        raise ValueError("old Git")
+    receipt = json.loads(open(receipt_path, encoding="utf-8").read())
+    commit = str(receipt["commit"])
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        raise ValueError("invalid commit")
+    bundle_commit = os.path.basename(os.path.dirname(os.path.dirname(os.path.realpath(helper))))
+    if bundle_commit != commit:
+        raise ValueError("helper is not in its receipt-named bundle")
+    authoritative = subprocess.check_output([
+        git,
+        "--no-replace-objects",
+        f"--git-dir={repository}",
+        "-c", f"core.hooksPath={os.devnull}",
+        "-c", "core.fsmonitor=false",
+        "cat-file", "blob", f"{commit}:scripts/install_bundle.py",
+    ], env=environment)
+    try:
+        current = json.loads(open(current_path, encoding="utf-8").read())
+        activated = subprocess.check_output([
+            git,
+            "--no-replace-objects",
+            f"--git-dir={repository}",
+            "-c", f"core.hooksPath={os.devnull}",
+            "show-ref", "--verify", "--hash", f"refs/issue-flow/activated/{commit}",
+        ], env=environment, text=True).strip()
+        normal_identity = current.get("current") == commit and activated == commit
+    except (OSError, subprocess.SubprocessError, ValueError):
+        normal_identity = False
+    try:
+        transaction = json.loads(open(transaction_path, encoding="utf-8").read())
+        recovery_identity = transaction.get("schema") == 1 and commit in {
+            transaction.get("previous"), transaction.get("target")
+        }
+    except (OSError, ValueError):
+        recovery_identity = False
+    if not normal_identity and not recovery_identity:
+        raise ValueError("helper is neither active nor a declared recovery endpoint")
+    actual = open(helper, "rb").read()
+except (KeyError, OSError, subprocess.SubprocessError, ValueError):
+    raise SystemExit(125)
+if authoritative != actual:
+    raise SystemExit(125)
+os.environ["ISSUE_FLOW_GIT"] = os.path.realpath(git)
+sys.argv = [helper, *installer_arguments]
+namespace = {"__name__": "__main__", "__file__": helper}
+exec(compile(actual, helper, "exec"), namespace)
+'@
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($code))
+    $arguments = @($Python.Prefix) + @(
+        '-X', 'utf8', '-I', '-c', 'import base64,sys;code=base64.b64decode(sys.argv[1]);del sys.argv[1];exec(code)',
+        $encoded, $Path, $Receipt, $Repository, $Current, $Transaction, $Git
+    ) + $InstallerArguments
+    $savedHome = [Environment]::GetEnvironmentVariable('HOME', 'Process')
+    $savedProfile = [Environment]::GetEnvironmentVariable('USERPROFILE', 'Process')
+    $savedInstallerHome = [Environment]::GetEnvironmentVariable('ISSUE_FLOW_HOME', 'Process')
+    $savedInstallerGit = [Environment]::GetEnvironmentVariable('ISSUE_FLOW_GIT', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('HOME', $HomePath, 'Process')
+        [Environment]::SetEnvironmentVariable('USERPROFILE', $HomePath, 'Process')
+        [Environment]::SetEnvironmentVariable('ISSUE_FLOW_HOME', $HomePath, 'Process')
+        [Environment]::SetEnvironmentVariable('ISSUE_FLOW_GIT', $Git, 'Process')
+        & $Python.Executable @arguments
+        $script:LocalHelperResult = $LASTEXITCODE
+    } finally {
+        [Environment]::SetEnvironmentVariable('HOME', $savedHome, 'Process')
+        [Environment]::SetEnvironmentVariable('USERPROFILE', $savedProfile, 'Process')
+        [Environment]::SetEnvironmentVariable('ISSUE_FLOW_HOME', $savedInstallerHome, 'Process')
+        [Environment]::SetEnvironmentVariable('ISSUE_FLOW_GIT', $savedInstallerGit, 'Process')
     }
-    if ((Test-Path $Dest) -and -not (Test-Path (Join-Path $Dest '.git'))) {
-        throw "$Dest exists and is not a git clone - move it aside and re-run."
+}
+
+$python = Get-PythonCommand
+$homeArguments = @($python.Prefix) + @('-X', 'utf8', '-I', '-c', 'import base64,os,sys;print(base64.b64encode(os.path.realpath(sys.argv[1]).encode()).decode())', $HOME)
+$resolvedHome = & $python.Executable @homeArguments
+if ($LASTEXITCODE -ne 0 -or -not $resolvedHome) { throw 'Could not resolve the operator home with the selected Python.' }
+$resolvedHome = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$resolvedHome))
+$invocationPath = $MyInvocation.MyCommand.Path
+$physicalInvocation = $null
+if ($invocationPath) {
+    $pathArguments = @($python.Prefix) + @('-X', 'utf8', '-I', '-c', 'import base64,os,sys;print(base64.b64encode(os.path.realpath(sys.argv[1]).encode()).decode())', $invocationPath)
+    $physicalInvocation = & $python.Executable @pathArguments
+    if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the installer path with the selected Python.' }
+    $physicalInvocation = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$physicalInvocation))
+}
+$helper = if ($physicalInvocation -and [IO.Path]::GetFileName($physicalInvocation) -eq 'install.ps1') {
+    Join-Path ([IO.Path]::GetDirectoryName($physicalInvocation)) 'scripts\install_bundle.py'
+} else { $null }
+$gitCommand = $null
+if ($helper -and (Test-Path -LiteralPath $helper -PathType Leaf)) {
+    $gitCommand = Get-Command git -ErrorAction SilentlyContinue
+    $receipt = Join-Path ([IO.Path]::GetDirectoryName($physicalInvocation)) '.issue-flow-bundle.json'
+    $repository = Join-Path $resolvedHome '.agents\skills\.issue-flow\repository.git'
+    $current = Join-Path $resolvedHome '.agents\skills\.issue-flow\current.json'
+    $transaction = Join-Path $resolvedHome '.agents\skills\.issue-flow\transaction.json'
+    if ($gitCommand) {
+        Invoke-VerifiedLocalHelper -Path $helper -Receipt $receipt -Repository $repository -Current $current -Transaction $transaction -Git $gitCommand.Source -Python $python -HomePath $resolvedHome -InstallerArguments @(Get-InstallerArguments)
+        if ($script:LocalHelperResult -ne 125) { exit $script:LocalHelperResult }
     }
-    if (-not (Test-Path $Dest)) {
-        Write-Host "installing into $Dest"
-        git clone -q --depth 1 $Repo $Dest
-    } else {
-        Write-Host "upgrading $Dest"
-        git -C $Dest fetch -q origin
-        git -C $Dest checkout -q origin/main -- .
-        git -C $Dest reset -q origin/main
-    }
-    & (Join-Path $Dest 'install.ps1') $Command
+    Write-Warning 'Local installer helper failed Git-object verification; reacquiring canonical main.'
+}
+
+if ($fromSpecified) {
+    throw 'single-file sync is retired; run sync without -From.'
+}
+
+$destination = Join-Path $resolvedHome '.agents\skills\issue-flow'
+$statePath = Join-Path $resolvedHome '.agents\skills\.issue-flow'
+$destinationPresent = $null -ne (Get-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue)
+$statePresent = $null -ne (Get-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue)
+$runtimePresent = @(
+    Join-Path $resolvedHome '.claude\skills\issue-flow'
+    Join-Path $resolvedHome '.codex\skills\issue-flow'
+) | Where-Object { $null -ne (Get-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue) }
+$runtimeRootUnsafe = @(
+    Join-Path $resolvedHome '.agents'
+    Join-Path $resolvedHome '.agents\skills'
+    Join-Path $resolvedHome '.claude'
+    Join-Path $resolvedHome '.claude\skills'
+    Join-Path $resolvedHome '.codex'
+    Join-Path $resolvedHome '.codex\skills'
+) | ForEach-Object { Get-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue } |
+    Where-Object { -not $_.PSIsContainer -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) }
+if ($DryRun -and -not $setSpecified -and -not $fromSpecified -and $Command -in @('install', 'sync') -and -not $destinationPresent -and -not $statePresent -and -not $runtimePresent -and -not $runtimeRootUnsafe) {
+    Write-Host "would   install one complete Git tree at $destination"
     return
 }
+if (-not $gitCommand) { $gitCommand = Get-Command git -ErrorAction SilentlyContinue }
+if (-not $gitCommand) {
+    throw 'git is required; install it and retry.'
+}
 
-# Per-runtime skill directories that must point at the canonical one. `.agents/skills/` is
-# the cross-runtime convention; Claude Code does NOT read it (anthropics/claude-code#31005),
-# so for that runtime the link is the mechanism rather than a convenience.
-$RuntimeDirs = @(
-    (Join-Path $HOME '.claude\skills'),
-    (Join-Path $HOME '.codex\skills')
+$gitNames = @(
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_TEMPLATE_DIR', 'GIT_EXEC_PATH',
+    'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL',
+    'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT', 'GIT_ASKPASS'
 )
-
-# --- config block ---------------------------------------------------------------------
-
-function Split-Config {
-    <#  Returns @{Before; Block; After}. Refuses rather than guesses: a sync that cannot
-        locate the block would silently drop the operator's settings, and they would find
-        out the next time an agent asked for a confirmation it should not have needed.     #>
-    param([string]$Text, [string]$Origin)
-
-    $i = $Text.IndexOf($StartMark)
-    $j = $Text.IndexOf($EndMark)
-    if ($i -lt 0 -or $j -lt 0) {
-        throw "config markers not found in $Origin.`n" +
-              "       expected $StartMark ... $EndMark`n" +
-              "       refusing to sync - resolve by hand so no settings are lost."
-    }
-    if ($j -lt $i) { throw "config end marker precedes the start marker in $Origin; file is corrupt." }
-
-    $end = $j + $EndMark.Length
-    return @{
-        Before = $Text.Substring(0, $i)
-        Block  = $Text.Substring($i, $end - $i)
-        After  = $Text.Substring($end)
-    }
+$saved = @{}
+foreach ($name in $gitNames) {
+    $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
 }
 
-function Test-HasConfig { param([string]$Text)
-    return ($Text.Contains($StartMark) -and $Text.Contains($EndMark))
-}
+try {
+    $env:GIT_CONFIG_NOSYSTEM = '1'
+    $env:GIT_CONFIG_GLOBAL = 'NUL'
+    $env:GIT_CONFIG_COUNT = '0'
+    $env:GIT_TERMINAL_PROMPT = '0'
+    $env:GIT_ASKPASS = ''
+    # PowerShell 7 can pass a syntactically correct native argv while Git still receives an empty
+    # worktree path under some environment combinations. Python is already required and gives both
+    # PowerShell editions the same exact subprocess boundary used by the installed helper.
+    $bootstrapCode = @'
+import ctypes
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import uuid
+from pathlib import Path
 
-# --- backups --------------------------------------------------------------------------
+repository, git_executable, home_value, *installer_arguments = sys.argv[1:]
+git_executable = os.path.realpath(git_executable)
+home = Path(home_value).resolve(strict=True)
 
-function Backup-File {
-    # Cheap, and the difference between a bug and a loss.
-    param([string]$Path)
-    $dir = Join-Path (Split-Path $Path -Parent) '.backups'
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $dest = Join-Path $dir ((Split-Path $Path -Leaf) + ".$stamp")
-    Copy-Item -LiteralPath $Path -Destination $dest -Force
-    return $dest
-}
+def lock_owner(handle, blocking):
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    import fcntl
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        return True
+    except BlockingIOError:
+        return False
 
-function Write-Utf8NoBom {
-    <#  Set-Content -Encoding UTF8 writes a BOM on Windows PowerShell 5.1, which lands three bytes
-        in front of the frontmatter delimiter and makes the file's first line something no YAML
-        parser expects. Write the bytes ourselves instead.                                        #>
-    param([string]$Path, [string]$Text)
-    [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding $false))
-}
+def is_junction(path):
+    checker = getattr(os.path, "isjunction", None)
+    if checker:
+        return bool(checker(path))
+    if os.name != "nt" or not os.path.lexists(path):
+        return False
+    attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    return attributes != 0xFFFFFFFF and bool(attributes & 0x400)
 
-# --- linking --------------------------------------------------------------------------
+def make_writable(function, target, _error):
+    details = os.lstat(target)
+    if stat.S_ISREG(details.st_mode) and details.st_nlink != 1:
+        raise RuntimeError(f"refusing to chmod externally hard-linked bootstrap state: {target}")
+    os.chmod(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    function(target)
 
-function Get-LinkKind {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return 'absent' }
-    $item = Get-Item -LiteralPath $Path -Force
-    if ($item.LinkType) { return $item.LinkType.ToLower() }   # SymbolicLink | Junction
-    return 'directory'
-}
+def remove_bootstrap(path):
+    owner = path / ".issue-flow-bootstrap-owner"
+    repository_path = path / "repository.git"
+    unexpected = {item.name for item in path.iterdir()} - {owner.name, repository_path.name}
+    if unexpected:
+        raise RuntimeError(f"bootstrap quarantine contains unowned entries: {path}: {sorted(unexpected)}")
+    if repository_path.exists():
+        if repository_path.is_symlink() or is_junction(repository_path) or not repository_path.is_dir():
+            raise RuntimeError(f"bootstrap repository is not a real directory: {repository_path}")
+        shutil.rmtree(repository_path, onerror=make_writable)
+    if repository_path.exists():
+        raise RuntimeError(f"bootstrap repository cleanup did not complete: {repository_path}")
+    if os.name != "nt":
+        directory = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    if owner.exists():
+        details = os.lstat(owner)
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+            raise RuntimeError(f"bootstrap owner marker is not private: {owner}")
+        owner.unlink()
+    if os.name != "nt":
+        directory = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    path.rmdir()
+    if os.name != "nt":
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    if path.exists():
+        raise RuntimeError(f"bootstrap quarantine cleanup did not complete: {path}")
 
-function New-SkillLink {
-    <#  Point $Link at $Target, degrading only as far as Windows forces.
+guard_path = home / ".issue-flow-bootstrap.lock"
+if os.path.lexists(guard_path) and guard_path.is_symlink():
+    raise RuntimeError(f"bootstrap guard may not be a link: {guard_path}")
+guard_flags = os.O_RDWR | os.O_CREAT
+if hasattr(os, "O_NOFOLLOW"):
+    guard_flags |= os.O_NOFOLLOW
+guard_descriptor = os.open(guard_path, guard_flags, 0o600)
+guard_details = os.fstat(guard_descriptor)
+if not stat.S_ISREG(guard_details.st_mode) or guard_details.st_nlink != 1:
+    os.close(guard_descriptor)
+    raise RuntimeError(f"bootstrap guard is not a private regular file: {guard_path}")
+bootstrap_guard = os.fdopen(guard_descriptor, "r+b")
+if guard_details.st_size == 0:
+    bootstrap_guard.write(b"\0")
+    bootstrap_guard.flush()
+    os.fsync(bootstrap_guard.fileno())
+if not lock_owner(bootstrap_guard, blocking=True):
+    raise RuntimeError(f"could not acquire bootstrap guard: {guard_path}")
 
-        Symlink first because it is the most faithful. Junction second because it needs NO
-        elevation — that single fact is why Windows is not a dead end here. Copy last: it
-        works, but it stops being a link, and from then on the copies drift.               #>
-    param([string]$Link, [string]$Target)
-
-    $parent = Split-Path $Link -Parent
-    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-
-    try {
-        New-Item -ItemType SymbolicLink -Path $Link -Target $Target -ErrorAction Stop | Out-Null
-        return 'symlink'
-    } catch { }
-
-    try {
-        New-Item -ItemType Junction -Path $Link -Target $Target -ErrorAction Stop | Out-Null
-        return 'junction'
-    } catch { }
-
-    Copy-Item -LiteralPath $Target -Destination $Link -Recurse -Force
-    return 'copy'
-}
-
-# --- commands -------------------------------------------------------------------------
-
-function Invoke-Install {
-    $skill = Join-Path $Canonical $SkillFile
-    if (-not (Test-Path -LiteralPath $skill)) {
-        throw "$skill not found - run this script from inside the skill directory."
-    }
-
-    $degraded = @()
-    foreach ($base in $RuntimeDirs) {
-        # Only wire up runtimes that actually exist on this machine.
-        if (-not (Test-Path (Split-Path $base -Parent))) { continue }
-
-        $link = Join-Path $base $SkillName
-        $kind = Get-LinkKind $link
-
-        if ($kind -in @('symboliclink', 'junction')) {
-            Write-Host "ok      $link  already linked ($kind)"
+for candidate in home.iterdir():
+    if not re.fullmatch(r"\.issue-flow-bootstrap-[0-9a-f]{32}", candidate.name):
+        continue
+    if candidate.is_symlink() or is_junction(candidate) or not candidate.is_dir():
+        raise RuntimeError(f"installer-shaped bootstrap path is not a real directory: {candidate}")
+    owner = candidate / ".issue-flow-bootstrap-owner"
+    if not owner.exists():
+        if not any(candidate.iterdir()):
+            candidate.rmdir()
             continue
-        }
-        if ($kind -eq 'directory') {
-            # Never clobber a real directory: it may be a hand-made copy carrying local edits.
-            Write-Host "SKIP    $link  exists as a real directory - remove it first if you meant to link"
-            continue
-        }
-        if ($DryRun) { Write-Host "would   $link  ->  $Canonical"; continue }
+        raise RuntimeError(f"non-empty bootstrap quarantine has no owner marker: {candidate}")
+    details = os.lstat(owner)
+    if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+        raise RuntimeError(f"bootstrap owner marker is not private: {owner}")
+    owner_probe = owner.open("r+b")
+    if not lock_owner(owner_probe, blocking=False):
+        owner_probe.close()
+        continue
+    unexpected = {item.name for item in candidate.iterdir()} - {owner.name, "repository.git"}
+    owner_probe.close()
+    if unexpected:
+        raise RuntimeError(f"bootstrap quarantine contains unowned entries: {candidate}: {sorted(unexpected)}")
+    if candidate.exists():
+        remove_bootstrap(candidate)
 
-        $made = New-SkillLink -Link $link -Target $Canonical
-        Write-Host "linked  $link  ->  $Canonical  ($made)"
-        if ($made -eq 'copy') { $degraded += $link }
-    }
-
-    if ($degraded.Count -gt 0) {
-        Write-Host ""
-        Write-Warning "Fell back to copying - neither a symlink nor a junction was possible."
-        Write-Host "         These are now INDEPENDENT copies. Editing the canonical skill will"
-        Write-Host "         NOT update them, and 'sync' only touches the canonical one:"
-        $degraded | ForEach-Object { Write-Host "           $_" }
-    }
-}
-
-function Invoke-Uninstall {
-    # Removes only the links this script creates. The canonical skill is never touched.
-    foreach ($base in $RuntimeDirs) {
-        $link = Join-Path $base $SkillName
-        $kind = Get-LinkKind $link
-        if ($kind -eq 'absent') { continue }
-        if ($kind -eq 'directory') {
-            Write-Host "SKIP    $link  is a real directory, not one of our links - left alone"
-            continue
-        }
-        if ($DryRun) { Write-Host "would   remove $link ($kind)"; continue }
-        # .Delete() removes the reparse point without following it into the target.
-        (Get-Item -LiteralPath $link -Force).Delete()
-        Write-Host "removed $link ($kind)"
-    }
-}
-
-function Invoke-Sync {
-    param([string]$Source)
-
-    $installed = Join-Path $Canonical $SkillFile
-    if (-not (Test-Path -LiteralPath $Source))    { throw "$Source not found." }
-    if (-not (Test-Path -LiteralPath $installed)) { throw "$installed not found - nothing to sync." }
-
-    $newText = Get-Content -LiteralPath $Source -Raw -Encoding UTF8
-    $mine    = Split-Config -Text (Get-Content -LiteralPath $installed -Raw -Encoding UTF8) -Origin 'the installed skill'
-
-    if (Test-HasConfig $newText) {
-        # The incoming version ships its own block; ours replaces it verbatim.
-        $theirs = Split-Config -Text $newText -Origin 'the incoming skill'
-        $merged = $theirs.Before + $mine.Block + $theirs.After
-    } else {
-        # A template with no block at all: append ours so the settings survive.
-        $merged = $newText.TrimEnd() + "`n`n" + $mine.Block + "`n"
-    }
-
-    if ($DryRun) {
-        Write-Host "would   sync $installed from $Source, preserving $($mine.Block.Length) chars of config"
-        return
-    }
-
-    $saved = Backup-File $installed
-    Write-Utf8NoBom -Path $installed -Text $merged
-    Write-Host "backup  $saved"
-    Write-Host "synced  $installed  (config preserved: $($mine.Block.Length) chars)"
-}
-
-function Invoke-Config {
-    <#  Read or write one row of the operator configuration table.
-
-        Deliberately generic: it matches a row by its NAME and never carries a list of known
-        settings. Add a row to the skill and this keeps working — a config tool that has to be
-        taught every new setting is a second place to forget one.                                #>
-    param([string]$Assignment)
-
-    $template = Join-Path $Canonical $SkillFile
-    $installed = Join-Path $Canonical $ConfigFile
-    $templateText = Get-Content -LiteralPath $template -Raw -Encoding UTF8
-    $defaultBlock = (Split-Config -Text $templateText -Origin 'the versioned skill defaults').Block
-
-    if (-not (Test-Path -LiteralPath $installed)) {
-        if ($DryRun) {
-            Write-Host "would   create $installed from portable defaults"
-            if (-not $Assignment) {
-                $defaultBlock -split "`n" | Where-Object { $_ -match '^\|' } | ForEach-Object { Write-Host $_.TrimEnd() }
-                return
-            }
-            $text = $defaultBlock
-        } else {
-            Write-Utf8NoBom -Path $installed -Text $defaultBlock
-            Write-Host "created $installed from portable defaults"
-            $text = $defaultBlock
-        }
-    } else {
-        $text = Get-Content -LiteralPath $installed -Raw -Encoding UTF8
-    }
-    $block = (Split-Config -Text $text -Origin 'the installed skill').Block
-
-    if (-not $Assignment) {
-        # No assignment: print the table as it stands.
-        $block -split "`n" | Where-Object { $_ -match '^\|' } | ForEach-Object { Write-Host $_.TrimEnd() }
-        return
-    }
-
-    $i = $Assignment.IndexOf('=')
-    if ($i -lt 1) { throw "expected --set '<Setting>=<value>', got '$Assignment'" }
-    $name  = $Assignment.Substring(0, $i).Trim()
-    $value = $Assignment.Substring($i + 1).Trim()
-
-    # A pipe would silently split the cell and corrupt the table.
-    if ($value.Contains('|')) { throw "value may not contain '|' - it would break the table row." }
-
-    $lines = $text -split "`n"
-    $hits = @()
-    for ($n = 0; $n -lt $lines.Count; $n++) {
-        $parts = $lines[$n] -split '\|'
-        if ($parts.Count -ge 4 -and $parts[1].Trim() -eq $name) { $hits += $n }
-    }
-    if ($hits.Count -eq 0) { throw "no setting named '$name' in the configuration block." }
-    if ($hits.Count -gt 1) { throw "'$name' matches $($hits.Count) rows; refusing to guess which." }
-
-    $n = $hits[0]
-    $parts = $lines[$n] -split '\|'
-    $was = $parts[2].Trim()
-    $parts[2] = " $value "
-    $lines[$n] = ($parts -join '|')
-
-    if ($DryRun) { Write-Host "would   set $name : $was  ->  $value"; return }
-
-    $saved = Backup-File $installed
-    Write-Utf8NoBom -Path $installed -Text ($lines -join "`n")
-    Write-Host "backup  $saved"
-    Write-Host "set     $name : $was  ->  $value"
-}
-
-function Invoke-Status {
-    Write-Host "canonical  $Canonical"
-    $config = Join-Path $Canonical $ConfigFile
-    if (Test-Path -LiteralPath $config) {
-        $text = Get-Content -LiteralPath $config -Raw -Encoding UTF8
-        $state = if (Test-HasConfig $text) { "$config  [local, ignored]" } else { "INVALID - markers missing in $config" }
-        Write-Host "config     $state"
-    } else {
-        Write-Host "config     defaults (no $config)"
-    }
-    foreach ($base in $RuntimeDirs) {
-        $link = Join-Path $base $SkillName
-        Write-Host "target     $link  [$(Get-LinkKind $link)]"
+bootstrap = home / f".issue-flow-bootstrap-{uuid.uuid4().hex}"
+os.mkdir(bootstrap, 0o700)
+details = os.lstat(bootstrap)
+if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode) or is_junction(bootstrap):
+    raise RuntimeError(f"bootstrap quarantine is not a private directory: {bootstrap}")
+owner_path = bootstrap / ".issue-flow-bootstrap-owner"
+owner_handle = owner_path.open("x+b")
+owner_handle.write(b"\0")
+owner_handle.flush()
+os.fsync(owner_handle.fileno())
+if not lock_owner(owner_handle, blocking=True):
+    raise RuntimeError(f"could not lock bootstrap owner marker: {owner_path}")
+owner_handle.seek(0)
+owner_handle.write(b"issue-flow-bootstrap-v1\n")
+owner_handle.truncate()
+owner_handle.flush()
+os.fsync(owner_handle.fileno())
+if os.name != "nt":
+    directory = os.open(bootstrap, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+bare = bootstrap / "repository.git"
+environment = os.environ.copy()
+for name in tuple(environment):
+    if name.startswith("GIT_") or name in {"SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE"}:
+        environment.pop(name, None)
+environment.update({
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_COUNT": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_NO_LAZY_FETCH": "1",
+})
+file_protocol = "always" if repository.lower().startswith("file:") else "never"
+disabled_hooks = "NUL" if os.name == "nt" else "/dev/null"
+version = subprocess.check_output([git_executable, "--version"], env=environment, text=True)
+match = re.search(r"\b(\d+)\.(\d+)", version)
+if not match or tuple(map(int, match.groups())) < (2, 36):
+    raise RuntimeError(f"Git 2.36 or newer is required, got {version.strip()}")
+common = [git_executable, "--no-replace-objects", "-c", f"core.hooksPath={disabled_hooks}", "-c", "credential.helper="]
+try:
+    subprocess.run([
+        *common,
+        "-c", "protocol.allow=never",
+        "-c", "protocol.ext.allow=never",
+        "-c", f"protocol.file.allow={file_protocol}",
+        "-c", "protocol.https.allow=always",
+        "clone", "-q", "--bare", "--no-tags", "--single-branch", "--branch", "main",
+        repository, str(bare),
+    ], env=environment, check=True)
+    commit = subprocess.check_output([
+        git_executable, "--no-replace-objects", f"--git-dir={bare}",
+        "-c", f"core.hooksPath={disabled_hooks}", "rev-parse", "refs/heads/main^{commit}",
+    ], env=environment, text=True).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        raise RuntimeError("canonical main did not resolve to a commit")
+    helper = subprocess.check_output([
+        git_executable, "--no-replace-objects", f"--git-dir={bare}",
+        "-c", f"core.hooksPath={disabled_hooks}", "-c", "core.fsmonitor=false",
+        "cat-file", "blob", f"{commit}:scripts/install_bundle.py",
+    ], env=environment)
+    os.environ["ISSUE_FLOW_HOME"] = str(home)
+    os.environ["ISSUE_FLOW_GIT"] = git_executable
+    sys.argv = [f"git:{commit}:scripts/install_bundle.py", *installer_arguments]
+    namespace = {"__name__": "__main__", "__file__": sys.argv[0]}
+    exec(compile(helper, sys.argv[0], "exec"), namespace)
+finally:
+    owner_handle.close()
+    if bootstrap.exists():
+        remove_bootstrap(bootstrap)
+    bootstrap_guard.close()
+'@
+    # Base64 keeps Windows PowerShell 5.1 from stripping quotes in the multiline `-c` argument.
+    $encodedBootstrap = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootstrapCode))
+    $installerArguments = @(Get-InstallerArguments)
+    $bootstrapArguments = @($python.Prefix) + @(
+        '-X', 'utf8', '-I', '-c', 'import base64,sys;code=base64.b64decode(sys.argv[1]);del sys.argv[1];exec(code)',
+        $encodedBootstrap, $RepositoryUrl, $gitCommand.Source, $resolvedHome
+    ) + $installerArguments
+    & $python.Executable @bootstrapArguments
+    if ($LASTEXITCODE -ne 0) { throw "bootstrap acquisition failed ($LASTEXITCODE)." }
+} finally {
+    foreach ($name in $gitNames) {
+        [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process')
     }
 }
-
-switch ($Command) {
-    'install'   { Invoke-Install }
-    'uninstall' { Invoke-Uninstall }
-    'status'    { Invoke-Status }
-    'config'    { Invoke-Config -Assignment $Set }
-    'sync'      {
-        if (-not $From) { throw "sync needs -From <path to the newer SKILL.md>" }
-        Invoke-Sync -Source $From
-    }
-}
+return

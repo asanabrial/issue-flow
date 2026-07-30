@@ -1,333 +1,488 @@
 #!/bin/sh
-# Install, link and upgrade the issue-flow skill. POSIX sh, no dependencies.
-#
-# The versioned skill contains portable defaults. Operator values live in the ignored
-# operator.local.md beside it, so upgrades and publications cannot disclose local permissions,
-# machine paths or tracker identifiers.
-#
-# Mirror of install.ps1. Keep the two in step: they share the marker contract, not code.
-#
-#   curl -fsSL https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.sh | sh
-#   ./install.sh status
-#   ./install.sh install [--dry-run]
-#   ./install.sh sync --from <path/to/newer/SKILL.md> [--dry-run]
-#   ./install.sh uninstall [--dry-run]
-#   ./install.sh config [--set '<Setting>=<value>'] [--dry-run]
+# Bootstrap issue-flow, then delegate every state transition to the shared Python installer.
 
 set -eu
 
-SKILL_NAME='issue-flow'
-SKILL_FILE='SKILL.md'
-CONFIG_FILE='operator.local.md'
-START='<!-- issue-flow:config:start -->'
-END='<!-- issue-flow:config:end -->'
+REPOSITORY_URL='https://github.com/asanabrial/issue-flow.git'
 
-# The skill's real home is wherever this script sits.
-CANONICAL=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || CANONICAL=''
-
-# Piped (`curl | sh`) or run from outside a checkout, there is no skill next to this script.
-# Then the installer acquires itself - clone on first contact, upgrade after - and hands over to
-# the on-disk copy, so everything of substance always executes from files you can read.
-if [ ! -f "$CANONICAL/SKILL.md" ] || [ ! -f "$CANONICAL/install.sh" ]; then
-    REPO='https://github.com/asanabrial/issue-flow.git'
-    DEST="$HOME/.agents/skills/issue-flow"
-    command -v git >/dev/null 2>&1 || {
-        printf 'error: git is required - install it and re-run.
-' >&2; exit 1; }
-    if [ -e "$DEST" ] && [ ! -e "$DEST/.git" ]; then
-        printf 'error: %s exists and is not a git clone - move it aside and re-run.
-' "$DEST" >&2
-        exit 1
-    fi
-    if [ ! -e "$DEST" ]; then
-        printf 'installing into %s
-' "$DEST"
-        git clone -q --depth 1 "$REPO" "$DEST"
+find_python() {
+    candidate=$(command -v python3 2>/dev/null || :)
+    if [ -n "$candidate" ] && "$candidate" -X utf8 -I -c 'import sys; raise SystemExit(sys.version_info < (3, 10) or sys.platform.startswith(("cygwin", "msys")))' >/dev/null 2>&1; then printf '%s\n' "$candidate"
     else
-        printf 'upgrading %s
-' "$DEST"
-        git -C "$DEST" fetch -q origin
-        git -C "$DEST" checkout -q origin/main -- .
-        git -C "$DEST" reset -q origin/main
+        candidate=$(command -v python 2>/dev/null || :)
+        if [ -n "$candidate" ] && "$candidate" -X utf8 -I -c 'import sys; raise SystemExit(sys.version_info < (3, 10) or sys.platform.startswith(("cygwin", "msys")))' >/dev/null 2>&1; then printf '%s\n' "$candidate"
+        else
+            printf 'error: native Python 3.10 or newer is required; Cygwin/MSYS Python cannot create Windows-native pointers.\n' >&2
+            return 1
+        fi
     fi
-    exec sh "$DEST/install.sh" "${1:-install}"
+}
+
+find_git() {
+    candidate=$(command -v git 2>/dev/null || :)
+    [ -n "$candidate" ] || return 1
+    "$PYTHON" -X utf8 -I -c 'import os,re,subprocess,sys; executable=os.path.realpath(sys.argv[1]); environment={name:value for name,value in os.environ.items() if not name.startswith("GIT_")}; environment.update({"GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_SYSTEM":os.devnull,"GIT_CONFIG_GLOBAL":os.devnull,"GIT_CONFIG_COUNT":"0"}); out=subprocess.check_output([executable, "--version"], env=environment, text=True); m=re.search(r"\b(\d+)\.(\d+)", out); bad=not m or tuple(map(int, m.groups())) < (2, 36); print(executable.replace("\\", "/")) if not bad else sys.exit(1)' "$candidate" || return 1
+}
+
+LOCAL_VERIFIER='import configparser
+import ctypes
+import json
+import os
+import re
+import subprocess
+import sys
+
+mode, helper, receipt_path, repository, current_path, transaction_path, git = sys.argv[1:8]
+installer_arguments = sys.argv[8:]
+
+def is_pointer(path):
+    junction = getattr(os.path, "isjunction", None)
+    if junction and junction(path):
+        return True
+    if os.path.islink(path):
+        return True
+    if os.name != "nt" or not os.path.lexists(path):
+        return False
+    attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    return attributes != 0xFFFFFFFF and bool(attributes & 0x400)
+
+def validate_repository(path):
+    if is_pointer(path) or not os.path.isdir(path) or os.path.lexists(os.path.join(path, "commondir")):
+        raise ValueError("redirected repository")
+    for name in ("objects", "refs"):
+        candidate = os.path.join(path, name)
+        if is_pointer(candidate) or not os.path.isdir(candidate):
+            raise ValueError("linked repository directory")
+    for name in ("config", "HEAD", "packed-refs"):
+        candidate = os.path.join(path, name)
+        if name == "packed-refs" and not os.path.lexists(candidate):
+            continue
+        details = os.lstat(candidate)
+        if is_pointer(candidate) or not os.path.isfile(candidate) or details.st_nlink != 1:
+            raise ValueError("linked repository authority")
+    for directory, names, files in os.walk(os.path.join(path, "refs"), followlinks=False):
+        for name in names:
+            candidate = os.path.join(directory, name)
+            if is_pointer(candidate) or not os.path.isdir(candidate):
+                raise ValueError("linked ref directory")
+        for name in files:
+            candidate = os.path.join(directory, name)
+            if is_pointer(candidate) or not os.path.isfile(candidate) or os.lstat(candidate).st_nlink != 1:
+                raise ValueError("linked ref")
+            if open(candidate, "rb").read().lstrip().startswith(b"ref:"):
+                raise ValueError("symbolic ref")
+    for name in ("alternates", "http-alternates"):
+        if os.path.lexists(os.path.join(path, "objects", "info", name)):
+            raise ValueError("alternate object database")
+    parser = configparser.RawConfigParser(interpolation=None, strict=True)
+    parser.read(os.path.join(path, "config"), encoding="utf-8")
+    allowed = {"repositoryformatversion", "filemode", "bare", "logallrefupdates", "symlinks", "ignorecase", "precomposeunicode", "fsync", "fsyncmethod"}
+    if parser.sections() != ["core"] or set(parser["core"]) - allowed:
+        raise ValueError("repository config authority")
+    if parser["core"].get("bare", "").casefold() != "true" or parser["core"].get("fsync", "").casefold() != "reference" or parser["core"].get("fsyncmethod", "").casefold() != "fsync":
+        raise ValueError("repository config durability")
+
+try:
+    validate_repository(repository)
+    receipt = json.loads(open(receipt_path, encoding="utf-8").read())
+    commit = str(receipt["commit"])
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        raise ValueError("invalid commit")
+    bundle_commit = os.path.basename(os.path.dirname(os.path.dirname(os.path.realpath(helper))))
+    if bundle_commit != commit:
+        raise ValueError("helper is not in its receipt-named bundle")
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    environment.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_COUNT": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+    })
+    authoritative = subprocess.check_output([
+        git,
+        "--no-replace-objects",
+        f"--git-dir={repository}",
+        "-c", f"core.hooksPath={os.devnull}",
+        "-c", "core.fsmonitor=false",
+        "cat-file", "blob", f"{commit}:scripts/install_bundle.py",
+    ], env=environment)
+    try:
+        current = json.loads(open(current_path, encoding="utf-8").read())
+        activated = subprocess.check_output([
+            git,
+            "--no-replace-objects",
+            f"--git-dir={repository}",
+            "-c", f"core.hooksPath={os.devnull}",
+            "show-ref", "--verify", "--hash", f"refs/issue-flow/activated/{commit}",
+        ], env=environment, text=True).strip()
+        normal_identity = current.get("current") == commit and activated == commit
+    except (OSError, subprocess.SubprocessError, ValueError):
+        normal_identity = False
+    try:
+        transaction = json.loads(open(transaction_path, encoding="utf-8").read())
+        recovery_identity = transaction.get("schema") == 1 and commit in {
+            transaction.get("previous"), transaction.get("target")
+        }
+    except (OSError, ValueError):
+        recovery_identity = False
+    if not normal_identity and not recovery_identity:
+        raise ValueError("helper is neither active nor a declared recovery endpoint")
+    actual = open(helper, "rb").read()
+except (KeyError, OSError, subprocess.SubprocessError, ValueError):
+    raise SystemExit(125)
+if authoritative != actual:
+    raise SystemExit(125)
+if mode == "check":
+    raise SystemExit(0)
+os.environ["ISSUE_FLOW_GIT"] = os.path.realpath(git)
+sys.argv = [helper, *installer_arguments]
+namespace = {"__name__": "__main__", "__file__": helper}
+exec(compile(actual, helper, "exec"), namespace)'
+
+verify_local_helper() {
+    "$PYTHON" -X utf8 -I -c "$LOCAL_VERIFIER" check "$HELPER" "$SCRIPT_DIR/.issue-flow-bundle.json" \
+        "$HOME/.agents/skills/.issue-flow/repository.git" \
+        "$HOME/.agents/skills/.issue-flow/current.json" \
+        "$HOME/.agents/skills/.issue-flow/transaction.json" "$GIT" "$@"
+}
+
+PYTHON=$(find_python) || exit 1
+PYTHON_PLATFORM=$("$PYTHON" -X utf8 -I -c 'import sys; print(sys.platform)')
+if [ "$PYTHON_PLATFORM" = win32 ] && [ -z "${MSYSTEM-}" ]; then
+    printf 'error: Cygwin is not supported; use Git Bash with native Windows Python.\n' >&2
+    exit 1
+fi
+HOME=$("$PYTHON" -X utf8 -I -c '
+import os
+import sys
+
+path = os.path.realpath(sys.argv[1])
+ancestor = path
+while not os.path.exists(ancestor):
+    parent = os.path.dirname(ancestor)
+    if parent == ancestor:
+        raise SystemExit(1)
+    ancestor = parent
+details = os.stat(ancestor)
+owner = getattr(os, "geteuid", lambda: details.st_uid)()
+if details.st_uid != owner:
+    raise SystemExit(1)
+print(path.replace("\\", "/"))
+' "$HOME") || {
+    printf 'error: installer HOME must resolve to a directory owned by the current user.\n' >&2
+    exit 1
+}
+USERPROFILE=$HOME; ISSUE_FLOW_HOME=$HOME; export HOME USERPROFILE ISSUE_FLOW_HOME
+SCRIPT_PATH=$("$PYTHON" -X utf8 -I -c 'import os,sys; print(os.path.realpath(sys.argv[1]).replace("\\", "/"))' "$0" 2>/dev/null || :)
+SCRIPT_PARENT=${SCRIPT_PATH%/*}
+[ "$SCRIPT_PARENT" = "$SCRIPT_PATH" ] && SCRIPT_PARENT=.
+SCRIPT_DIR=$(CDPATH= cd -- "$SCRIPT_PARENT" 2>/dev/null && pwd -P) || SCRIPT_DIR=''
+case ${SCRIPT_PATH##*/} in install.sh) ;; *) SCRIPT_DIR='' ;; esac
+HELPER="$SCRIPT_DIR/scripts/install_bundle.py"
+
+if [ -f "$HELPER" ]; then
+    GIT=$(find_git) || {
+        printf 'error: Git 2.36 or newer is required; install it and retry.\n' >&2
+        exit 1
+    }
+    ISSUE_FLOW_GIT=$GIT; export ISSUE_FLOW_GIT
+    if verify_local_helper "$@"; then
+        exec "$PYTHON" -X utf8 -I -c "$LOCAL_VERIFIER" execute "$HELPER" "$SCRIPT_DIR/.issue-flow-bundle.json" \
+            "$HOME/.agents/skills/.issue-flow/repository.git" \
+            "$HOME/.agents/skills/.issue-flow/current.json" \
+            "$HOME/.agents/skills/.issue-flow/transaction.json" "$GIT" "$@"
+    else
+        LOCAL_RESULT=$?
+        [ "$LOCAL_RESULT" -ne 125 ] && exit "$LOCAL_RESULT"
+    fi
+    printf 'warning: local installer helper failed Git-object verification; reacquiring canonical main.\n' >&2
 fi
 
-# Per-runtime skill directories that must point at the canonical one. `.agents/skills/` is the
-# cross-runtime convention; Claude Code does NOT read it (anthropics/claude-code#31005), so for that
-# runtime the link is the mechanism rather than a convenience.
-RUNTIME_DIRS="$HOME/.claude/skills $HOME/.codex/skills"
+# A raw/piped script has no companion files. Refuse unsafe legacy arguments and a fresh dry-run
+# before network or filesystem mutation, then acquire the complete current bootstrap in quarantine.
+"$PYTHON" -X utf8 -I - "$@" <<'PY'
+import argparse
+import sys
 
-DRY_RUN=0
-FROM=''
-SET=''
-
-die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-
-# --- config block -------------------------------------------------------------------------------
-
-has_config() {
-    grep -qF "$START" "$1" 2>/dev/null && grep -qF "$END" "$1" 2>/dev/null
-}
-
-# Print the config block of $1, markers included.
-extract_block() {
-    awk -v s="$START" -v e="$END" '
-        index($0, s) { f = 1 }
-        f            { print }
-        index($0, e) { f = 0 }
-    ' "$1"
-}
-
-# Print $1 (the newer skill) with $2 (a block file) spliced in place of its own block.
-splice_block() {
-    awk -v s="$START" -v e="$END" -v bf="$2" '
-        index($0, s) && !done {
-            while ((getline line < bf) > 0) print line
-            close(bf); done = 1; skip = 1; next
-        }
-        skip { if (index($0, e)) skip = 0; next }
-        { print }
-    ' "$1"
-}
-
-# --- backups ------------------------------------------------------------------------------------
-
-# Cheap, and the difference between a bug and a loss.
-backup_file() {
-    dir=$(dirname -- "$1")/.backups
-    mkdir -p -- "$dir"
-    dest="$dir/$(basename -- "$1").$(date +%Y%m%d-%H%M%S)"
-    cp -p -- "$1" "$dest"
-    printf '%s\n' "$dest"
-}
-
-# --- linking ------------------------------------------------------------------------------------
-
-link_kind() {
-    if [ -L "$1" ]; then printf 'symlink\n'
-    elif [ -d "$1" ]; then printf 'directory\n'
-    elif [ -e "$1" ]; then printf 'file\n'
-    else printf 'absent\n'
-    fi
-}
-
-# Point $1 at $2. A symlink normally just works here; the copy fallback exists for filesystems that
-# refuse them (some container mounts, anything FAT-backed), and it stops being a link at all.
-make_link() {
-    mkdir -p -- "$(dirname -- "$1")"
-    if ln -s -- "$2" "$1" 2>/dev/null; then
-        printf 'symlink\n'
-    else
-        cp -R -- "$2" "$1"
-        printf 'copy\n'
-    fi
-}
-
-# --- commands -----------------------------------------------------------------------------------
-
-cmd_install() {
-    [ -f "$CANONICAL/$SKILL_FILE" ] ||
-        die "$CANONICAL/$SKILL_FILE not found - run this script from inside the skill directory."
-
-    degraded=''
-    for base in $RUNTIME_DIRS; do
-        # Only wire up runtimes that actually exist on this machine.
-        [ -d "$(dirname -- "$base")" ] || continue
-
-        link="$base/$SKILL_NAME"
-        kind=$(link_kind "$link")
-
-        case "$kind" in
-            symlink)
-                printf 'ok      %s  already linked (symlink)\n' "$link"; continue ;;
-            directory|file)
-                # Never clobber something real: it may be a hand-made copy carrying local edits.
-                printf 'SKIP    %s  exists as a real %s - remove it first if you meant to link\n' \
-                    "$link" "$kind"; continue ;;
-        esac
-
-        if [ "$DRY_RUN" -eq 1 ]; then
-            printf 'would   %s  ->  %s\n' "$link" "$CANONICAL"; continue
-        fi
-
-        made=$(make_link "$link" "$CANONICAL")
-        printf 'linked  %s  ->  %s  (%s)\n' "$link" "$CANONICAL" "$made"
-        [ "$made" = 'copy' ] && degraded="$degraded $link"
-    done
-
-    if [ -n "$degraded" ]; then
-        printf '\nWARNING: fell back to copying - this filesystem refused a symlink.\n'
-        printf '         These are now INDEPENDENT copies. Editing the canonical skill will\n'
-        printf "         NOT update them, and 'sync' only touches the canonical one:\n"
-        for d in $degraded; do printf '           %s\n' "$d"; done
-    fi
-}
-
-cmd_uninstall() {
-    # Removes only the links this script creates. The canonical skill is never touched.
-    for base in $RUNTIME_DIRS; do
-        link="$base/$SKILL_NAME"
-        kind=$(link_kind "$link")
-        case "$kind" in
-            absent) continue ;;
-            directory|file)
-                printf 'SKIP    %s  is a real %s, not one of our links - left alone\n' "$link" "$kind"
-                continue ;;
-        esac
-        if [ "$DRY_RUN" -eq 1 ]; then
-            printf 'would   remove %s (symlink)\n' "$link"; continue
-        fi
-        rm -- "$link"
-        printf 'removed %s (symlink)\n' "$link"
-    done
-}
-
-cmd_sync() {
-    installed="$CANONICAL/$SKILL_FILE"
-    [ -f "$FROM" ] || die "$FROM not found."
-    [ -f "$installed" ] || die "$installed not found - nothing to sync."
-
-    # Refusing beats guessing: a sync that cannot locate the block would silently drop the operator's
-    # settings, and they would find out the next time an agent asked for a confirmation it should not
-    # have needed.
-    if ! has_config "$installed"; then
-        printf 'error: config markers not found in the installed skill.\n' >&2
-        printf '       expected %s ... %s\n' "$START" "$END" >&2
-        printf '       refusing to sync - resolve by hand so no settings are lost.\n' >&2
-        exit 1
-    fi
-
-    tmpdir=$(mktemp -d)
-    trap 'rm -rf -- "$tmpdir"' EXIT
-    block="$tmpdir/block"
-    merged="$tmpdir/merged"
-
-    extract_block "$installed" > "$block"
-
-    if has_config "$FROM"; then
-        # The incoming version ships its own block; ours replaces it verbatim.
-        splice_block "$FROM" "$block" > "$merged"
-    else
-        # A template with no block at all: append ours so the settings survive.
-        { cat -- "$FROM"; printf '\n'; cat -- "$block"; } > "$merged"
-    fi
-
-    chars=$(wc -c < "$block" | tr -d ' ')
-    if [ "$DRY_RUN" -eq 1 ]; then
-        printf 'would   sync %s from %s, preserving %s chars of config\n' "$installed" "$FROM" "$chars"
-        return 0
-    fi
-
-    saved=$(backup_file "$installed")
-    cat -- "$merged" > "$installed"
-    printf 'backup  %s\n' "$saved"
-    printf 'synced  %s  (config preserved: %s chars)\n' "$installed" "$chars"
-}
-
-cmd_config() {
-    # Read or write one row of the operator configuration table.
-    #
-    # Deliberately generic: it matches a row by its NAME and never carries a list of known settings.
-    # Add a row to the skill and this keeps working - a config tool that has to be taught every new
-    # setting is a second place to forget one.
-    template="$CANONICAL/$SKILL_FILE"
-    installed="$CANONICAL/$CONFIG_FILE"
-    has_config "$template" || die "no default configuration block in $template."
-
-    if [ ! -f "$installed" ]; then
-        if [ "$DRY_RUN" -eq 1 ]; then
-            printf 'would   create %s from portable defaults\n' "$installed"
-            [ -z "$SET" ] && extract_block "$template" | grep '^|' || true
-            [ -z "$SET" ] && return 0
-            tmp_local=$(mktemp)
-            extract_block "$template" > "$tmp_local"
-            installed="$tmp_local"
-        else
-            extract_block "$template" > "$installed"
-            printf 'created %s from portable defaults\n' "$installed"
-        fi
-    fi
-    has_config "$installed" || die "no configuration block in $installed."
-
-    if [ -z "$SET" ]; then
-        extract_block "$installed" | grep '^|' || true
-        return 0
-    fi
-
-    case "$SET" in *=*) ;; *) die "expected --set '<Setting>=<value>', got '$SET'" ;; esac
-    name=$(printf '%s' "${SET%%=*}" | sed 's/^ *//; s/ *$//')
-    value=$(printf '%s' "${SET#*=}"  | sed 's/^ *//; s/ *$//')
-
-    # A pipe would silently split the cell and corrupt the table.
-    case "$value" in *'|'*) die "value may not contain '|' - it would break the table row." ;; esac
-
-    hits=$(awk -F'|' -v n="$name" 'NF>=4 { g=$2; gsub(/^ +| +$/,"",g); if (g==n) c++ } END { print c+0 }' "$installed")
-    if [ "$hits" -eq 0 ]; then die "no setting named '$name' in the configuration block."; fi
-    if [ "$hits" -gt 1 ]; then die "'$name' matches $hits rows; refusing to guess which."; fi
-
-    was=$(awk -F'|' -v n="$name" 'NF>=4 { g=$2; gsub(/^ +| +$/,"",g); if (g==n) { v=$3; gsub(/^ +| +$/,"",v); print v; exit } }' "$installed")
-
-    if [ "$DRY_RUN" -eq 1 ]; then
-        printf 'would   set %s : %s  ->  %s
-' "$name" "$was" "$value"
-        return 0
-    fi
-
-    tmp=$(mktemp)
-    awk -F'|' -v OFS='|' -v n="$name" -v v="$value" '
-        NF>=4 { g=$2; gsub(/^ +| +$/,"",g); if (g==n && !done) { $3=" " v " "; done=1 } }
-        { print }
-    ' "$installed" > "$tmp"
-
-    saved=$(backup_file "$installed")
-    cat -- "$tmp" > "$installed"
-    rm -f -- "$tmp"
-    printf 'backup  %s
-' "$saved"
-    printf 'set     %s : %s  ->  %s
-' "$name" "$was" "$value"
-}
-
-cmd_status() {
-    printf 'canonical  %s\n' "$CANONICAL"
-    if [ -f "$CANONICAL/$CONFIG_FILE" ]; then
-        if has_config "$CANONICAL/$CONFIG_FILE"; then
-            printf 'config     %s  [local, ignored]\n' "$CANONICAL/$CONFIG_FILE"
-        else
-            printf 'config     INVALID - markers missing in %s\n' "$CANONICAL/$CONFIG_FILE"
-        fi
-    else
-        printf 'config     defaults (no %s)\n' "$CANONICAL/$CONFIG_FILE"
-    fi
-    for base in $RUNTIME_DIRS; do
-        link="$base/$SKILL_NAME"
-        printf 'target     %s  [%s]\n' "$link" "$(link_kind "$link")"
-    done
-}
-
-# --- entry --------------------------------------------------------------------------------------
-
-COMMAND=${1:-install}
-[ $# -gt 0 ] && shift
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --dry-run) DRY_RUN=1 ;;
-        --from)    shift; [ $# -gt 0 ] || die '--from needs a path'; FROM=$1 ;;
-        --from=*)  FROM=${1#--from=} ;;
-        --set)     shift; [ $# -gt 0 ] || die '--set needs <Setting>=<value>'; SET=$1 ;;
-        --set=*)   SET=${1#--set=} ;;
-        *)         die "unknown argument: $1" ;;
+parser = argparse.ArgumentParser(description="Install one verified issue-flow Git tree.", allow_abbrev=False)
+parser.add_argument("command", nargs="?", default="install", choices=(
+    "install", "sync", "uninstall", "status", "config", "rollback", "recover"
+))
+parser.add_argument("--dry-run", action="store_true")
+parser.add_argument("--set")
+parser.add_argument("--from", dest="source", help="retired; always fails because one file cannot prove a bundle")
+options = parser.parse_args(sys.argv[1:])
+if options.set and options.command != "config":
+    parser.error("--set is valid only with config")
+PY
+FRESH_DRY=0
+FRESH_COMMAND=install
+FRESH_SET=0
+FRESH_HELP=0
+for argument in "$@"; do
+    case "$argument" in
+        install|sync|uninstall|status|config|rollback|recover) FRESH_COMMAND=$argument ;;
+        --from|--from=*)
+            printf 'error: single-file sync is retired; run sync without --from.\n' >&2
+            exit 1
+            ;;
+        --dry-run) FRESH_DRY=1 ;;
+        --set|--set=*) FRESH_SET=1 ;;
+        -h|--help) FRESH_HELP=1 ;;
     esac
-    shift
 done
+[ "$FRESH_HELP" -eq 1 ] && exit 0
 
-case "$COMMAND" in
-    install)   cmd_install ;;
-    uninstall) cmd_uninstall ;;
-    status)    cmd_status ;;
-    config)    cmd_config ;;
-    sync)      [ -n "$FROM" ] || die 'sync needs --from <path to the newer SKILL.md>'; cmd_sync ;;
-    *)         die "unknown command: $COMMAND" ;;
-esac
+DEST="$HOME/.agents/skills/issue-flow"
+STATE="$HOME/.agents/skills/.issue-flow"
+CLAUDE_DEST="$HOME/.claude/skills/issue-flow"
+CODEX_DEST="$HOME/.codex/skills/issue-flow"
+if "$PYTHON" -X utf8 -I - "$HOME" <<'PY'
+import ctypes
+import os
+import sys
+
+home = sys.argv[1]
+checker = getattr(os.path, "isjunction", None)
+for relative in (".agents", ".agents/skills", ".claude", ".claude/skills", ".codex", ".codex/skills"):
+    path = os.path.join(home, relative)
+    if not os.path.lexists(path):
+        continue
+    junction = bool(checker(path)) if checker else (
+        os.name == "nt"
+        and (attributes := ctypes.windll.kernel32.GetFileAttributesW(str(path))) != 0xFFFFFFFF
+        and bool(attributes & 0x400)
+    )
+    if os.path.islink(path) or junction or not os.path.isdir(path):
+        raise SystemExit(1)
+PY
+then FRESH_ANCESTORS_SAFE=1
+else FRESH_ANCESTORS_SAFE=0
+fi
+case $FRESH_COMMAND in install|sync) FRESH_DRY_INSTALL=1 ;; *) FRESH_DRY_INSTALL=0 ;; esac
+if [ "$FRESH_DRY" -eq 1 ] && [ "$FRESH_DRY_INSTALL" -eq 1 ] && [ "$FRESH_SET" -eq 0 ] \
+    && [ "$FRESH_ANCESTORS_SAFE" -eq 1 ] \
+    && [ ! -e "$DEST" ] && [ ! -L "$DEST" ] \
+    && [ ! -e "$STATE" ] && [ ! -L "$STATE" ] \
+    && { [ ! -e "$HOME/.claude" ] || { [ -d "$HOME/.claude" ] && [ ! -L "$HOME/.claude" ]; }; } \
+    && { [ ! -e "$HOME/.codex" ] || { [ -d "$HOME/.codex" ] && [ ! -L "$HOME/.codex" ]; }; } \
+    && [ ! -e "$CLAUDE_DEST" ] && [ ! -L "$CLAUDE_DEST" ] \
+    && [ ! -e "$CODEX_DEST" ] && [ ! -L "$CODEX_DEST" ]; then
+    printf 'would   install one complete Git tree at %s\n' "$DEST"
+    exit 0
+fi
+
+GIT=$(find_git) || {
+    printf 'error: Git 2.36 or newer is required; install it and retry.\n' >&2
+    exit 1
+}
+ISSUE_FLOW_GIT=$GIT; export ISSUE_FLOW_GIT
+
+USERPROFILE=$HOME; ISSUE_FLOW_HOME=$HOME; export USERPROFILE ISSUE_FLOW_HOME
+exec "$PYTHON" -X utf8 -I - "$REPOSITORY_URL" "$GIT" "$@" <<'PY'
+import ctypes
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+repository, git, *installer_arguments = sys.argv[1:]
+home = Path.home().resolve(strict=True)
+if os.name != "nt" and home.stat().st_uid != os.geteuid():
+    raise RuntimeError(f"installer HOME is not owned by the current user: {home}")
+
+def lock_owner(handle, blocking):
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    import fcntl
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        return True
+    except BlockingIOError:
+        return False
+
+def is_junction(path):
+    checker = getattr(os.path, "isjunction", None)
+    if checker:
+        return bool(checker(path))
+    if os.name != "nt" or not os.path.lexists(path):
+        return False
+    attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    return attributes != 0xFFFFFFFF and bool(attributes & 0x400)
+
+def make_writable(function, target, _error):
+    details = os.lstat(target)
+    if stat.S_ISREG(details.st_mode) and details.st_nlink != 1:
+        raise RuntimeError(f"refusing to chmod externally hard-linked bootstrap state: {target}")
+    os.chmod(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    function(target)
+
+def remove_bootstrap(path):
+    owner = path / ".issue-flow-bootstrap-owner"
+    repository_path = path / "repository.git"
+    unexpected = {item.name for item in path.iterdir()} - {owner.name, repository_path.name}
+    if unexpected:
+        raise RuntimeError(f"bootstrap quarantine contains unowned entries: {path}: {sorted(unexpected)}")
+    if repository_path.exists():
+        if repository_path.is_symlink() or is_junction(repository_path) or not repository_path.is_dir():
+            raise RuntimeError(f"bootstrap repository is not a real directory: {repository_path}")
+        shutil.rmtree(repository_path, onerror=make_writable)
+    if repository_path.exists():
+        raise RuntimeError(f"bootstrap repository cleanup did not complete: {repository_path}")
+    if os.name != "nt":
+        directory = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    if owner.exists():
+        details = os.lstat(owner)
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+            raise RuntimeError(f"bootstrap owner marker is not private: {owner}")
+        owner.unlink()
+    if os.name != "nt":
+        directory = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    path.rmdir()
+    if os.name != "nt":
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    if path.exists():
+        raise RuntimeError(f"bootstrap quarantine cleanup did not complete: {path}")
+
+guard_path = home / ".issue-flow-bootstrap.lock"
+if os.path.lexists(guard_path) and guard_path.is_symlink():
+    raise RuntimeError(f"bootstrap guard may not be a link: {guard_path}")
+guard_flags = os.O_RDWR | os.O_CREAT
+if hasattr(os, "O_NOFOLLOW"):
+    guard_flags |= os.O_NOFOLLOW
+guard_descriptor = os.open(guard_path, guard_flags, 0o600)
+guard_details = os.fstat(guard_descriptor)
+if not stat.S_ISREG(guard_details.st_mode) or guard_details.st_nlink != 1:
+    os.close(guard_descriptor)
+    raise RuntimeError(f"bootstrap guard is not a private regular file: {guard_path}")
+bootstrap_guard = os.fdopen(guard_descriptor, "r+b")
+if guard_details.st_size == 0:
+    bootstrap_guard.write(b"\0")
+    bootstrap_guard.flush()
+    os.fsync(bootstrap_guard.fileno())
+if not lock_owner(bootstrap_guard, blocking=True):
+    raise RuntimeError(f"could not acquire bootstrap guard: {guard_path}")
+
+for candidate in home.iterdir():
+    if not re.fullmatch(r"\.issue-flow-bootstrap-[0-9a-f]{32}", candidate.name):
+        continue
+    if candidate.is_symlink() or is_junction(candidate) or not candidate.is_dir():
+        raise RuntimeError(f"installer-shaped bootstrap path is not a real directory: {candidate}")
+    owner = candidate / ".issue-flow-bootstrap-owner"
+    if not owner.exists():
+        if not any(candidate.iterdir()):
+            candidate.rmdir()
+            continue
+        raise RuntimeError(f"non-empty bootstrap quarantine has no owner marker: {candidate}")
+    details = os.lstat(owner)
+    if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+        raise RuntimeError(f"bootstrap owner marker is not private: {owner}")
+    owner_probe = owner.open("r+b")
+    if not lock_owner(owner_probe, blocking=False):
+        owner_probe.close()
+        continue
+    unexpected = {item.name for item in candidate.iterdir()} - {owner.name, "repository.git"}
+    owner_probe.close()
+    if unexpected:
+        raise RuntimeError(f"bootstrap quarantine contains unowned entries: {candidate}: {sorted(unexpected)}")
+    if candidate.exists():
+        remove_bootstrap(candidate)
+
+bootstrap = home / f".issue-flow-bootstrap-{uuid.uuid4().hex}"
+os.mkdir(bootstrap, 0o700)
+details = os.lstat(bootstrap)
+if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode) or is_junction(bootstrap):
+    raise RuntimeError(f"bootstrap quarantine is not a private directory: {bootstrap}")
+owner_path = bootstrap / ".issue-flow-bootstrap-owner"
+owner_handle = owner_path.open("x+b")
+owner_handle.write(b"\0")
+owner_handle.flush()
+os.fsync(owner_handle.fileno())
+if not lock_owner(owner_handle, blocking=True):
+    raise RuntimeError(f"could not lock bootstrap owner marker: {owner_path}")
+owner_handle.seek(0)
+owner_handle.write(b"issue-flow-bootstrap-v1\n")
+owner_handle.truncate()
+owner_handle.flush()
+os.fsync(owner_handle.fileno())
+if os.name != "nt":
+    directory = os.open(bootstrap, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+bare = bootstrap / "repository.git"
+environment = os.environ.copy()
+for name in tuple(environment):
+    if name.startswith("GIT_") or name in {"SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE"}:
+        environment.pop(name, None)
+environment.update({
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_COUNT": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_NO_LAZY_FETCH": "1",
+})
+file_protocol = "always" if repository.lower().startswith("file:") else "never"
+hooks = "NUL" if os.name == "nt" else "/dev/null"
+common = [git, "--no-replace-objects", "-c", f"core.hooksPath={hooks}", "-c", "credential.helper="]
+try:
+    subprocess.run([
+        *common,
+        "-c", "protocol.allow=never",
+        "-c", "protocol.ext.allow=never",
+        "-c", f"protocol.file.allow={file_protocol}",
+        "-c", "protocol.https.allow=always",
+        "clone", "-q", "--bare", "--no-tags", "--single-branch", "--branch", "main",
+        repository, str(bare),
+    ], env=environment, check=True)
+    commit = subprocess.check_output([
+        git, "--no-replace-objects", f"--git-dir={bare}",
+        "-c", f"core.hooksPath={hooks}", "rev-parse", "refs/heads/main^{commit}",
+    ], env=environment, text=True).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        raise RuntimeError("canonical main did not resolve to a commit")
+    helper = subprocess.check_output([
+        git, "--no-replace-objects", f"--git-dir={bare}",
+        "-c", f"core.hooksPath={hooks}", "-c", "core.fsmonitor=false",
+        "cat-file", "blob", f"{commit}:scripts/install_bundle.py",
+    ], env=environment)
+    os.environ["ISSUE_FLOW_GIT"] = os.path.realpath(git)
+    sys.argv = [f"git:{commit}:scripts/install_bundle.py", *installer_arguments]
+    namespace = {"__name__": "__main__", "__file__": sys.argv[0]}
+    exec(compile(helper, sys.argv[0], "exec"), namespace)
+finally:
+    owner_handle.close()
+    if bootstrap.exists():
+        remove_bootstrap(bootstrap)
+    bootstrap_guard.close()
+PY

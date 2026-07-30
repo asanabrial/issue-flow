@@ -82,8 +82,12 @@ workflow already demands).
 
 ## Install
 
-One line. It clones the skill into `~/.agents/skills/issue-flow`, links it into each runtime it
-finds, and — run again later — **upgrades in place while preserving your configuration block**:
+The installer needs Git 2.36 or newer and Python 3.10 or newer, the same Python runtime used by the
+GitHub binding. Git Bash/MSYS must select native Windows Python so the shared installer creates
+junctions that native agents can follow; Cygwin is rejected because its path and symlink model is
+not compatible with native agent runtimes. One line
+acquires the current commit into quarantine, materializes its complete Git tree as a new immutable
+bundle, and points `~/.agents/skills/issue-flow` at that bundle:
 
 ```sh
 # macOS / Linux
@@ -95,23 +99,90 @@ curl -fsSL https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.
 irm https://raw.githubusercontent.com/asanabrial/issue-flow/main/install.ps1 | iex
 ```
 
-**The piped script is the installer itself**, and the first thing it does with no skill beside it is
-clone the repository and hand over to its on-disk copy — so everything of substance executes from
-files on your machine, and the settings that remove confirmation steps only ever hold the values you
-put there yourself. Prefer to see everything before anything runs? Same result by hand:
+**The piped script is only a bootstrap.** It runs Python in isolated mode, disables inherited Git
+configuration and hooks, acquires canonical `main` into a private quarantine below the resolved
+operator home, extracts the commit's shared installer into memory, and executes those exact bytes
+without reopening a replaceable helper path. Standard proxy variables remain available to Git;
+Git-specific authority and caller-controlled CA override variables do not, so TLS identity comes
+from the host's system trust store. Quarantine cleanup clears Git's read-only pack attributes and
+fails if its bootstrap path remains; a later bootstrap removes owner-marked quarantines only when
+their lifetime lock is no longer held, while a stable guard serializes owner-file publication
+through final quarantine deletion. Cleanup removes the repository first, persists that removal,
+and deletes the owner marker last so a crash cannot leave an unowned non-empty quarantine. Windows
+junctions are refused before stale-quarantine cleanup can traverse them.
+Every Python entrypoint forces UTF-8 mode so non-ASCII operator
+homes survive shell/native-process boundaries. Installed wrappers likewise reverify the local helper against
+its Git blob in the same Python process that executes those bytes; the absolute Git executable
+selected by the wrapper is propagated through every helper subprocess instead of being reselected
+after a directory change. The
+installer reads blobs directly from the fetched Git objects, rejects unsafe paths (including
+case-only collisions in every directory prefix) and broken local Markdown links, verifies every
+materialized byte against the commit tree, and activates only after the complete bundle is durable.
+Target paths reject Windows control characters and every reserved device-name spelling, including
+the superscript-digit `COM`/`LPT` aliases.
+Prefer to inspect the files first? The legacy clone layout is a
+supported one-time migration source:
 
 ```sh
 git clone https://github.com/asanabrial/issue-flow ~/.agents/skills/issue-flow
 ~/.agents/skills/issue-flow/install.sh install
 ```
 
-The skill lives in `~/.agents/skills/issue-flow/` and the installer links it into each runtime's
-skill directory (`~/.claude/skills/`, `~/.codex/skills/`). Run `status` to see what is linked, and
-`uninstall` to remove the links — the skill itself is never touched.
+An existing v1.11 installation upgrades by rerunning the current one-line bootstrap above, not by
+using v1.11's retired single-file `sync --from` command. Migration rejects included, worktree-scoped,
+promisor and partial-clone Git authority before reading objects, and adopts a v1.11 policy write that
+wins before the legacy clone move or after provisional policy state from an interrupted attempt.
+If that restored checkout instead removes its policy and returns to portable defaults, retry removes
+the provisional generation rather than resurrecting it.
+Stop all v1.11 installer commands before migration: v1.11 has no operating-system lock, so an already
+paused process cannot participate in v1.12 serialization after the public path changes layout.
 
-On Windows the installer tries a symlink, falls back to a directory junction (which needs no
-elevation) and only then to a copy. If it copies, it says so loudly: copies stop tracking the
-original.
+The stable public path remains `~/.agents/skills/issue-flow/`. Its bundles, Git object store, local
+policy generations, activation receipt, completed-activation refs and retained rollback targets live under
+`~/.agents/skills/.issue-flow/`. The operating-system lock is the stable sibling
+`~/.agents/skills/.issue-flow.sync.lock`, so first install and first uninstall serialize even before
+the state directory exists.
+POSIX atomically replaces the public symlink; Windows atomically retargets its directory junction,
+which needs no elevation. Runtime paths under `~/.claude/skills/` and `~/.codex/skills/` point at the
+stable public path. Independent copies are refused because they would remain on stale policy.
+Intermediate `.agents`, `.claude`, `.codex` and `skills` ancestors must be real directories contained
+under the once-resolved operator home; fresh dry-run and live commands both refuse linked parents
+before state mutation, runtime enumeration, cleanup or uninstall.
+
+The store retains every activated immutable bundle so an already-running load can keep using the immutable path
+it resolved at activation across any number of later upgrades. Materialization and activation have
+separate Git refs. A target that never reached activation is atomically renamed to a discard
+tombstone; recovery deletes its materialization ref before deleting the tombstone and resumes either
+step after a crash. It also removes the CAS-checked incoming acquisition ref left by an interruption
+before journaling and private stale Git ref lockfiles left by a terminated child process. Every
+installer ref must contain a direct object ID; symbolic refs are rejected, and updates use
+no-dereference compare-and-swap. The installer requires Git reference fsync before removing a recovery journal:
+`rollback` accepts the recorded previous generation only when a completed
+post-switch activation marker exists. `status` verifies tracked bytes and local attachments for every
+retained bundle, reports corrupt and unactivated generations plus pending incoming acquisition, and measures all deduplicated installer-state storage
+for deliberate operator cleanup. A new load sees one complete generation and must not reopen
+companions through the stable alias. The byte-exact v1.11 clone is not an immutable rollback target:
+its old installer performs in-place writes that are unsafe against the new store. A successful first
+migration therefore has no `rollback` target until the next immutable upgrade. If migration is
+interrupted before activation, recovery validates and restores the original standalone clone instead,
+including when canonical GitHub is temporarily unavailable and the command starts from a retained
+journal endpoint. Top-level ignored state and empty directories move intact; untracked state nested
+inside a tracked contract directory fails closed because Git cannot inventory an empty nested path.
+Reserved installer names, linked operator policy and partial/promisor Git object authority are
+rejected before migration publishes attachment state or reads tracked objects; legacy Git config
+includes are rejected because they could hide that authority outside the inspected config.
+On Windows, read-only local files are rejected before attachment publication because safely deleting
+one hardlink must not change the attributes of another operator-owned link.
+Run the one-time directory move between agent sessions because it has a brief availability gap.
+
+Run `status` to verify the active commit, tree, runtime targets and pending recovery state; `rollback`
+fetches canonical `main`, proves the retained activated predecessor is still in its history, then
+reactivates it. `recover` completes an interrupted transaction only
+when the pointer is one of that journal's declared endpoints. Unexplained pointer/state drift fails
+closed instead of being normalized; a missing or replaced canonical pointer cannot become a fresh
+install while durable activation state remains without a recovery journal. `uninstall` removes only installer-owned runtime links; it never
+removes bundles, policy or rollback state and remains available when unrelated attachment metadata
+is corrupt.
 
 ## Use
 
@@ -164,9 +235,9 @@ its priorities, its evidence requirements and its identity scheme — and never 
 which is what keeps it portable.
 
 **How is my configuration kept across upgrades?**
-Portable defaults live between two markers inside `SKILL.md`. Operator values live separately in
-the ignored `operator.local.md`, so updating or publishing the skill cannot disclose permissions,
-machine paths or tracker identifiers.
+Portable defaults live between two markers inside `SKILL.md`. Operator values live in stable local
+state and are hard-linked into the active bundle as the ignored `operator.local.md`, so updating or
+publishing the skill cannot disclose permissions, machine paths or tracker identifiers.
 
 ## Layout
 
@@ -177,7 +248,8 @@ bindings/linear.md
 bindings/trello.md
 scripts/github.py                 the GitHub binding's reversible operations, executable
 examples/domain-test-coverage.md  a worked domain rule book
-install.sh / install.ps1          self-acquiring installers (pipe them or run them)
+install.sh / install.ps1          thin self-acquiring bootstrap adapters
+scripts/install_bundle.py         shared immutable-bundle transaction implementation
 ```
 
 **Why an operation is a script and not a paragraph.** The failures this workflow keeps recording are
@@ -190,48 +262,96 @@ per-run worktree path, PR reuse, the closing-keyword scan — execute as code, a
 **judgement** stay in prose. Irreversible remote writes (merge, version tags, close) are deliberately
 left to the agent: a defect in a script must not be able to merge, tag or close anything.
 
-The script needs Python 3 and `gh`. Its exit codes separate "a check said stop" from "the read
+The script needs Python 3.10 or newer and `gh`. Its exit codes separate "a check said stop" from "the read
 failed" — treating a timeout as a stand-down halts every run, treating it as clearance lets a run
 write deaf, and it never collapses the two.
 
 ## Configuration
 
-Settings live in the ignored `operator.local.md` beside `SKILL.md` — tracker, delivery route, merge
-strategy, worktree location, and whether delivery is pre-authorised. The installer creates it from
-the marked defaults in `SKILL.md` on first use. A pull-request route publishes the branch
+Settings appear as the ignored `operator.local.md` beside `SKILL.md` and persist across bundle
+switches. Edit that visible file; `config` adopts it into a private stable copy and each bundle then
+exposes a content-addressed immutable generation under `~/.agents/skills/.issue-flow/`. Settings include tracker, delivery route, merge
+strategy, worktree location, and whether delivery is pre-authorised. The `config` command creates
+the file from the marked defaults in `SKILL.md` when needed. A pull-request route publishes the branch
 for independent review, waits for required CI on the latest head, and then merges using the selected
 strategy. When that delivery changes an app or project version, issue-flow creates an annotated,
 immutable tag on the delivered commit and pushes it to the remote before closing the work. GitHub
 Releases remain a separate publication layer and follow the repository's existing convention. The
 configuration is a table with the defaults written next to each value, so it reads on its own.
 
-Edit it by hand, or from the installer:
+Read or update it through the installer. Manual edits beside `SKILL.md` may add arbitrary local
+instructions; run `config` afterward to validate the markers and atomically publish those exact bytes to every bundle:
 
 ```sh
 ./install.sh config                                              # print the table
 ./install.sh config --set "Worktree location=/wt/<repo>/<branch>"
 ```
 
-The installer matches a setting **by its name** and carries no list of its own, so a default row
-added to the skill is settable immediately without touching either script. It backs the local file
-up first, refuses a name that matches no row or more than one, and refuses a value containing `|`,
-which would split the cell and corrupt the table.
+UTF-8 is canonical. A BOM-marked UTF-16 edit produced by Windows PowerShell 5.1 is accepted by
+`config` and normalized to UTF-8 during publication.
+Recovery treats the BOM-only encoding change as the same authorized visible edit if publication was
+interrupted after journaling.
 
-`sync` upgrades the versioned skill while leaving `operator.local.md` untouched:
+The installer matches a setting **by its name** and carries no setting list of its own, so a default
+row added to the skill is settable immediately. It verifies every destination, publishes the new
+content-addressed generation through a fsynced temporary file, then atomically changes each bundle
+hard link while keeping the editable stable file independent. Recovery removes abandoned link
+temporaries and completes an authorized visible-edit transaction even when an in-place Windows edit
+changed the predecessor generation inode before the journaled relink or the stable copy already
+advanced before journal deletion. First policy publication is also recoverable before the stable
+copy exists. It refuses a
+name that matches no row or more than one, and refuses a value containing `|`, which would split the
+cell and corrupt the table.
+
+`sync` fetches canonical `main`, validates the complete target tree, and atomically activates its
+bundle while leaving `operator.local.md` byte-identical:
 
 ```sh
-./install.sh sync --from ./newer-SKILL.md
+./install.sh sync
 ```
 
-It backs the skill up first. Never force-add `operator.local.md`: its values are permissions,
-including whether an agent may publish or merge without asking.
+Single-file `--from`/`-From` sync fails before mutation because it cannot prove that required
+references and assets come from the same contract. Remote acquisition uses a one-shot bare clone
+before any destination-local config exists, disables executable hooks and protocols outside the
+configured transport, rejects malformed CLI before fresh dry-run shortcuts, and atomically copies
+verified objects into real store directories. A failed fetch, validation or materialization leaves
+the active pointer unchanged and cannot retain an unactivated final bundle. Dry-run validates real
+runtime paths, configuration destinations and preserved attachment collisions without activating
+the fetched target. `config` binds preflight and activation to the same commit; if `main` advances it
+fails before activation and asks for a retry. Explicit updates merge newly shipped default rows into
+the preserved table while retaining every existing operator value. On POSIX, every newly created
+state-directory component is fsynced into its parent before a journal can name it, and cross-directory
+renames persist the destination before source deletion. Windows uses write-through atomic replacements
+for published files and junction switches rather than claiming unsupported directory-handle fsync.
+After two immutable
+generations exist, the previous complete bundle remains available through `rollback`; `recover`
+restores the standalone clone or reconciles the bundle journal when an operation was interrupted;
+`recover --dry-run` validates the same journal, authority, provenance and cleanup ownership without mutation.
+It recognizes journal-owned or verified unjournaled policy and file-attachment hard-link replacement
+temporaries without deleting them. An existing
+operating-system lock, including a POSIX `flock`, and both pre-switch and post-switch activation refs must pass the same
+identity checks as live recovery. Shared and wrapper-side verification both require installer refs
+to point directly to commits rather than blobs, trees or annotated tags.
+Never force-add `operator.local.md`: its values are permissions, including whether an agent may
+publish or merge without asking.
 
 ## Status
 
 The workflow, the state machine and the GitHub binding are the mature parts, exercised against a
 live board. **The Linear and Trello bindings are written against their official API documentation
 but have not yet been exercised against a live workspace** — expect the first real run to find
-something. `install.sh` has been tested under Git Bash; the logic is POSIX but it has not run on a
-native Linux or macOS shell.
+something. The installer acceptance suite runs shared migration, authority, crash-recovery,
+rollback and policy cases once on Windows through PowerShell 7 and once on native Linux. Short smoke
+lanes retain wrapper-specific coverage for Windows PowerShell 5.1 and Git Bash without triplicating
+the shared Python state machine. The Linux lane exercises native symlinks, `flock`, modes and
+directory fsync, including private `0700` creation under a permissive umask. Native macOS remains untested.
+
+The Python and Git executables selected from the operator's `PATH`, the host's system TLS roots and
+canonical GitHub `main` are trust roots. The shell runtime and resolved operator home are part of the
+OS-account boundary; bootstrap does not execute other `PATH` utilities. Local receipts, refs and
+journals detect partial drift and interrupted writes; they are
+not signatures against a fully compromised account that can coherently rewrite every object, bundle,
+pointer and state file. That stronger threat requires OS account isolation or signed upstream
+artifacts rather than another unsigned local marker.
 
 Licensed GPL-2.0. Issues and corrections welcome, preferably filed through the workflow itself.

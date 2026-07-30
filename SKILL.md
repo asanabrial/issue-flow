@@ -4,7 +4,7 @@ description: "Trigger: issue-flow analyst [conditions], issue-flow dev, analyst,
 license: GPL-2.0
 metadata:
   author: asanabrial
-  version: "1.11.0"
+  version: "1.12.0"
 ---
 
 # Issue Flow — Analyst / Dev over a shared issue tracker
@@ -14,6 +14,7 @@ metadata:
 Use for `issue-flow analyst [conditions]`, `issue-flow dev [domain-rules] [issue-number]`, analyst or developer work, claims, and workflow-state transitions.
 Analyst conditions and dev domains are optional: a bounded target is the scope; otherwise the analyst audits the repository and the dev implements the selected issue.
 Read repository instructions first and load only the tracker binding selected by operator configuration before tracker work.
+Resolve this skill's immutable filesystem directory once per activation and load every local reference from that resolved directory; never reopen companions through the stable installation alias during a concurrent upgrade.
 Load [domain composition](references/domain-composition.md) for handoff, priority, or routing rules; [runtime notes](references/runtime-notes.md) for invocation, delegation, or team mechanics; and [safety incidents](references/safety-incidents.md) for race, reclaim, handoff, or failure rationale.
 
 ## Hard Rules
