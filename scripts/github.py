@@ -2307,15 +2307,19 @@ def canonical_worktree_path(path: Path) -> Path:
     #
     # The reason none of them worked is that the property is not a property of one path. "Do two
     # run IDs land in one directory" cannot be answered by looking at one run's spelling — the
-    # other run's junction is not in it. What CAN answer it is the layer that already exists:
-    # `registered_worktrees` is keyed on RESOLVED paths, so the second run's lookup finds the first
-    # run's checkout at the shared real directory, and the ownership marker names the first run.
-    # The second run is refused with `worktree-owned-by-another-run` — the accurate message, from
-    # evidence rather than inference. `resolve_worktree_ownership` carries this, and a test drives
-    # exactly this collapse through it.
+    # other run's junction is not in it.
+    #
+    # What answers it is resolution followed by ownership, and resolution happens TWICE: here,
+    # before anything is created, so the checkout is made and registered under one spelling; and
+    # again in `normalise_path` when the registry is consulted, so the lookup compares real
+    # directories. Either alone is enough to make two aliased spellings meet — established by
+    # mutation: breaking one leaves the collapse refused, and breaking both degrades it only to
+    # `worktree-path-occupied`, still a refusal. Neither is load-bearing alone, which is precisely
+    # what makes this hard to remove by accident. `resolve_worktree_ownership` then names the run
+    # that got there first.
     #
     # So this function refuses what a single path CAN prove — its own leaf being an alias — and
-    # leaves what only two paths can prove to the layer that can see both.
+    # leaves what only two paths can prove to the layers that see both.
     return canonical
 
 

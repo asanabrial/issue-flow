@@ -1881,12 +1881,13 @@ with tempfile_module.TemporaryDirectory() as root:
         aliased = f"this platform refused to create the link: {exc}"
     check("a run directory that is itself a link is refused", aliased, "aliased-worktree-path")
 
+    # No platform guard here: `link` either exists by now or the check above already reported why
+    # not, and nothing in this block creates one. A guard that cannot fire is a claim of robustness
+    # the code does not make.
     try:
         ancestor_link = m.same_location(m.canonical_worktree_path(link / "sub"), real / "sub")
     except m.Stop as stop:
         ancestor_link = f"an ordinary ancestor link was refused: {stop.payload.get('reason')}"
-    except (OSError, NotImplementedError) as exc:
-        ancestor_link = f"this platform refused to create the link: {exc}"
     check("an ancestor link is resolved rather than refused", ancestor_link, True)
 
 # The collapse a single path CANNOT prove, and the layer that can. Two junctions — `run-a` and
@@ -1894,11 +1895,11 @@ with tempfile_module.TemporaryDirectory() as root:
 # cleanly, and no amount of inspecting ONE run's spelling can see the other run's junction. Three
 # path-only heuristics were tried here and each shipped a defect in a different direction.
 #
-# What decides it is two steps, and the first is the load-bearing one: `canonical_worktree_path`
-# resolves both spellings to ONE string, so both runs hand the registry and `git worktree add` the
-# same key instead of two keys for one directory. The lookup then lands on the first run's checkout
-# and the ownership marker names the first run. Both steps are asserted below — the first directly,
-# because everything under it is asking about a path nobody registered if it does not hold.
+# What decides it is resolution followed by ownership, and resolution happens TWICE on purpose:
+# `canonical_worktree_path` before anything is created, and `normalise_path` when the registry is
+# consulted. Neither is load-bearing alone — established by mutating them, not by argument: break
+# either one and the collapse is still refused; break BOTH and it degrades only to
+# `worktree-path-occupied`, which is still a refusal. Both steps are asserted below.
 with tempfile_module.TemporaryDirectory() as root:
     shared = Path(root) / "shared"
     shared.mkdir()
@@ -1907,10 +1908,11 @@ with tempfile_module.TemporaryDirectory() as root:
         (Path(root) / "run-a").symlink_to(shared, target_is_directory=True)
         (Path(root) / "run-b").symlink_to(shared, target_is_directory=True)
         (shared / "fix-6").mkdir()
-        # The step everything downstream rests on, asserted directly: two aliased SPELLINGS of one
-        # directory canonicalise to one identical string. Without it the registry lookup and
-        # `git worktree add` are handed two different keys for one directory, and every layer below
-        # is asking about a path nobody has registered.
+        # The first of the two resolutions, asserted directly: two aliased SPELLINGS of one
+        # directory canonicalise to one identical string, so `git worktree add` and the registry
+        # are handed one key rather than two keys for one directory. `normalise_path` would also
+        # supply this at lookup time; asserting it here pins the earlier one, which is the only
+        # place the CREATED checkout's spelling is decided.
         one_spelling = (m.canonical_worktree_path(Path(root) / "run-a" / "fix-6")
                         == m.canonical_worktree_path(Path(root) / "run-b" / "fix-6"))
     except m.Stop as stop:
