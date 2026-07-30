@@ -1290,6 +1290,97 @@ except m.ReadFailure:
 check("closing-reference read failures remain fail closed", read_failed_closed, True)
 
 
+# --------------------------------------------------------------------------------------
+# Worktree registry. The defect: `git worktree list` ran with check=False and its output was
+# scanned line by line, so a FAILED read produced `{}` — indistinguishable from "no worktree owns
+# this path", which is the answer that grants clearance to write into somebody else's checkout.
+# --------------------------------------------------------------------------------------
+OBJECT = "a" * 40
+
+
+def registry(*records) -> str:
+    """Build a `--porcelain -z` stream: NUL after every field, an empty field ending each record."""
+    return "".join("".join(f"{field}\0" for field in record) + "\0" for record in records)
+
+
+parsed = m.parse_worktree_registry(registry(
+    ("worktree /repo", f"HEAD {OBJECT}", "branch refs/heads/main"),
+    ("worktree /wt/two words", f"HEAD {'b' * 40}", "detached", "locked being moved right now"),
+    ("worktree /wt/line\nbreak", f"HEAD {'c' * 64}", "branch refs/heads/fix/1", "prunable"),
+    ("worktree /repo.git", "bare"),
+))
+check("every valid worktree shape parses, and a NUL-delimited path stays whole",
+      [(r["path"], r["branch"], r["detached"], r["bare"]) for r in parsed],
+      [("/repo", "main", False, False),
+       ("/wt/two words", None, True, False),
+       ("/wt/line\nbreak", "fix/1", False, False),
+       ("/repo.git", None, False, True)])
+check("a reason attached to locked survives with its spaces", parsed[1]["locked"],
+      "being moved right now")
+
+# One rejection per incoherence the registry can present. Each is a way the old parser answered
+# "no owner" about a record it could not actually read.
+for name, stream in (
+    ("an empty registry is a failed read, not an empty answer", ""),
+    ("a stream cut mid-field is truncation", "worktree /a"),
+    ("a record that never terminates is truncation",
+     f"worktree /a\0HEAD {OBJECT}\0branch refs/heads/x\0"),
+    ("a repeated path cannot decide which record owns it",
+     registry(("worktree /a", f"HEAD {OBJECT}", "branch refs/heads/x"),
+              ("worktree /a", f"HEAD {OBJECT}", "detached"))),
+    ("a checkout with no HEAD is not a checkout",
+     registry(("worktree /a", "branch refs/heads/x"))),
+    ("a checkout that states no branch, detached or bare has no state",
+     registry(("worktree /a", f"HEAD {OBJECT}"))),
+    ("a record cannot be on a branch and detached at once",
+     registry(("worktree /a", f"HEAD {OBJECT}", "branch refs/heads/x", "detached"))),
+    ("a record cannot be on a branch and bare at once",
+     registry(("worktree /a", f"HEAD {OBJECT}", "branch refs/heads/x", "bare"))),
+    ("a bare record cannot also be checked out at a HEAD",
+     registry(("worktree /a", f"HEAD {OBJECT}", "bare"))),
+    ("a repeated field cannot decide the record",
+     registry(("worktree /a", f"HEAD {OBJECT}", "branch refs/heads/x", "branch refs/heads/y"))),
+    ("a field this parser does not know is unknown structure, not noise",
+     registry(("worktree /a", f"HEAD {OBJECT}", "branch refs/heads/x", "worktree-kind linked"))),
+    ("an attribute before any path belongs to nobody",
+     registry((f"HEAD {OBJECT}", "worktree /a", "branch refs/heads/x"))),
+    ("a worktree line with no path names no directory",
+     registry(("worktree ", f"HEAD {OBJECT}", "branch refs/heads/x"))),
+    ("a ref outside refs/heads is not a worktree branch",
+     registry(("worktree /a", f"HEAD {OBJECT}", "branch refs/tags/x"))),
+    ("a HEAD that is not an object id is not a HEAD",
+     registry(("worktree /a", "HEAD not-an-object", "branch refs/heads/x"))),
+):
+    refused = False
+    try:
+        m.parse_worktree_registry(stream)
+    except m.ReadFailure:
+        refused = True
+    check(name, refused, True)
+
+# The stdout here is a PERFECTLY VALID registry, so only the exit code can reject it. An earlier
+# version of this check sent empty stdout, and it still passed with the exit-code test deleted —
+# the empty-registry rule was catching it instead. A check that survives the mutation it exists to
+# catch is not a check.
+exit_code_only = registry(("worktree /a", f"HEAD {OBJECT}", "branch refs/heads/x")).encode()
+failed_read = False
+try:
+    with patch.object(m, "run", return_value=SimpleNamespace(
+            returncode=128, stdout=exit_code_only, stderr=b"fatal: not a git repository")):
+        m.registered_worktrees(Path("."))
+except m.ReadFailure:
+    failed_read = True
+check("a nonzero git worktree list exits through the read-failure contract", failed_read, True)
+
+# The parser above is pure, so it can only prove what the fixtures assert. This one proves the
+# shape git actually emits still passes — the check no hand-written fixture can stand in for.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+try:
+    live_parses = m.normalise_path(REPO_ROOT) in m.registered_worktrees(REPO_ROOT)
+except m.ReadFailure as exc:
+    live_parses = f"the live registry was refused: {exc}"
+check("the live repository registry passes through the new parser", live_parses, True)
+
 operation_parsers = m.build_parser()._subparsers._group_actions[0].choices
 check("ownership writers require operation identity", [next(a for a in operation_parsers[command]._actions if a.dest == "operation_id").required for command in ("claim", "reclaim", "unassign")], [True, True, True])
 check("target discovery remains a read-only first call", [next(a for a in operation_parsers[command]._actions if a.dest == "target_operation").required for command in ("reclaim", "unassign")], [False, False])

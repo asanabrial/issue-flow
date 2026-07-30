@@ -197,7 +197,7 @@ class Stop(Exception):
 # ---------------------------------------------------------------------------
 
 def run(args: list[str], cwd: Path | None = None, check: bool = True,
-        writes: bool = False) -> subprocess.CompletedProcess:
+        writes: bool = False, binary: bool = False) -> subprocess.CompletedProcess:
     """Run a command with an argument LIST and no shell.
 
     No shell means no PowerShell backtick expansion, no word splitting, no quoting rules — the
@@ -208,20 +208,24 @@ def run(args: list[str], cwd: Path | None = None, check: bool = True,
     learned, retry"; a failed write means "something may already have happened, re-read before you
     decide". Reporting a failed write under the read contract tells the caller to retry blindly,
     which is how a single command posts two claim comments.
+
+    `binary=True` returns undecoded bytes, and exists for exactly one class of caller: a
+    NUL-delimited stream whose payload may contain raw `\\r` or `\\n`. Text mode applies universal
+    newline translation, so `\\r\\n` and a lone `\\r` inside a POSIX path would silently arrive as
+    `\\n` — a corrupted path is worse than an unreadable one, because it is still a valid key.
     """
     try:
         proc = subprocess.run(
             args,
             cwd=str(cwd) if cwd else None,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            **({} if binary else {"text": True, "encoding": "utf-8", "errors": "replace"}),
         )
     except FileNotFoundError as exc:
         raise ReadFailure(f"{args[0]} not found on PATH: {exc}") from exc
     if check and proc.returncode != 0:
-        detail = f"{' '.join(args[:3])} failed ({proc.returncode}): {proc.stderr.strip()}"
+        stderr = proc.stderr.decode("utf-8", "replace") if binary else proc.stderr
+        detail = f"{' '.join(args[:3])} failed ({proc.returncode}): {stderr.strip()}"
         raise (WriteFailure if writes else ReadFailure)(detail)
     return proc
 
@@ -2160,22 +2164,133 @@ def branch_start_point(*, exists_local: bool, exists_remote: bool, branch: str, 
     return f"origin/{branch}" if exists_remote else f"origin/{base}"
 
 
+WORKTREE_OBJECT_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def parse_worktree_registry(text: str) -> list[dict]:
+    """Parse `git worktree list --porcelain -z` into complete records, or refuse the read.
+
+    Pure by construction — it takes the raw stream and touches neither the filesystem nor git — so
+    every rejection below is exercisable without a repository. That matters because this is the
+    ONLY local authority that separates a resume from writing into somebody else's checkout, and
+    the defect it replaces was precisely that an unanswered read looked identical to "no worktrees
+    exist". A parser that guesses at an incoherent record hands out that same false clearance one
+    level lower down.
+
+    NUL delimiting rather than lines: a worktree path may legally contain spaces and, on POSIX,
+    newline bytes. Splitting the porcelain stream on newlines turns one such path into two
+    fragments, and the fragment that survives names a directory nobody owns.
+
+    Records are `worktree <path>` first, then optional attributes, terminated by an empty field.
+    `bare` records carry no HEAD and no branch/detached state; every other record carries exactly
+    one HEAD and exactly one of `branch`/`detached`. Anything else — a repeated field, a repeated
+    path, an attribute with no record, an attribute this parser does not know, a stream that stops
+    mid-record — is refused rather than interpreted.
+    """
+    if not text:
+        raise ReadFailure("git worktree registry was empty; git lists at least the main worktree")
+    if not text.endswith("\0"):
+        raise ReadFailure("git worktree registry ended mid-field")
+
+    records: list[dict] = []
+    seen_paths: set[str] = set()
+    current: dict | None = None
+
+    for field in text.split("\0")[:-1]:
+        if not field:
+            if current is None:
+                raise ReadFailure("git worktree registry terminated a record that never began")
+            records.append(complete_worktree_record(current))
+            current = None
+            continue
+
+        label, _, value = field.partition(" ")
+        if label == "worktree":
+            if current is not None:
+                raise ReadFailure("git worktree registry began a record before terminating the previous one")
+            if not value:
+                raise ReadFailure("git worktree registry declared a worktree with no path")
+            if value in seen_paths:
+                raise ReadFailure(f"git worktree registry repeated the path {value!r}")
+            seen_paths.add(value)
+            current = {"path": value, "head": None, "branch": None,
+                       "detached": False, "bare": False, "locked": None, "prunable": None}
+            continue
+
+        if current is None:
+            raise ReadFailure(f"git worktree registry field {label!r} preceded its worktree path")
+        if label == "HEAD":
+            if current["head"] is not None:
+                raise ReadFailure("git worktree record declared HEAD twice")
+            if not WORKTREE_OBJECT_RE.fullmatch(value):
+                raise ReadFailure(f"git worktree record carried a malformed HEAD {value!r}")
+            current["head"] = value
+        elif label == "branch":
+            if current["branch"] is not None:
+                raise ReadFailure("git worktree record declared branch twice")
+            if not value.startswith("refs/heads/") or value == "refs/heads/":
+                raise ReadFailure(f"git worktree record carried a non-branch ref {value!r}")
+            current["branch"] = value[len("refs/heads/"):]
+        elif label in ("detached", "bare"):
+            if value:
+                raise ReadFailure(f"git worktree record gave the boolean {label!r} a value")
+            if current[label]:
+                raise ReadFailure(f"git worktree record declared {label!r} twice")
+            current[label] = True
+        elif label in ("locked", "prunable"):
+            if current[label] is not None:
+                raise ReadFailure(f"git worktree record declared {label!r} twice")
+            current[label] = value
+        else:
+            raise ReadFailure(f"unknown git worktree registry field {label!r}")
+
+    if current is not None:
+        raise ReadFailure("git worktree registry stopped inside an unterminated record")
+    return records
+
+
+def complete_worktree_record(record: dict) -> dict:
+    """Reject a record whose fields contradict each other or leave its state unstated.
+
+    Split out so the contradictions are named once, in one place, instead of accumulating as
+    conditions inside the field loop where the next one added would be easy to misplace.
+    """
+    path = record["path"]
+    if record["bare"]:
+        if record["head"] is not None or record["branch"] is not None or record["detached"]:
+            raise ReadFailure(f"git worktree record for {path!r} is bare and checked out at once")
+        return record
+    if record["branch"] is not None and record["detached"]:
+        raise ReadFailure(f"git worktree record for {path!r} is on a branch and detached at once")
+    if record["branch"] is None and not record["detached"]:
+        raise ReadFailure(f"git worktree record for {path!r} declared no branch, detached or bare state")
+    if record["head"] is None:
+        raise ReadFailure(f"git worktree record for {path!r} is checked out with no HEAD")
+    return record
+
+
 def registered_worktrees(cwd: Path) -> dict[str, str | None]:
     """Every worktree git knows about, as {normalised path: branch or None if detached}.
 
     A directory git does NOT list is not a worktree — it is an orphan a dead run left behind, and
     the difference decides whether writing there is a resume or a collision.
+
+    A failed or incoherent read is NOT an empty registry. The previous implementation ran with
+    `check=False` and ignored the exit code, so git failing to describe its own worktrees produced
+    `{}` — the same answer as a clean repository with nothing checked out anywhere, and the answer
+    that grants clearance. It now raises `ReadFailure`, which the CLI reports as exit `3`: the read
+    answered nothing, so write nothing and retry.
     """
-    proc = run(["git", "worktree", "list", "--porcelain"], cwd=cwd, check=False)
-    trees: dict[str, str | None] = {}
-    current = None
-    for line in proc.stdout.splitlines():
-        if line.startswith("worktree "):
-            current = normalise_path(line[len("worktree "):].strip())
-            trees[current] = None
-        elif line.startswith("branch ") and current:
-            trees[current] = line[len("branch refs/heads/"):].strip()
-    return trees
+    proc = run(["git", "worktree", "list", "--porcelain", "-z"], cwd=cwd, check=False, binary=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        raise ReadFailure(f"git worktree list failed ({proc.returncode}): {detail}")
+    # `surrogateescape`, not `replace`: a path byte that is not valid UTF-8 must survive as itself
+    # rather than collapse into U+FFFD, because two undecodable paths would otherwise normalise to
+    # one key and the registry would name the wrong owner.
+    text = (proc.stdout or b"").decode("utf-8", "surrogateescape")
+    return {normalise_path(record["path"]): record["branch"]
+            for record in parse_worktree_registry(text)}
 
 
 def cmd_start_branch(args, config, cwd) -> dict:

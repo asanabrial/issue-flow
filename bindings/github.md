@@ -171,7 +171,7 @@ Every ownership write uses a fresh lowercase 32-hex `--operation-id`, reused unc
 | `transition` | `SCRIPT transition --issue <n> --to <s> [--from <s>]` | mirrors the board **first**, swaps the label in **one** call, then reads **both** back and repairs a board that disagrees. Omitting `--from` removes whatever stale state labels it finds |
 | `comment` | `SCRIPT comment --issue <n> --body-file <f> [--run-id <id> --kind note\|blocker\|diagnosis]` | file-based body, always; `--run-id` and `--kind` are a pair. Every generic comment gets a non-control marker, and quoted issue-flow markers plus claim-shaped legacy prose are escaped, so generic text cannot become a control event or fall through to the prose parser |
 | `heartbeat` | `SCRIPT heartbeat --issue <n> --run-id <id> --expect-state <s> --body-file <f>` | renewal first, post second; **refuses to post** when the renewal says stop and escapes control-shaped text before appending its own heartbeat marker |
-| branch + worktree | `SCRIPT start-branch --issue <n> --branch <b> --base <base> --run-id <id>` | renews first, fetches before fallback discovery, resumes local or remote-only branch heads without moving them, and creates from the fetched base only when the branch is absent everywhere |
+| branch + worktree | `SCRIPT start-branch --issue <n> --branch <b> --base <base> --run-id <id>` | renews first, fetches before fallback discovery, resumes local or remote-only branch heads without moving them, and creates from the fetched base only when the branch is absent everywhere. The local worktree registry is read NUL-delimited and fails closed: a failed, truncated or contradictory read is a failed read, never an empty registry |
 | `publish_review` | `SCRIPT publish-review --issue <n> --branch <b> --base <base> --run-id <id> --pr-title <t> --pr-body-file <f> [--worktree <p>]` | pushes, **reuses** the single open PR or creates one, refuses on more than one, scans for closing keywords, and records the PR URL with its exact head and base SHAs |
 | `changelog-notes` | `SCRIPT changelog-notes --version <x.y.z> --file <changelog> [--out <f>]` | read-only. Extracts the version's entry for its tag and Release, anchored on the version **opening** the heading. Fails closed on a missing or empty entry — a tag is immutable, so notes invented at tag time are permanent |
 | `check closing keywords` | `SCRIPT check-closing-keywords --issue <n>` | run again before merging: the branch's commit messages can introduce one after the body is already clean. Historical merged closers and open PRs for another named branch/base are excluded from the current-delivery verdict |
@@ -303,6 +303,21 @@ worktree for this exact branch is a resume: it is reused and reported as `resume
 Anything else — a stranger's checkout, or an orphan left by a dead run — is refused, because writing
 into either is the failure above. Merely refusing every existing path would make resume impossible
 under a run-id-free template while protecting against nothing git had not already caught.
+
+**"Not registered" and "the registry could not be read" are different answers, and only one of them
+is a clearance.** That question is answered by `git worktree list`, so how it is read decides
+whether the paragraph above means anything. The read is NUL-delimited (`--porcelain -z`) because a
+worktree path may legally contain spaces and, on POSIX, newline bytes — splitting the stream on
+lines turns one such path into two fragments, and the surviving fragment names a directory nobody
+owns. Every record is then required to be coherent before any of it is believed: a nonzero exit, a
+stream that stops mid-record, a repeated path, a repeated field, a field this parser does not know,
+an attribute with no record, a checkout with no HEAD or no branch/detached/bare state, and any
+bare-plus-checked-out or branch-plus-detached contradiction are all refused as exit `3`.
+
+The failure that motivates it is the quiet one: the read used to ignore its exit code, so git being
+unable to describe its own worktrees returned exactly the same answer as a repository with nothing
+checked out anywhere — and that answer is the one that lets a run write into a directory another
+run already owns.
 
 **A fresh worktree does not have the files git never tracked.** Everything gitignored — environment
 files, secrets, credentials, local settings — is simply absent, and the failure it produces is
