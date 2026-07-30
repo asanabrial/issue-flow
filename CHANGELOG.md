@@ -11,11 +11,13 @@ All notable changes to Issue Flow are documented here.
   a common issue branch as an alternative to a per-run path — that alternative depends on winning a
   race the registration check cannot win — and states that registration is not ownership, so a
   resume needs durable evidence that this run created the checkout. The migration inventory's
-  worktree row and the #58 incident record are corrected to match, including the full stop list —
-  a foreign path, an orphan, an unproven claim and an unreadable one — and the README documents the
-  run-scoped worktree template, the in-memory completion of a branch-only one, why the join is `~`,
-  and the exit code that separates a configuration defect from a lost race and from an ambiguous
-  write. `SKILL.md` no longer presents the version-control system's own checkout guard as decisive.
+  worktree row is corrected to match, and the #58 incident record now carries the full stop list —
+  a foreign path, an orphan and an unproven claim stop, an unreadable one is a failed read. The
+  binding's own summary of `start-branch` no longer describes the superseded order in which the
+  issue was linked before the checkout existed. The README documents the run-scoped worktree
+  template, the in-memory completion of a branch-only one, why the join is `~`, and the exit code
+  that separates a configuration defect from a lost race and from an ambiguous write. `SKILL.md` no
+  longer presents the version-control system's own checkout guard as decisive.
 
 ## [1.12.2] - 2026-07-30
 

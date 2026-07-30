@@ -197,9 +197,10 @@ to nothing, and deriving it purely from the issue means two runs that both want 
 same path and share one checkout. Git will not save you: `worktree add` refuses a branch already
 checked out elsewhere, but that check is a read followed by a write with no lock between them — two
 processes have been observed registering one branch concurrently — and **nothing refuses a second
-process writing into a directory that already exists**. So put the run-id in the path — `<root>/<repo>/<issue>-<slug>~<run-id>`, joined with a
-character neither half can contain — and the collision becomes impossible instead of merely
-unlikely. The cost is one stale directory when a run dies; the cost of the shared path is two
+process writing into a directory that already exists**. So put the run-id in the path —
+`<root>/<repo>/<issue>-<slug>~<run-id>`, joined with a character neither half can contain — and the
+collision becomes impossible instead of merely unlikely.
+The cost is one stale directory when a run dies; the cost of the shared path is two
 agents editing one tree with no record anywhere that it happened
 (seen live on #58, 2026-07-24: model, migration and test files appearing in a checkout their author
 had created clean minutes earlier).
