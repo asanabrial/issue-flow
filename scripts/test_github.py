@@ -1951,16 +1951,19 @@ SKILL = (REPO_ROOT / "SKILL.md").read_text(encoding="utf-8")
 SKILL_LINES = SKILL.split("\n")
 INVENTORY = (REPO_ROOT / "references" / "migration-inventory.md").read_text(encoding="utf-8")
 
-# The line budget, asserted rather than described. Issue #7 asks for 140-170 lines; the contract
-# lands at 112 with every required section present and all nine invariants stated exactly once, and
-# padding the one document loaded on every invocation to reach a floor would defeat what the number
-# is a proxy for. Pinned as an exact expectation so the deviation is visible in the suite instead of
-# only in a pull-request body, and so drift in either direction has to be argued for deliberately.
-# Counted the way `wc -l` counts, so the number here is the number anyone checks by hand: the
+# The line budget, asserted rather than described, and pinned exactly rather than as a range.
+#
+# Issue #7 asks for 140-170 lines. The contract lands at 112 with every required section present
+# and all nine invariants stated exactly once, so reaching that floor would mean padding the one
+# document loaded on every invocation — defeating what the number is a proxy for. A range check
+# would also be dead weight here: `<= 170` can never fail while the exact pin holds. So the pin is
+# the whole check, and it works as a tripwire in both directions: growth back toward the old
+# duplication fails it, and so does a deletion nobody argued for.
+#
+# Counted the way `wc -l` counts, so the number here is the number anyone verifies by hand: the
 # trailing newline terminates the last line rather than starting another.
 SKILL_LINE_COUNT = len(SKILL.rstrip("\n").split("\n"))
-check("the runtime contract stays within its line budget", SKILL_LINE_COUNT <= 170, True)
-check("the runtime contract is the size this migration landed on", SKILL_LINE_COUNT, 112)
+check("the runtime contract is exactly the size this migration landed on", SKILL_LINE_COUNT, 112)
 
 front = SKILL.split("---", 2)
 check("the frontmatter declares name, description, licence, author and version",
@@ -2008,59 +2011,72 @@ retired_headings = ["What the analyst produces", "Working in a repository", "Aba
                     "Where to put work you cannot finish", "Optional: a board view"]
 check("no retired section heading survives in the contract",
       [h for h in retired_headings if h in SKILL], [])
-# Every row of every table, discovered by SHAPE rather than by an enumerated set of ID letters.
+# The ledger guard, fourth attempt, and the first three are why this one is strict rather than
+# clever. Each earlier version matched row TEXT with a slightly wider regex — `^\| S\d\d \|`, then
+# `[TIXS]`, then a "row-shaped line" — and each reported a clean ledger while a whole region of it
+# claimed a source that had been deleted: eighteen template and incident rows, then all thirty-nine
+# invariant-family rows, then anything with padded cells, a capitalised verdict, an extra column or
+# a formatter's column alignment.
 #
-# This guard has now been wrong twice, the same way each time. It first anchored on `^\| S\d\d \|`
-# and reported a clean ledger while eighteen template and incident rows still claimed a source that
-# had been deleted. Widened to `[TIXS]`, it reported a clean ledger while all thirty-nine rows of
-# the invariant-families table — the table issue #7's criterion 5 actually names — said the same.
-#
-# The guard has been wrong three times, and each fix was a slightly wider REGEX over row text: an
-# `S`-only allowlist, then `[TIXS]`, then a "row-shaped line" pattern paired with a companion that
-# claimed to be an independent shape while sharing the same tail — so it still missed padded cells
-# (`|  no  |`), capitalisation, an extra trailing column, and a column-aligned table, which is what
-# any markdown formatter produces. It also stopped noticing a table being DELETED outright.
-#
-# Matching row text was the mistake. This parses the tables instead: find each header row, locate
-# the column literally titled "Old source retired", and read that cell in every body row beneath
-# it. Alignment, padding, casing and extra columns are then irrelevant by construction rather than
-# by another pattern, and a table that disappears takes its heading with it — which the count check
-# below sees.
+# So it parses the tables by COLUMN TITLE instead. What that buys is only as good as its refusal to
+# guess: reading a fixed column index and accepting any row at least that wide lets one widened row
+# be read a cell to the left, and `\|` — which renders as a literal pipe but splits like a
+# delimiter — is all it takes. Every structural assumption is therefore asserted rather than
+# assumed, and a violation raises instead of being skipped, because a ledger this file cannot parse
+# is exactly the state where "no unretired rows found" is worthless.
+class LedgerError(Exception):
+    """The ledger could not be parsed as the shape this guard requires."""
+
+
 def ledger_tables(text: str) -> dict:
-    """{table heading: [(row id, retired cell)]} parsed by column title, not by row shape."""
-    tables, heading, columns = {}, None, None
-    for line in text.split("\n"):
+    """{table heading: [(row id, owner-copied, retired)]}, or raise rather than guess."""
+    tables, heading, header = {}, None, None
+    for number, line in enumerate(text.split("\n"), start=1):
         if line.startswith("## "):
-            heading, columns = line[3:].strip(), None
+            heading, header = line[3:].strip(), None
             continue
         if not line.lstrip().startswith("|"):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if all(set(c) <= set("-: ") and c for c in cells):
+        if all(c and set(c) <= set("-: ") for c in cells):
             continue                                    # the |---|---| separator
-        if columns is None:
-            # `heading is not None` keeps the file's status LEGEND out of this: it sits above the
-            # first `##`, and its body row's first cell is literally "Old source retired", which a
-            # header test on cell text alone happily mistakes for a header.
-            lowered = [c.lower() for c in cells]
-            if heading is not None and "old source retired" in lowered:
-                columns = lowered.index("old source retired")
-                tables.setdefault(heading, [])
+        lowered = [c.lower() for c in cells]
+        if header is None:
+            # The status LEGEND sits above the first `##` and its body row's first cell reads
+            # "Old source retired", which any header test on cell text alone mistakes for a header.
+            if heading is None:
+                continue
+            if "old source retired" not in lowered:
+                raise LedgerError(f"line {number}: a table row precedes its header under {heading!r}")
+            for title in ("old source retired", "owner copied"):
+                if lowered.count(title) != 1:
+                    raise LedgerError(f"line {number}: {title!r} appears {lowered.count(title)} times")
+            header = (len(cells), lowered.index("owner copied"), lowered.index("old source retired"))
+            tables.setdefault(heading, [])
             continue
-        if heading in tables and columns < len(cells):
-            tables[heading].append((cells[0], cells[columns].lower()))
+        width, copied, retired = header
+        if len(cells) != width:
+            raise LedgerError(f"line {number}: {len(cells)} cells under a {width}-column header")
+        if not cells[0]:
+            raise LedgerError(f"line {number}: a ledger row with no id")
+        tables[heading].append((cells[0], lowered[copied], lowered[retired]))
     return tables
 
 
-LEDGER = ledger_tables(INVENTORY)
-check("the migration ledger records every row as retired, in every table",
-      sorted(rid for rows in LEDGER.values() for rid, retired in rows if retired != "yes"), [])
-# Pinned here rather than derived from the file, because a table that is DELETED takes its heading
-# with it — so any expectation read out of the ledger agrees with its own deletion. This is the one
-# place a literal is the right answer: the four tables and their sizes are the migration's shape,
-# and a slice that legitimately changes them should have to say so here.
-check("every ledger table is present, with the rows the migration accounted for",
-      {name: len(rows) for name, rows in LEDGER.items()},
+try:
+    LEDGER = ledger_tables(INVENTORY)
+    ledger_rows = [(rid, copied, retired)
+                   for rows in LEDGER.values() for rid, copied, retired in rows]
+    unfinished = sorted(rid for rid, copied, retired in ledger_rows
+                        if copied != "yes" or retired != "yes")
+    shape = {name: len(rows) for name, rows in LEDGER.items()}
+except LedgerError as exc:
+    unfinished, shape = [f"the ledger could not be parsed: {exc}"], {}
+check("the migration ledger records every row as copied and retired, in every table", unfinished, [])
+# Pinned rather than derived from the file, because a table that is DELETED takes its heading with
+# it — so any expectation read out of the ledger agrees with its own deletion. The four tables and
+# their sizes are this migration's shape, and a slice that legitimately changes them says so here.
+check("every ledger table is present, with the rows the migration accounted for", shape,
       {"Current sections": 21, "Analyst issue template": 7,
        "Named incidents and failure cases": 21, "Invariant families": 39})
 
