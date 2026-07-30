@@ -2297,12 +2297,15 @@ def cmd_start_branch(args, config, cwd) -> dict:
     }
 
 
+CLOSING_REFS_MAX_PAGES = 100
+
 CLOSING_KEYWORDS_QUERY = """
-query($owner: String!, $name: String!, $number: Int!) {
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
-      closedByPullRequestsReferences(first: 5) {
-        nodes { number state }
+      closedByPullRequestsReferences(first: 100, after: $cursor) {
+        nodes { number state headRefName baseRefName }
+        pageInfo { hasNextPage endCursor }
       }
     }
   }
@@ -2318,14 +2321,58 @@ CLOSING_KEYWORD_RE = re.compile(
 
 
 def closing_refs(issue: int, cwd: Path) -> list[dict]:
+    """Return the complete closing-PR connection or reject the read as incomplete.
+
+    This set authorizes post-merge claim renewal, so a truncated or malformed response cannot be
+    treated as an empty/non-matching answer. The page cap bounds a hostile or unstable connection;
+    reaching it while GitHub still advertises another page is a failed read, not partial evidence.
+    """
     owner, name = repo_identity(cwd)
-    data = gh_json(
-        ["api", "graphql", "-f", f"query={CLOSING_KEYWORDS_QUERY}",
-         "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={issue}"],
-        cwd=cwd,
-    )
-    node = (((data or {}).get("data") or {}).get("repository") or {}).get("issue") or {}
-    return (node.get("closedByPullRequestsReferences") or {}).get("nodes") or []
+    cursor = None
+    seen_cursors = set()
+    refs_by_number = {}
+
+    for page in range(CLOSING_REFS_MAX_PAGES):
+        args = ["api", "graphql", "-f", f"query={CLOSING_KEYWORDS_QUERY}",
+                "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={issue}"]
+        if cursor is not None:
+            args.extend(["-f", f"cursor={cursor}"])
+        data = gh_json(args, cwd=cwd)
+        if not isinstance(data, dict) or data.get("errors"):
+            raise ReadFailure("closing-reference GraphQL response is partial or malformed")
+        repository = ((data or {}).get("data") or {}).get("repository")
+        issue_node = repository.get("issue") if isinstance(repository, dict) else None
+        connection = (issue_node or {}).get("closedByPullRequestsReferences")
+        if not isinstance(connection, dict):
+            raise ReadFailure("closing-reference response omitted the issue connection")
+        nodes = connection.get("nodes")
+        page_info = connection.get("pageInfo")
+        if not isinstance(nodes, list) or not isinstance(page_info, dict):
+            raise ReadFailure("closing-reference response omitted nodes or page metadata")
+        has_next = page_info.get("hasNextPage")
+        if not isinstance(has_next, bool):
+            raise ReadFailure("closing-reference page metadata has no boolean hasNextPage")
+
+        for ref in nodes:
+            if (not isinstance(ref, dict) or isinstance(ref.get("number"), bool)
+                    or not isinstance(ref.get("number"), int)
+                    or not isinstance(ref.get("state"), str)):
+                raise ReadFailure("closing-reference response contains a malformed PR node")
+            previous = refs_by_number.get(ref["number"])
+            if previous is not None and previous != ref:
+                raise ReadFailure("closing-reference response contains conflicting duplicate PR nodes")
+            refs_by_number.setdefault(ref["number"], ref)
+
+        if not has_next:
+            return list(refs_by_number.values())
+        cursor = page_info.get("endCursor")
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            raise ReadFailure("closing-reference pagination did not provide a fresh continuation cursor")
+        seen_cursors.add(cursor)
+        if page + 1 == CLOSING_REFS_MAX_PAGES:
+            raise ReadFailure("closing-reference pagination exceeded its safety bound")
+
+    raise ReadFailure("closing-reference pagination did not terminate")
 
 
 def keyword_sources(issue: int, prs: list[dict], base: str | None, branch: str | None,
@@ -2353,7 +2400,7 @@ def keyword_sources(issue: int, prs: list[dict], base: str | None, branch: str |
 
 
 def assess_autoclose(issue: int, cwd: Path, base: str | None = None,
-                     branch: str | None = None) -> dict:
+                     branch: str | None = None, current_pr: int | None = None) -> dict:
     """Will this issue auto-close on merge, and if so, from what?
 
     Two distinct causes, one symptom:
@@ -2370,7 +2417,15 @@ def assess_autoclose(issue: int, cwd: Path, base: str | None = None,
     the auto-close is NOT the workflow's `close`, so `transition --to done` must still run after
     the merge or the label and the board freeze wherever they were.
     """
-    refs = closing_refs(issue, cwd)
+    # This command predicts the pending merge. Merged historical closers prove past deliveries,
+    # not a current risk; unrelated open PRs are equally irrelevant when the caller names a branch.
+    refs = [ref for ref in closing_refs(issue, cwd) if ref["state"] == "OPEN"]
+    if current_pr is not None:
+        refs = [ref for ref in refs if ref["number"] == current_pr]
+    if branch:
+        refs = [ref for ref in refs if ref.get("headRefName") == branch]
+    if base:
+        refs = [ref for ref in refs if ref.get("baseRefName") == base]
     if not refs:
         return {"will_autoclose": False, "cause": None, "linked_prs": []}
     hits = keyword_sources(issue, refs, base, branch, cwd)
@@ -2459,7 +2514,7 @@ def cmd_publish_review(args, config, cwd) -> dict:
         pr = fresh[0]
         created = True
 
-    verdict = assess_autoclose(args.issue, cwd, args.base, args.branch)
+    verdict = assess_autoclose(args.issue, cwd, args.base, args.branch, pr["number"])
     if verdict["cause"] == "closing-keyword":
         raise Stop(
             {

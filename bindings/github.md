@@ -167,14 +167,14 @@ Every ownership write uses a fresh lowercase 32-hex `--operation-id`, reused unc
 | `list_state` | `SCRIPT list-state --state <s>` | unassigned only, `--limit 200` (the default cap is 30 and silently truncates the queue), partitioned by `domain:<name>`. It returns the raw labels and **refuses to rank across partitions** — ordering inside one needs the domain's scale contract, and manufacturing a global rank is forbidden |
 | `claim` | `SCRIPT claim --issue <n> --run-id <id> --runtime <rt> --horizon <UTC> --operation-id <32-hex>` | retries may duplicate transport, never the semantic event; renewals use a fresh operation ID |
 | `reclaim` | `SCRIPT reclaim --issue <n> --run-id <id> --runtime <rt> --horizon <UTC> --operation-id <32-hex> [--target-operation <epoch>] [--force --reason-file <f>]` | target discovery is read-only; the write binds target, evidence, privilege and metadata, then proves exact projections |
-| `verify_claim` | `SCRIPT verify-claim --issue <n> --run-id <id> --expect-state <s> [--allow-closed-by-pr <pr>]` | proves the requested run is the reducer's current live winner and uses timeline position, not second-precision timestamps, as its control-message watermark |
+| `verify_claim` | `SCRIPT verify-claim --issue <n> --run-id <id> --expect-state <s> [--allow-closed-by-pr <pr>]` | proves the requested run is the reducer's current live winner and uses timeline position, not second-precision timestamps, as its control-message watermark. A closed-issue exception reads every page of closing PRs and accepts only the exact supplied PR; incomplete or malformed pagination is a failed read |
 | `transition` | `SCRIPT transition --issue <n> --to <s> [--from <s>]` | mirrors the board **first**, swaps the label in **one** call, then reads **both** back and repairs a board that disagrees. Omitting `--from` removes whatever stale state labels it finds |
 | `comment` | `SCRIPT comment --issue <n> --body-file <f> [--run-id <id> --kind note\|blocker\|diagnosis]` | file-based body, always; `--run-id` and `--kind` are a pair. Every generic comment gets a non-control marker, and quoted issue-flow markers plus claim-shaped legacy prose are escaped, so generic text cannot become a control event or fall through to the prose parser |
 | `heartbeat` | `SCRIPT heartbeat --issue <n> --run-id <id> --expect-state <s> --body-file <f>` | renewal first, post second; **refuses to post** when the renewal says stop and escapes control-shaped text before appending its own heartbeat marker |
 | branch + worktree | `SCRIPT start-branch --issue <n> --branch <b> --base <base> --run-id <id>` | renews first, fetches before fallback discovery, resumes local or remote-only branch heads without moving them, and creates from the fetched base only when the branch is absent everywhere |
 | `publish_review` | `SCRIPT publish-review --issue <n> --branch <b> --base <base> --run-id <id> --pr-title <t> --pr-body-file <f> [--worktree <p>]` | pushes, **reuses** the single open PR or creates one, refuses on more than one, scans for closing keywords, and records the PR URL with its exact head and base SHAs |
 | `changelog-notes` | `SCRIPT changelog-notes --version <x.y.z> --file <changelog> [--out <f>]` | read-only. Extracts the version's entry for its tag and Release, anchored on the version **opening** the heading. Fails closed on a missing or empty entry — a tag is immutable, so notes invented at tag time are permanent |
-| `check closing keywords` | `SCRIPT check-closing-keywords --issue <n>` | run again before merging: the branch's commit messages can introduce one after the body is already clean |
+| `check closing keywords` | `SCRIPT check-closing-keywords --issue <n>` | run again before merging: the branch's commit messages can introduce one after the body is already clean. Historical merged closers and open PRs for another named branch/base are excluded from the current-delivery verdict |
 | `unassign` | `SCRIPT unassign --issue <n> --runtime <rt> --run-id <id> --operation-id <32-hex> [--target-operation <epoch>] [--held-by-other]` | target discovery is read-only; retries cannot release a later acquisition |
 | board audit | `SCRIPT audit-board [--fix]` | compares every card's column against its own `status:*` label. **Zero cards is reported as a failed read, not a clean board** |
 | `review_status` | *(agent, not scripted)* | `gh pr view <pr> --json headRefOid,baseRefOid,latestReviews,reviewDecision,reviewRequests,mergeStateStatus`. The independent verdict artifact MUST contain `Reviewer-Run: <run-id>`, `Reviewed-Head: <full-head-sha>` and `Reviewed-Base: <full-base-sha>`; re-read both SHAs after review and reject the verdict if either differs. The verdict is mandatory even when every runtime authenticates as the PR author and GitHub cannot supply a distinct native approval |
@@ -557,6 +557,13 @@ moved neither the label nor the board, so skipping leaves a CLOSED issue wearing
 a card parked in the wrong column. `transition` is idempotent, so running it against an
 already-closed issue costs one call. The final `gh issue close` is then a no-op and may report the
 issue as already closed — that is success, not an error.
+
+That is the **final-delivery** path. An intermediate slice of a retained issue must not borrow it:
+record the workflow state that should survive before merging, renew with
+`verify-claim --allow-closed-by-pr <pr>` after the linked PR closes the issue, reopen it with
+`gh issue reopen <n>`, then transition from `review` into that recorded retained state and read it
+back. Never transition an intermediate slice to `done`. A different closer, truncated connection,
+or malformed pagination refuses the renewal, so none of those cases grants permission to reopen.
 
 Two calls means a partial-failure case: if the comment lands but the close errors, the issue is left
 open with its closing note already posted — retry only the bare `gh issue close <n>`, never re-post
