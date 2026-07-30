@@ -44,11 +44,20 @@ Place each implementation checkout outside the base working tree and include the
 in its parent path. A shared parent keyed only by branch can collide across repositories, while an
 in-tree worktree pollutes status and ignore behavior for every run.
 
-The worktree strategy MUST prevent two live runs from writing the same directory. Either make the
-path unique per run or rely on the version-control registration of one common issue branch; under the
-latter strategy, resume only a registered checkout for that exact branch and reject every foreign or
-orphaned directory. Tools with per-checkout indexes or caches get a fresh local instance rather than
-one copied or linked from another checkout.
+The worktree strategy MUST prevent two live runs from writing the same directory, and the path is
+made unique per run. Relying instead on the version-control registration of one common issue branch
+was tried and does not hold: the registration check is a read followed by a write with no lock
+between them, and two `git worktree add` processes have been observed registering one branch
+concurrently. A path that is unique per run does not depend on winning that race.
+
+**Registration is not ownership.** "This path holds this branch" is satisfied equally well by two
+runs of the same branch, so a resume additionally requires durable evidence that THIS run created
+the checkout. Absent evidence is not a permissive default — a registered checkout of your branch
+with nobody's name on it cannot be told apart from one another run is writing into right now. Every
+other case — a foreign checkout, an orphan directory, an unreadable ownership record — stops.
+
+Tools with per-checkout indexes or caches get a fresh local instance rather than one copied or
+linked from another checkout.
 
 Confirm isolation before the first edit and whenever the tree changes unexpectedly. Stop writing and
 renew the claim. A losing run leaves the tree untouched and records where its own work is; the winning

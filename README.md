@@ -264,7 +264,11 @@ left to the agent: a defect in a script must not be able to merge, tag or close 
 
 The script needs Python 3.10 or newer and `gh`. Its exit codes separate "a check said stop" from "the read
 failed" — treating a timeout as a stand-down halts every run, treating it as clearance lets a run
-write deaf, and it never collapses the two.
+write deaf, and it never collapses the two. A third answer is kept apart from both: a configuration
+or template defect exits `2`, because no authority changed hands and retrying after an edit is
+exactly right, where exit `1` means a check read the control surface and it answered stop. A write
+whose outcome could not be established exits `5` — re-read before retrying, never assume it did
+nothing.
 
 ## Configuration
 
@@ -284,8 +288,19 @@ instructions; run `config` afterward to validate the markers and atomically publ
 
 ```sh
 ./install.sh config                                              # print the table
-./install.sh config --set "Worktree location=/wt/<repo>/<branch>"
+./install.sh config --set "Worktree location=/wt/<repo>/<branch>~<run-id>"
 ```
+
+`<run-id>` is what keeps two live runs out of one checkout, so a template without it is completed
+rather than obeyed: `/wt/<repo>/<branch>` is read as `/wt/<repo>/<branch>~<run-id>` **in memory**,
+and your `operator.local.md` is never rewritten. The result reports `template_migrated` so the
+substitution is visible. If a checkout from before run-scoping is still registered at the old path,
+the run stops with preservation guidance rather than quietly starting a sibling beside it — it may
+hold unpushed work.
+
+The join is `~` and not `-` because each half being unambiguous does not make the composition
+unambiguous: branch `fix/6` with run `a-b` and branch `fix/6-a` with run `b` both spell `fix-6-a-b`.
+Git rejects `~` in a ref name and a run ID may not contain one, so the split point is unique.
 
 UTF-8 is canonical. A BOM-marked UTF-16 edit produced by Windows PowerShell 5.1 is accepted by
 `config` and normalized to UTF-8 during publication.

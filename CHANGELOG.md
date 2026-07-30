@@ -2,6 +2,19 @@
 
 All notable changes to Issue Flow are documented here.
 
+## [1.12.3] - 2026-07-30
+
+### Changed
+
+- Bring the public documentation into agreement with the run/worktree isolation that shipped in
+  1.12.1 and 1.12.2. The consolidated repository-delivery guidance no longer offers registration of
+  a common issue branch as an alternative to a per-run path — that alternative depends on winning a
+  race the registration check cannot win — and states that registration is not ownership, so a
+  resume needs durable evidence that this run created the checkout. The migration inventory's
+  worktree row is corrected to match, and the README documents the run-scoped worktree template,
+  the in-memory completion of a branch-only one, why the join is `~`, and the exit code that
+  separates a configuration defect from a lost race and from an ambiguous write.
+
 ## [1.12.2] - 2026-07-30
 
 ### Changed
