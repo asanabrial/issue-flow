@@ -289,10 +289,14 @@ comment.
 
 `gh issue develop <n> --name <branch> --base <base>` creates the branch **server-side, from the fresh
 base, already linked** in the issue's Development sidebar — one command replacing branch creation AND
-recording. `start-branch` uses it, then fetches and resumes an existing local or remote-only branch
-when it fails; only a branch absent everywhere starts from the fetched base. It records branch, base SHA, worktree
-path and holding run-id on the issue either way. A branch nobody can find from the issue is work
-nobody can follow.
+recording. A branch nobody can find from the issue is work nobody can follow.
+
+`start-branch` runs it **last**, not first. It fetches, resumes an existing local or remote-only
+branch without moving it — only a branch absent everywhere starts from the fetched base — creates
+the worktree and records ownership, and only then links the issue. *Nothing is created remotely
+until the local checkout is reserved*, below, is where that order and its reasons live; the summary
+here exists so the sequence is not learned from this paragraph in reverse. It records branch, base
+SHA, worktree path and holding run-id on the issue either way.
 
 The worktree path comes from the `Worktree location` configuration row, with `<repo>`, `<branch>`,
 `<issue>` and `<run-id>` substituted; `<repo>`, `<branch>` and `<issue>` are flattened, so a
@@ -498,9 +502,10 @@ newline bytes is legal and is handled by the NUL-delimited read below; quote pat
 
 A branch-only `Worktree location` gets the in-memory run-scoped sibling described above, and that is
 usually the end of it. The one hard case is a checkout from before run-scoping that is **still
-registered** at the legacy path: it may hold unpushed work, it is not run-scoped so it cannot be
-proven to belong to anybody, and starting a sibling beside it would leave two live checkouts of one
-branch. `start-branch` stops with `legacy-worktree-registered` and neither removes nor writes into
+registered to a branch** at the legacy path: it may hold unpushed work, it is not run-scoped so it
+cannot be proven to belong to anybody, and starting a sibling beside it would leave two live
+checkouts of one branch. (Registered *to a branch* — a legacy checkout left detached carries no
+branch in the registry and does not stop this.) `start-branch` stops with `legacy-worktree-registered` and neither removes nor writes into
 it. Push or preserve its work, `git worktree remove` it, then re-run — steps 1, 2 and 4 above. An
 unregistered leftover directory at the legacy path blocks nothing, because the sibling is a
 different directory.
