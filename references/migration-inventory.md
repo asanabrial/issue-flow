@@ -22,16 +22,16 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | S09 | Role: ANALYST (`SKILL.md:308-322`) | `SKILL.md` | The read-only boundary and one-finding limit remain direct runtime rules. | yes | yes |
 | S10 | Drain analysis and blocked (`SKILL.md:323-365`) | `SKILL.md` | Queue order and analyst tool boundary remain executable steps. | yes | yes |
 | S11 | Autonomous discovery (`SKILL.md:366-384`) | `references/domain-composition.md` | Consolidate the built-in fallback domain contract and deduplication bar. | yes | yes |
-| S12 | What the analyst produces (`SKILL.md:385-436`) | `SKILL.md` | Keep create/blocked instructions at runtime; the body schema moves to the asset. | yes | no |
-| S13 | Role: DEV (`SKILL.md:440-602`) | `SKILL.md` | Preserve resume, claim, build, review, and delivery as the dev execution path. | yes | no |
-| S14 | Repository default flow (`SKILL.md:603-742`) | `references/repository-delivery.md` | Consolidate branching, worktree, integration, review, and cleanup rationale. | yes | no |
-| S15 | Abandoned work (`SKILL.md:743-840`) | `references/safety-incidents.md` | Keep horizon, heartbeat, reclaim, and retention failure modes together. | yes | no |
-| S16 | Work that cannot finish (`SKILL.md:841-921`) | `references/safety-incidents.md` | Consolidate handoff-state rationale while retaining the decision gate in `SKILL.md`. | yes | no |
+| S12 | What the analyst produces (`SKILL.md:385-436`) | `SKILL.md` | Keep create/blocked instructions at runtime; the body schema moves to the asset. | yes | yes |
+| S13 | Role: DEV (`SKILL.md:440-602`) | `SKILL.md` | Preserve resume, claim, build, review, and delivery as the dev execution path. | yes | yes |
+| S14 | Repository default flow (`SKILL.md:603-742`) | `references/repository-delivery.md` | Consolidate branching, worktree, integration, review, and cleanup rationale. | yes | yes |
+| S15 | Abandoned work (`SKILL.md:743-840`) | `references/safety-incidents.md` | Keep horizon, heartbeat, reclaim, and retention failure modes together. | yes | yes |
+| S16 | Work that cannot finish (`SKILL.md:841-921`) | `references/safety-incidents.md` | Consolidate handoff-state rationale while retaining the decision gate in `SKILL.md`. | yes | yes |
 | S17 | State machine (`SKILL.md:922-972`) | `SKILL.md` | State meanings, exclusivity, blockers, and explicit done remain runtime decisions. | yes | yes |
-| S18 | Optional board view (`SKILL.md:973-1006`) | `references/safety-incidents.md` | Preserve authoritative-label and verified-projection rationale once; bindings own mechanics. | yes | no |
+| S18 | Optional board view (`SKILL.md:973-1006`) | `references/safety-incidents.md` | Preserve authoritative-label and verified-projection rationale once; bindings own mechanics. | yes | yes |
 | S19 | In-session agent team (`SKILL.md:1007-1036`) | `references/runtime-notes.md` | Isolate runtime-specific team lifetime and hook behavior. | yes | yes |
 | S20 | Honest limits (`SKILL.md:1037-1065`) | `references/runtime-notes.md` | Keep heuristic, credential, resource, and judgement limits visible as one safety boundary. | yes | yes |
-| S21 | Operator configuration (`SKILL.md:1069-1090`) | `SKILL.md` | Preserve script-readable markers and portable defaults; local overrides remain uncommitted. | no | no |
+| S21 | Operator configuration (`SKILL.md:1069-1090`) | `SKILL.md` | Preserve script-readable markers and portable defaults; local overrides remain uncommitted. `SKILL.md` is both source and final owner, so the block stays byte-for-byte — the installer parses it. | yes | yes |
 
 ## Analyst issue template
 

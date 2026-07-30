@@ -16,6 +16,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -1937,6 +1938,61 @@ with tempfile_module.TemporaryDirectory() as root:
         collapsed = f"this platform refused to create the link: {exc}"
     check("two junctions folding two runs into one checkout are caught by ownership, not by the path",
           collapsed, "worktree-owned-by-another-run")
+
+
+# --------------------------------------------------------------------------------------
+# Runtime-contract boundaries (issue #7). `SKILL.md` is loaded on EVERY invocation, so its
+# structure is a runtime property, not a style preference — and the failure it guards is the one
+# the migration ledger exists for: prose is deleted from the contract and nobody notices that its
+# new owner was never linked, or that a slice was marked retired while its text is still there.
+# --------------------------------------------------------------------------------------
+
+SKILL = (REPO_ROOT / "SKILL.md").read_text(encoding="utf-8")
+SKILL_LINES = SKILL.split("\n")
+INVENTORY = (REPO_ROOT / "references" / "migration-inventory.md").read_text(encoding="utf-8")
+
+front = SKILL.split("---", 2)
+check("the frontmatter declares name, description, licence, author and version",
+      [key in front[1] for key in ("name:", "description:", "license:", "author:", "version:")],
+      [True] * 5)
+
+# The prescribed order, and nothing between the headings that reintroduces a retired section.
+check("the runtime contract keeps the required section order",
+      [line for line in SKILL_LINES if line.startswith("## ")],
+      ["## Activation Contract", "## Hard Rules", "## Decision Gates", "## Execution Steps",
+       "## Output Contract", "## References", "## Operator configuration"])
+
+# Every reference and asset the contract names must exist, and every file that exists must be
+# named — a reference nobody loads is knowledge that was moved out of reach.
+linked = set(re.findall(r"\]\((references/[\w.-]+\.md|assets/[\w.-]+\.md)\)", SKILL))
+on_disk = {f"references/{p.name}" for p in (REPO_ROOT / "references").glob("*.md")} | \
+          {f"assets/{p.name}" for p in (REPO_ROOT / "assets").glob("*.md")}
+check("every companion the contract links exists on disk", sorted(linked - on_disk), [])
+check("every companion on disk is reachable from the contract",
+      sorted(on_disk - linked - {"references/migration-inventory.md"}), [])
+
+# The nine invariants issue #7 requires to stay DIRECTLY actionable in the contract itself.
+for name, needle in [
+    ("analyst repository read-only", "read-only for the repository"),
+    ("at most one finding", "at most one evidenced issue"),
+    ("state exclusivity", "Keep exactly one of"),
+    ("claim verification and renewal", "verify_claim"),
+    ("stale-work recovery", "Reclaimable from"),
+    ("isolated repository work", "isolated checkout"),
+    ("independent SHA-bound review", "every push invalidates both"),
+    ("verified tracker projections", "read back"),
+    ("immutable delivery gates", "annotated tag"),
+]:
+    check(f"the contract still states {name} directly", needle in SKILL, True)
+
+# The ledger and the contract must agree. A row marked retired whose heading is still in SKILL.md
+# is the exact bookkeeping lie the ledger exists to prevent.
+retired_headings = ["What the analyst produces", "Working in a repository", "Abandoned work",
+                    "Where to put work you cannot finish", "Optional: a board view"]
+check("no retired section heading survives in the contract",
+      [h for h in retired_headings if h in SKILL], [])
+check("the migration ledger records every slice as retired",
+      re.findall(r"^\| S\d\d \|.*\| (no) \|\s*$", INVENTORY, re.M), [])
 
 print()
 print(f"{CHECKS - len(FAILURES)}/{CHECKS} checks passed" + (f"; failures: {FAILURES}" if FAILURES else ""))

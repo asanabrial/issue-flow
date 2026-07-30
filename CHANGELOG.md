@@ -2,6 +2,29 @@
 
 All notable changes to Issue Flow are documented here.
 
+## [1.13.0] - 2026-07-30
+
+### Changed
+
+- Complete the runtime-contract migration by retiring the last six duplicated sources from
+  `SKILL.md`, which drops from 526 lines to 112. The analyst body template, the repository default
+  flow, the abandoned-run narrative, the incomplete-work narrative, the board-view rationale and a
+  detailed review gate left standing for this slice were all already copied into
+  `assets/analyst-issue-template.md`, `references/repository-delivery.md` and
+  `references/safety-incidents.md`; each was verified present in its surviving owner before the
+  source was removed. `references/migration-inventory.md` now records every slice as retired.
+- Keep the contract self-sufficient for the decisions a run makes on every activation. What a
+  renewal's stop answer requires, what a failed read forbids, when a holder becomes reclaimable and
+  what a reclaimer must preserve, and when work should be put down are decision gates rather than
+  rationale, so they are stated in `SKILL.md` and their evidence stays in the incident ledger. A
+  `References` section gives each companion an explicit load condition.
+- Add boundary tests for the contract itself: frontmatter completeness, the required section order,
+  that every linked companion exists and every companion on disk is reachable, that the nine
+  invariants issue #7 requires remain directly actionable, that no retired heading reappears, and
+  that the ledger records no unretired slice.
+- Show `references/` and `assets/` in the README layout, since they now own most of the knowledge,
+  and say why the always-loaded contract is short while its companions are not.
+
 ## [1.12.3] - 2026-07-30
 
 ### Changed
