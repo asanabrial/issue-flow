@@ -225,7 +225,8 @@ class Timeout(Exception):
 
 
 def run(args: list[str], cwd: Path | None = None, check: bool = True, writes: bool = False,
-        binary: bool = False, timeout: float | None = None) -> subprocess.CompletedProcess:
+        binary: bool = False, timeout: float | None = None,
+        stdin: str | None = None) -> subprocess.CompletedProcess:
     """Run a command with an argument LIST and no shell.
 
     No shell means no PowerShell backtick expansion, no word splitting, no quoting rules — the
@@ -248,6 +249,9 @@ def run(args: list[str], cwd: Path | None = None, check: bool = True, writes: bo
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             timeout=timeout,
+            # Only ever a value the caller supplies deliberately; `input=None` is exactly the
+            # previous behaviour, so no existing call changes.
+            input=stdin,
             **({} if binary else {"text": True, "encoding": "utf-8", "errors": "replace"}),
         )
     except FileNotFoundError as exc:
@@ -2969,6 +2973,12 @@ def cmd_start_branch(args, config, cwd) -> dict:
         # branch was never built on, and one that would make the coherence check below compare
         # the server's answer against itself.
         base_sha = run(["git", "rev-parse", f"origin/{args.base}"], cwd=cwd).stdout.strip()
+        # The base TREE alongside the base commit. A commit id says which revision was branched
+        # from; the tree says what that revision contained, and it is the tree a later run compares
+        # against when deciding whether the base moved in a way this delivery must integrate.
+        # Recording only the commit makes that comparison a second lookup that can quietly resolve
+        # to a different repository state — or fail, long after the branch marker was written.
+        base_tree = run(["git", "rev-parse", f"{base_sha}^{{tree}}"], cwd=cwd).stdout.strip()
         local_head = ref_object(cwd, f"refs/heads/{args.branch}")
         remote_head = ref_object(cwd, f"refs/remotes/origin/{args.branch}")
         start_point = branch_start_point(
@@ -3022,10 +3032,10 @@ def cmd_start_branch(args, config, cwd) -> dict:
             )
 
         with body_file(
-            f"Branch: `{args.branch}` (base `{args.base}` @ `{base_sha}`)\n"
+            f"Branch: `{args.branch}` (base `{args.base}` @ `{base_sha}`, tree `{base_tree}`)\n"
             f"Worktree: `{path}`\n"
             f"Held by `{args.run_id}`.\n\n"
-            f"{marker('branch', run_id=args.run_id, branch=args.branch, base=base_sha)}\n"
+            f"{marker('branch', run_id=args.run_id, branch=args.branch, base=base_sha, tree=base_tree)}\n"
         ) as note:
             run(["gh", "issue", "comment", str(args.issue), "--body-file", note],
                 cwd=cwd, writes=True)
@@ -3042,6 +3052,7 @@ def cmd_start_branch(args, config, cwd) -> dict:
         "ownership": ownership,
         "head": head,
         "base_sha": base_sha,
+        "base_tree": base_tree,
         "identity": verdict["reason"],
         "reminder": "gitignored files (.env, credentials, local settings) are NOT in a fresh worktree",
     }
@@ -3278,6 +3289,58 @@ def cmd_check_closing_keywords(args, config, cwd) -> dict:
     return result
 
 
+PUBLISH_READBACK_ATTEMPTS = 10
+PUBLISH_READBACK_PAUSE = 3
+
+
+def pr_body_text(path: str, issue: int) -> str:
+    """The PR body, with the safe reference prepended when the file forgot it.
+
+    Written rather than improvised per PR: knowing the rule is demonstrably not enough — `Fixes
+    #<n>` is the muscle-memory opening of a PR body.
+    """
+    body = Path(path).read_text(encoding="utf-8")
+    if f"#{issue}" not in body:
+        body = f"Refs #{issue} — a plain reference, deliberately NOT a closing keyword.\n\n" + body
+    return body
+
+
+def confirm_published(pr: int, expected_head: str, expected_base: str, cwd: Path) -> dict:
+    """Poll until the remote agrees with what was just pushed, or refuse to report success.
+
+    `gh pr list` is served from an index that lags the push, so the head it returns immediately
+    after one can be the PREVIOUS head — and every downstream artefact then binds review and CI to
+    a SHA that is not what shipped. Issue #70: the push landed and the command reported the old
+    head and base, and nothing noticed until the coverage audit.
+
+    So the published SHAs are not taken from the write path at all. They are read back, repeatedly,
+    and success requires exact agreement with the local HEAD and the base this branch was actually
+    cut from. Anything else — a head that never catches up, a base resolved to something else —
+    fails closed, because "probably propagated by now" is the assumption that produced the defect.
+    """
+    seen = None
+    for attempt in range(PUBLISH_READBACK_ATTEMPTS):
+        if attempt:
+            time.sleep(PUBLISH_READBACK_PAUSE)
+        seen = gh_json(["pr", "view", str(pr), "--json", "headRefOid,baseRefOid,state"], cwd=cwd)
+        if not isinstance(seen, dict) or not OBJECT_ID_RE.fullmatch(seen.get("headRefOid") or ""):
+            continue
+        if seen["headRefOid"] == expected_head and seen.get("baseRefOid") == expected_base:
+            return seen
+    raise Stop(
+        {
+            "ok": False,
+            "reason": "publication-readback-disagrees",
+            "pr": pr,
+            "expected_head": expected_head, "expected_base": expected_base,
+            "observed": seen,
+            "action": "the remote never reported the head and base that were just pushed. Do NOT "
+                      "bind review or CI to anything yet: re-read the PR, and if it settled on a "
+                      "different head, someone else pushed and the delivery target has changed",
+        }
+    )
+
+
 def cmd_publish_review(args, config, cwd) -> dict:
     """Push, then reuse-or-create the PR. A resumed issue reuses its existing open PR; creating a
     duplicate is not recovery. Does NOT transition — call `transition --to review` after this, so
@@ -3305,15 +3368,23 @@ def cmd_publish_review(args, config, cwd) -> dict:
     if existing:
         pr = existing[0]
         created = False
+        # A reused PR keeps the title and body it was created with unless they are replaced. A
+        # resumed delivery whose scope changed then advertises the old description over the new
+        # head — the reviewer reads one change and approves another. Issue #70 reproduced exactly
+        # that: the push landed and the supplied title/body were silently discarded.
+        if args.pr_body_file:
+            body = pr_body_text(args.pr_body_file, args.issue)
+            with body_file(body) as path:
+                run(["gh", "pr", "edit", str(pr["number"]), "--title", args.pr_title,
+                     "--body-file", path], cwd=cwd, writes=True)
+        elif args.pr_title:
+            run(["gh", "pr", "edit", str(pr["number"]), "--title", args.pr_title],
+                cwd=cwd, writes=True)
     else:
         if not args.pr_body_file:
             raise Stop({"ok": False, "reason": "missing-pr-body",
                         "action": "pass --pr-body-file for a new PR"})
-        body = Path(args.pr_body_file).read_text(encoding="utf-8")
-        # The safe form, written rather than improvised per PR: knowing the rule is demonstrably
-        # not enough — `Fixes #<n>` is the muscle-memory opening of a PR body.
-        if f"#{args.issue}" not in body:
-            body = f"Refs #{args.issue} — a plain reference, deliberately NOT a closing keyword.\n\n" + body
+        body = pr_body_text(args.pr_body_file, args.issue)
         with body_file(body) as path:
             run(["gh", "pr", "create", "--base", args.base, "--head", args.branch,
                  "--title", args.pr_title, "--body-file", path], cwd=cwd, writes=True)
@@ -3326,6 +3397,19 @@ def cmd_publish_review(args, config, cwd) -> dict:
             raise ReadFailure("the PR was created but is not visible yet")
         pr = fresh[0]
         created = True
+
+    # Everything reported from here on comes from the READ-BACK, never from the write path or the
+    # list that preceded it. `pr` is now only an identifier.
+    local_head = run(["git", "rev-parse", "HEAD"], cwd=worktree).stdout.strip()
+    # Fetch before resolving the base. GitHub's `baseRefOid` is the CURRENT tip of the base branch,
+    # not the commit this branch was cut from, so comparing it against a stale `origin/<base>` fails
+    # on every delivery whose base has advanced — which `references/repository-delivery.md` calls
+    # normal and expects to be left alone. The readback would then blame a phantom pusher.
+    run(["git", "fetch", "origin", "--", args.base], cwd=worktree)
+    expected_base = run(["git", "rev-parse", f"origin/{args.base}^{{commit}}"],
+                        cwd=worktree).stdout.strip()
+    published = confirm_published(pr["number"], local_head, expected_base, cwd)
+    pr = {**pr, "headRefOid": published["headRefOid"], "baseRefOid": published["baseRefOid"]}
 
     verdict = assess_autoclose(args.issue, cwd, args.base, args.branch, pr["number"])
     if verdict["cause"] == "closing-keyword":
@@ -3366,6 +3450,305 @@ def cmd_publish_review(args, config, cwd) -> dict:
             "is not the workflow's close and moves neither the label nor the board"
         )
     return result
+
+
+def cmd_expected_target(args, config, cwd) -> dict:
+    """Emit the COMPLETE intended review target before any reviewer runs, without disturbing it.
+
+    A reviewer authorises a diff. If what they were shown is a subset of what the pull request
+    delivers, their approval is evidence for something that was never reviewed — and nothing
+    downstream can tell, because the approval looks the same either way. Issue #70: the approved
+    lineage covered 12 workspace paths while the PR contained 15, and 35 of 65 final hunks carried
+    no authority at all.
+
+    So the target is derived here, once, from the exact recorded base through `HEAD` **plus** the
+    uncommitted worktree, and reported as a path/mode/blob manifest with a single digest over it.
+    A caller that has its own idea of the review target passes it as `--native-start` and this
+    fails closed on any disagreement, rather than letting the two drift and be reconciled by
+    whoever looks last.
+
+    Strictly read-only: `ls-tree`, `status` and `hash-object` WITHOUT `-w`, so nothing is written
+    to the object store, no ref moves, and the index and worktree are untouched. That matters
+    because this runs before review, on a tree somebody is still working in.
+    """
+    worktree = Path(args.worktree) if args.worktree else cwd
+    base = run(["git", "rev-parse", "--verify", f"{args.base}^{{commit}}"],
+               cwd=worktree).stdout.strip()
+    head = run(["git", "rev-parse", "--verify", "HEAD^{commit}"], cwd=worktree).stdout.strip()
+    for label, oid in (("base", base), ("head", head)):
+        if not OBJECT_ID_RE.fullmatch(oid):
+            raise ReadFailure(f"git did not resolve the {label} to an object id: {oid!r}")
+
+    # Every path below is repository-root relative, because that is what `ls-tree --full-tree` and
+    # `status --porcelain` both emit — regardless of which directory the command was run from.
+    # Joining them onto `--worktree` silently mislocates every file when that is a SUBDIRECTORY,
+    # and the hash then fails, and the overlay reads that failure as "the file was deleted": the
+    # target quietly shrinks and reports success. Resolve against the top level instead.
+    top = Path(run(["git", "rev-parse", "--show-toplevel"], cwd=worktree).stdout.strip())
+
+    listing = run(["git", "ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+                  cwd=worktree, binary=True).stdout.decode("utf-8", "surrogateescape")
+    if listing and not listing.endswith("\0"):
+        raise ReadFailure("git ls-tree ended mid-entry")
+    committed = tree_manifest(listing.split("\0")[:-1] if listing else [])
+
+    # `--no-optional-locks` because a plain `git status` refreshes and REWRITES `.git/index` and
+    # takes `index.lock` to do it. This command's whole promise is that it can be run against a
+    # tree somebody is still working in, and taking their index lock breaks that promise for the
+    # sake of a cache update nobody asked for.
+    status_out = run(["git", "--no-optional-locks", "status", "--porcelain=v1", "-z",
+                      "--untracked-files=all"],
+                     cwd=worktree, binary=True).stdout.decode("utf-8", "surrogateescape")
+    status, fields = [], status_out.split("\0")[:-1] if status_out else []
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        if len(entry) < 4:
+            raise ReadFailure(f"unreadable git status entry {entry!r}")
+        code, path = entry[:2], entry[3:]
+        if code[0] in "RC":
+            # A rename reports the destination first and the SOURCE in the next NUL field. The
+            # source is a deletion from the delivered tree and must not be left standing.
+            index += 1
+            if index >= len(fields):
+                raise ReadFailure("git status reported a rename with no source path")
+            status.append(("D ", fields[index]))
+        status.append((code, path))
+        index += 1
+
+    # Does this filesystem carry an executable bit at all? Git answers for itself, and on Windows
+    # the answer is no. `os.access(X_OK)` cannot decide it: on Windows it returns True for EVERY
+    # existing file — measured on a plain `.md` — so inferring from it reports `100755` for every
+    # overlaid path, makes the digest disagree with the same tree checked out on Linux, and turns
+    # a cross-platform review into a guaranteed false mismatch.
+    file_mode = run(["git", "config", "--get", "core.fileMode"], cwd=worktree,
+                    check=False).stdout.strip().lower()
+    honours_exec_bit = file_mode != "false" and os.name != "nt"
+
+    def blob_of(path: str):
+        entry = top / path
+        if not entry.is_symlink() and not entry.exists():
+            return None
+        if entry.is_symlink():
+            # Hash the LINK TEXT, which is what git stores behind mode 120000. `hash-object` on
+            # the path follows the link and records the blob of whatever it points at — a
+            # different object, and one that changes when the target changes rather than the link.
+            link = run(["git", "hash-object", "--stdin"], cwd=worktree, check=False,
+                       stdin=os.readlink(entry))
+            oid = link.stdout.strip()
+            if link.returncode != 0 or not OBJECT_ID_RE.fullmatch(oid):
+                raise ReadFailure(f"could not hash the symlink {path!r}")
+            return ("120000", oid)
+        probe = run(["git", "hash-object", "--", str(entry)], cwd=worktree, check=False)
+        oid = probe.stdout.strip()
+        if probe.returncode != 0 or not OBJECT_ID_RE.fullmatch(oid):
+            raise ReadFailure(f"could not hash {path!r}: {probe.stderr.strip()}")
+        if honours_exec_bit:
+            return ("100755" if os.access(entry, os.X_OK) else "100644", oid)
+        # No executable bit to read, so keep whatever the committed tree recorded: a file that is
+        # 100755 in the repository stays 100755 rather than being downgraded by the filesystem it
+        # happens to be checked out on.
+        return (committed.get(path, ("100644", None))[0], oid)
+
+    target = overlay_worktree(committed, status, blob_of)
+    digest = manifest_digest(target)
+    result = {
+        "ok": True, "base": base, "head": head, "digest": digest,
+        "paths": len(target),
+        "uncommitted": sorted({path for _, path in status}),
+        "manifest": [{"path": path, "mode": mode, "blob": blob}
+                     for path, (mode, blob) in sorted(target.items())],
+    }
+
+    if args.native_start:
+        supplied = json.loads(Path(args.native_start).read_text(encoding="utf-8"))
+        entries = supplied.get("manifest") if isinstance(supplied, dict) else supplied
+        if not isinstance(entries, list):
+            raise ReadFailure("the supplied native-start target has no manifest list")
+        try:
+            claimed = {e["path"]: (e["mode"], e["blob"]) for e in entries}
+        except (TypeError, KeyError) as exc:
+            raise ReadFailure(f"a supplied manifest entry is malformed: {exc}") from exc
+        missing = sorted(set(target) - set(claimed))
+        extra = sorted(set(claimed) - set(target))
+        differing = sorted(p for p in set(target) & set(claimed) if target[p] != claimed[p])
+        if missing or extra or differing:
+            raise Stop(
+                {
+                    "ok": False,
+                    "reason": "review-target-mismatch",
+                    "base": base, "head": head,
+                    "expected_digest": digest,
+                    "supplied_digest": manifest_digest(claimed),
+                    "unreviewed": missing, "not_delivered": extra, "differing": differing,
+                    "action": "the target the reviewer was given is not the target this branch "
+                              "delivers. `unreviewed` paths would ship without authority. Rebuild "
+                              "the review over the complete target; do not proceed on the "
+                              "difference being small",
+                }
+            )
+        result["native_start"] = "matches"
+    return result
+
+
+def cmd_base_movement(args, config, cwd) -> dict:
+    """Report what moving the base would mean for this delivery. Evidence, never a verdict.
+
+    The operator policy forbids merging the base branch as a routine step: it rewrites the review
+    target, invalidates a head that review and CI are already bound to, and is usually unnecessary.
+    What it does require is CLASSIFYING later movement — and the classification needs facts a
+    script can establish exactly (which refs, which paths, whether a merge conflicts) rather than
+    an impression.
+
+    `git merge-tree --write-tree` performs the merge without touching the index, the worktree or
+    any branch; its exit status reports conflicts. It is not, however, side-effect free, and saying
+    so plainly matters because an adversarial reviewer is repository read-only: it writes the merged
+    tree into the object store, and this command fetches first, which updates remote-tracking refs.
+    Neither changes a branch, the index or a file, so nothing a run is working on moves — but
+    "read-only" here means *does not modify the delivery*, not *writes nothing at all*.
+
+    Semantic impact — two disjoint files that must change together — is not visible to any merge
+    algorithm, so this says so and leaves that judgement with the caller instead of implying
+    textual cleanliness settles it.
+
+    `--write-tree` needs git 2.38. Below that the merge cannot be established and the answer is
+    `unknown`, which integrates rather than assuming compatibility.
+    """
+    worktree = Path(args.worktree) if args.worktree else cwd
+    run(["git", "fetch", "origin"], cwd=worktree)
+    current = run(["git", "rev-parse", "--verify", f"origin/{args.base}^{{commit}}"],
+                  cwd=worktree).stdout.strip()
+    head = run(["git", "rev-parse", "--verify", "HEAD^{commit}"], cwd=worktree).stdout.strip()
+    recorded = args.recorded_base
+
+    def changed(a: str, b: str) -> set[str]:
+        out = run(["git", "diff", "--name-only", "-z", f"{a}..{b}"],
+                  cwd=worktree, binary=True).stdout.decode("utf-8", "surrogateescape")
+        return {p for p in out.split("\0") if p}
+
+    moved = changed(recorded, current) if recorded != current else set()
+    target_paths = changed(recorded, head)
+
+    conflicted = None
+    if recorded != current:
+        merge = run(["git", "merge-tree", "--write-tree", "--no-messages", head, current],
+                    cwd=worktree, check=False)
+        if merge.returncode == 0:
+            conflicted = False
+        elif merge.returncode == 1:
+            conflicted = True                        # a real, reported conflict
+        # any other status leaves it None: the merge did not answer, which is not "compatible"
+
+    verdict = classify_base_movement(recorded=recorded, current=current, moved_paths=moved,
+                                     target_paths=target_paths, conflicted=conflicted)
+    return {
+        "ok": True, "recorded_base": recorded, "current_base": current, "head": head,
+        "moved_paths": sorted(moved), "target_paths": sorted(target_paths),
+        "conflict": conflicted, **verdict,
+        "semantic_impact": "not decided here — disjoint paths and a clean merge are evidence, not "
+                           "proof that the change still means what it did",
+    }
+
+
+def tree_manifest(lines: list[str]) -> dict[str, tuple[str, str]]:
+    """`{path: (mode, blob)}` from `git ls-tree -r -z` output. Pure, so its edge cases are testable.
+
+    Mode is carried, not just content: a file that becomes executable, or a regular file replaced
+    by a symlink, changes what is delivered while every byte of content stays identical. A manifest
+    that recorded only blobs would call that no change at all.
+    """
+    manifest = {}
+    for line in lines:
+        if not line:
+            continue
+        meta, _, path = line.partition("\t")
+        fields = meta.split()
+        if not path or len(fields) != 3 or fields[1] != "blob":
+            raise ReadFailure(f"unreadable tree entry {line!r}")
+        if path in manifest:
+            raise ReadFailure(f"the tree listed {path!r} twice")
+        manifest[path] = (fields[0], fields[2])
+    if not manifest:
+        raise ReadFailure("the tree listed no entries; an empty answer is not a delivery target")
+    return manifest
+
+
+def overlay_worktree(manifest: dict, status: list[tuple[str, str]],
+                     blob_of) -> dict[str, tuple[str, str]]:
+    """Apply uncommitted worktree changes onto a committed manifest.
+
+    The review target is `base..HEAD` PLUS whatever is still uncommitted, because that is what a
+    reviewer is being asked to authorise. Reviewing only the committed prefix, or only the dirty
+    suffix, both authorise something other than the delivery — issue #70 approved 12 paths of a
+    15-path PR exactly that way.
+
+    `status` is `(code, path)` pairs from `git status --porcelain=v1 -z`, already decoded. `blob_of`
+    hashes a working-tree path and reports its mode, so this stays pure and the hashing stays in
+    the caller that owns the filesystem.
+    """
+    overlaid = dict(manifest)
+    for code, path in status:
+        if not path:
+            raise ReadFailure("git status reported a change with no path")
+        if code.strip() in {"D", "DD", "AD"} or code.startswith("D") and code[1] in " D":
+            overlaid.pop(path, None)
+            continue
+        if "?" in code or set(code.strip()) & set("MARCUT"):
+            entry = blob_of(path)
+            if entry is None:                       # vanished between the status and the hash
+                overlaid.pop(path, None)
+            else:
+                overlaid[path] = entry
+            continue
+        raise ReadFailure(f"unclassified git status code {code!r} for {path!r}")
+    return overlaid
+
+
+def manifest_digest(manifest: dict[str, tuple[str, str]]) -> str:
+    """One identity for a delivery target, stable across machines and independent of order.
+
+    A digest rather than the manifest itself, because it is what a caller can compare in one
+    equality without agreeing on JSON key order or line endings. It covers path, mode and blob, so
+    it changes for a content edit, a mode flip, a rename and a deletion alike — including binary
+    content, which no textual diff summary represents faithfully.
+    """
+    payload = "\n".join(f"{mode} {blob} {path}"
+                        for path, (mode, blob) in sorted(manifest.items()))
+    return hashlib.sha256(payload.encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def classify_base_movement(*, recorded: str, current: str, moved_paths: set[str],
+                            target_paths: set[str], conflicted: bool | None) -> dict:
+    """Did the base move in a way this delivery must integrate before review?
+
+    Pure and fed answers, because the states it separates are races that no test can reproduce by
+    calling git. The distinction the operator policy turns on:
+
+    * the base did not move — nothing to decide;
+    * it moved, but every path it touched is disjoint from the delivery target AND a read-only
+      merge reports no conflict — compatible, so the candidate branch is left ALONE. Merging
+      `main` routinely is what the policy forbids: it rewrites the review target for no reason and
+      invalidates evidence already bound to the old head;
+    * it moved and touched paths this delivery also touches, or the merge conflicts — material, so
+      it is integrated before final review.
+
+    `conflicted=None` means the merge could not be established, and that is never "compatible".
+    Textual disjointness is not semantic compatibility either: this reports the evidence and says
+    so, and the judgement stays with the caller.
+    """
+    if recorded == current:
+        return {"movement": "none", "integrate": False}
+    overlap = sorted(moved_paths & target_paths)
+    if conflicted is None:
+        return {"movement": "unknown", "integrate": True, "overlap": overlap,
+                "detail": "the merge result could not be established"}
+    if conflicted:
+        return {"movement": "conflicting", "integrate": True, "overlap": overlap}
+    if overlap:
+        return {"movement": "overlapping", "integrate": True, "overlap": overlap}
+    return {"movement": "compatible", "integrate": False, "overlap": [],
+            "detail": "disjoint paths and a conflict-free merge; semantic impact is the caller's "
+                      "judgement, and this is evidence rather than a verdict"}
 
 
 def changelog_section(text: str, version: str) -> tuple[str, str] | None:
@@ -3841,6 +4224,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("audit-board", help="compare every card's column against its own status label")
     p.add_argument("--fix", action="store_true", help="repair the drift this pass finds")
 
+    p = sub.add_parser("expected-target",
+                       help="emit the complete intended review target; read-only")
+    p.add_argument("--base", required=True, help="the exact recorded base commit or ref")
+    p.add_argument("--worktree", help="the checkout to inspect; defaults to --repo-dir")
+    p.add_argument("--native-start",
+                   help="a manifest a reviewer was given; any disagreement fails closed")
+
+    p = sub.add_parser("base-movement",
+                       help="classify later base movement against this delivery; read-only")
+    p.add_argument("--base", required=True, help="the base BRANCH name, e.g. main")
+    p.add_argument("--recorded-base", required=True,
+                   help="the exact base commit start-branch recorded")
+    p.add_argument("--worktree", help="the checkout to inspect; defaults to --repo-dir")
+
     return parser
 
 
@@ -3861,6 +4258,8 @@ COMMANDS = {
     "changelog-notes": cmd_changelog_notes,
     "check-closing-keywords": cmd_check_closing_keywords,
     "audit-board": cmd_audit_board,
+    "expected-target": cmd_expected_target,
+    "base-movement": cmd_base_movement,
 }
 
 

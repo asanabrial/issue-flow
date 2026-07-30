@@ -1262,24 +1262,41 @@ with patch.object(m, "assess_autoclose", side_effect=fake_assess):
         SimpleNamespace(issue=7, base="main", branch="fix/current"), {}, Path("."))
 check("standalone autoclose checks do not invent a current PR", assessed_prs, [None])
 
+PUB_HEAD, PUB_BASE, PUB_STALE = "e" * 40, "f" * 40, "9" * 40
+# `pr list` deliberately answers with the PREVIOUS head, which is what GitHub's index actually
+# serves immediately after a push. Trusting it is the #70 defect; only the readback is current.
 published_pr = {
     "number": 28,
     "url": "https://example/28",
-    "headRefOid": "head",
-    "baseRefOid": "base",
+    "headRefOid": PUB_STALE,
+    "baseRefOid": PUB_BASE,
 }
+
+
+def fake_publish_json(argv, cwd=None):
+    return {"headRefOid": PUB_HEAD, "baseRefOid": PUB_BASE, "state": "OPEN"}         if argv[:2] == ["pr", "view"] else [published_pr]
+
+
+def fake_publish_run(argv, cwd=None, **_kwargs):
+    stdout = PUB_HEAD if argv[:3] == ["git", "rev-parse", "HEAD"] else (
+        PUB_BASE if argv[:2] == ["git", "rev-parse"] else "")
+    return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+
 with patch.multiple(
         m,
         do_verify_claim=lambda *_args: {},
-        gh_json=lambda *_args, **_kwargs: [published_pr],
-        run=lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        gh_json=fake_publish_json,
+        run=fake_publish_run,
         assess_autoclose=fake_assess,
 ):
-    m.cmd_publish_review(SimpleNamespace(
+    published = m.cmd_publish_review(SimpleNamespace(
         issue=28, run_id="owner", expect_state="in-progress", worktree=None,
         branch="fix/current", base="main", pr_body_file=None, pr_title=None,
     ), {}, Path("."))
 check("publish-review assesses only its exact PR", assessed_prs[-1], 28)
+check("publish-review reports the SHAs it read back, not the ones it was handed",
+      (published["head"], published["base"]), (PUB_HEAD, PUB_BASE))
 
 read_failed_closed = False
 try:
@@ -2098,6 +2115,249 @@ check("every ledger table holds exactly the rows the migration accounted for", s
       {"Current sections": ids("S", 21), "Analyst issue template": ids("T", 7),
        "Named incidents and failure cases": sorted(ids("I", 11) + ids("X", 10)),
        "Invariant families": ids("K", 39)})
+
+
+# --------------------------------------------------------------------------------------
+# Review target and base movement (issue #12). Investora #70: a native review covered 12
+# workspace paths while the PR delivered 15, and 35 of 65 final hunks carried no authority —
+# and `publish-review` reported the PREVIOUS head after a successful push, so the receipt named
+# a revision that was never the delivery.
+# --------------------------------------------------------------------------------------
+
+BLOB = {name: name * 8 for name in ("aa", "bb", "cc", "dd")}
+
+
+def tree(*entries):
+    return [f"{mode} blob {BLOB[b]}\t{path}" for mode, b, path in entries]
+
+
+check("a committed tree becomes a path/mode/blob manifest",
+      m.tree_manifest(tree(("100644", "aa", "src/a.py"), ("100755", "bb", "run.sh"))),
+      {"src/a.py": ("100644", BLOB["aa"]), "run.sh": ("100755", BLOB["bb"])})
+check("an empty tree is a failed read, not an empty delivery target",
+      refused(lambda: m.tree_manifest([])), "ReadFailure")
+check("a malformed or duplicated tree entry is refused",
+      [refused(lambda: m.tree_manifest(["100644 blob deadbeef"])),
+       refused(lambda: m.tree_manifest(tree(("100644", "aa", "x")) + tree(("100644", "bb", "x")))),
+       refused(lambda: m.tree_manifest(["040000 tree abc\tsub"]))],
+      ["ReadFailure"] * 3)
+
+# The overlay is the whole point: base..HEAD PLUS the dirty worktree is what ships.
+committed = m.tree_manifest(tree(("100644", "aa", "keep.py"), ("100644", "bb", "edit.py"),
+                                 ("100644", "cc", "gone.py")))
+overlay = {"edit.py": ("100644", BLOB["dd"]), "new.py": ("100644", BLOB["dd"]),
+           "mode.py": ("100755", BLOB["aa"])}
+check("uncommitted edits, additions and deletions all reach the target",
+      m.overlay_worktree(committed, [(" M", "edit.py"), ("??", "new.py"), (" D", "gone.py")],
+                         lambda p: overlay.get(p)),
+      {"keep.py": ("100644", BLOB["aa"]), "edit.py": ("100644", BLOB["dd"]),
+       "new.py": ("100644", BLOB["dd"])})
+check("a file that vanished between the status and the hash leaves the target",
+      "gone.py" in m.overlay_worktree(committed, [("??", "gone.py")], lambda p: None), False)
+check("an unclassified status code is refused rather than guessed",
+      refused(lambda: m.overlay_worktree(committed, [("!!", "x.py")], lambda p: None)),
+      "ReadFailure")
+check("a status entry with no path is refused",
+      refused(lambda: m.overlay_worktree(committed, [(" M", "")], lambda p: None)), "ReadFailure")
+
+# A mode flip changes what is delivered while every content byte stays identical.
+check("the digest covers mode, not only content",
+      m.manifest_digest({"a": ("100644", BLOB["aa"])})
+      == m.manifest_digest({"a": ("100755", BLOB["aa"])}), False)
+check("the digest is independent of insertion order",
+      m.manifest_digest({"a": ("100644", BLOB["aa"]), "b": ("100644", BLOB["bb"])})
+      == m.manifest_digest({"b": ("100644", BLOB["bb"]), "a": ("100644", BLOB["aa"])}), True)
+check("the digest changes when a path is renamed",
+      m.manifest_digest({"a": ("100644", BLOB["aa"])})
+      == m.manifest_digest({"b": ("100644", BLOB["aa"])}), False)
+
+# Base movement. Disjoint-and-clean leaves the branch alone; anything else integrates first.
+check("a base that did not move decides nothing",
+      m.classify_base_movement(recorded="a" * 40, current="a" * 40, moved_paths=set(),
+                               target_paths={"x"}, conflicted=None),
+      {"movement": "none", "integrate": False})
+check("disjoint paths and a clean merge leave the candidate branch untouched",
+      m.classify_base_movement(recorded="a" * 40, current="b" * 40, moved_paths={"docs/x"},
+                               target_paths={"src/y"}, conflicted=False)["integrate"], False)
+check("paths this delivery also touches must be integrated before final review",
+      m.classify_base_movement(recorded="a" * 40, current="b" * 40, moved_paths={"src/y"},
+                               target_paths={"src/y"}, conflicted=False),
+      {"movement": "overlapping", "integrate": True, "overlap": ["src/y"]})
+check("a conflicting merge must be integrated even with disjoint paths",
+      m.classify_base_movement(recorded="a" * 40, current="b" * 40, moved_paths={"docs/x"},
+                               target_paths={"src/y"}, conflicted=True)["movement"], "conflicting")
+check("a merge whose result could not be established is never compatible",
+      m.classify_base_movement(recorded="a" * 40, current="b" * 40, moved_paths=set(),
+                               target_paths=set(), conflicted=None),
+      {"movement": "unknown", "integrate": True, "overlap": [],
+       "detail": "the merge result could not be established"})
+
+# The readback. `pr list` is served from an index that lags the push, so the head it returns
+# immediately afterwards can be the previous one — which is how #70's receipt named a revision
+# that was never the delivery.
+HEAD_A, HEAD_B, BASE = "a" * 40, "b" * 40, "c" * 40
+
+
+def views(*answers):
+    seen = iter(answers)
+    return lambda argv, cwd=None: next(seen, answers[-1])
+
+
+with patch.multiple(m, gh_json=views({"headRefOid": HEAD_B, "baseRefOid": BASE, "state": "OPEN"}),
+                    time=SimpleNamespace(sleep=lambda _s: None)):
+    check("a readback that already agrees is accepted",
+          m.confirm_published(7, HEAD_B, BASE, Path("."))["headRefOid"], HEAD_B)
+with patch.multiple(m, gh_json=views({"headRefOid": HEAD_A, "baseRefOid": BASE, "state": "OPEN"},
+                                     {"headRefOid": HEAD_B, "baseRefOid": BASE, "state": "OPEN"}),
+                    time=SimpleNamespace(sleep=lambda _s: None)):
+    check("a stale head is polled until the remote catches up",
+          m.confirm_published(7, HEAD_B, BASE, Path("."))["headRefOid"], HEAD_B)
+with patch.multiple(m, gh_json=views({"headRefOid": HEAD_A, "baseRefOid": BASE, "state": "OPEN"}),
+                    time=SimpleNamespace(sleep=lambda _s: None)):
+    check("a head that never catches up is refused, not reported",
+          refused(lambda: m.confirm_published(7, HEAD_B, BASE, Path("."))),
+          "publication-readback-disagrees")
+with patch.multiple(m, gh_json=views({"headRefOid": HEAD_B, "baseRefOid": HEAD_A, "state": "OPEN"}),
+                    time=SimpleNamespace(sleep=lambda _s: None)):
+    check("a base resolved to something else is refused even when the head matches",
+          refused(lambda: m.confirm_published(7, HEAD_B, BASE, Path("."))),
+          "publication-readback-disagrees")
+with patch.multiple(m, gh_json=views(None, {"headRefOid": HEAD_B, "baseRefOid": BASE}),
+                    time=SimpleNamespace(sleep=lambda _s: None)):
+    check("an unreadable answer is retried rather than believed",
+          m.confirm_published(7, HEAD_B, BASE, Path("."))["headRefOid"], HEAD_B)
+
+
+# A real repository, because the pure functions above can only prove what their fixtures assert.
+# `expected-target` reads a live tree, a live `git status` and live worktree files, and the shape
+# git actually emits — NUL framing, rename pairs, mode bits — is exactly what no fixture can stand
+# in for. Skips itself, visibly, where git cannot be run.
+
+NL = chr(10)
+
+
+def git(*argv, cwd):
+    done = __import__("subprocess").run(["git", *argv], cwd=cwd, capture_output=True, text=True)
+    if done.returncode != 0:
+        raise RuntimeError(f"git {' '.join(argv)} -> {done.stderr.strip()}")
+    return done.stdout.strip()
+
+
+def build_repo(root: Path):
+    git("init", "-q", "-b", "main", str(root), cwd=root.parent)
+    git("config", "user.email", "t@example", cwd=root)
+    git("config", "user.name", "t", cwd=root)
+    (root / "keep.py").write_text("keep" + NL, encoding="utf-8")
+    (root / "edit.py").write_text("before" + NL, encoding="utf-8")
+    (root / "gone.py").write_text("gone" + NL, encoding="utf-8")
+    (root / "moved.py").write_text("moved" + NL, encoding="utf-8")
+    git("add", "-A", cwd=root)
+    git("commit", "-qm", "base", cwd=root)
+    return git("rev-parse", "HEAD", cwd=root)
+
+
+with tempfile_module.TemporaryDirectory() as area:
+    live = Path(area) / "repo"
+    live.mkdir()
+    try:
+        base_sha = build_repo(live)
+        # A committed commit on top of the base, then a dirty worktree over that: the two halves
+        # #70 reviewed separately. The complete target is both.
+        (live / "added.py").write_text("added" + NL, encoding="utf-8")
+        git("add", "-A", cwd=live)
+        git("commit", "-qm", "committed prefix", cwd=live)
+        (live / "edit.py").write_text("after" + NL, encoding="utf-8")
+        (live / "gone.py").unlink()
+        (live / "untracked.py").write_text("new" + NL, encoding="utf-8")
+        git("mv", "moved.py", "renamed.py", cwd=live)
+        args = SimpleNamespace(base=base_sha, worktree=str(live), native_start=None)
+        target = m.cmd_expected_target(args, {}, live)
+        paths = {e["path"] for e in target["manifest"]}
+        live_ok = True
+    except (RuntimeError, OSError) as exc:
+        target, paths, live_ok = None, set(), f"git was unavailable: {exc}"
+
+    check("the target spans the committed prefix and the dirty overlay together",
+          paths if live_ok is True else live_ok,
+          {"keep.py", "edit.py", "added.py", "untracked.py", "renamed.py"})
+    check("a renamed path leaves its source behind",
+          ("moved.py" not in paths, "renamed.py" in paths) if live_ok is True else live_ok,
+          (True, True))
+    check("an uncommitted edit reaches the manifest as the WORKTREE content",
+          ([e["blob"] for e in target["manifest"] if e["path"] == "edit.py"]
+           == [git("hash-object", "edit.py", cwd=live)]) if live_ok is True else live_ok, True)
+
+    if live_ok is True:
+        # A reviewer handed the committed prefix only — exactly #70 — must fail closed.
+        prefix = [e for e in target["manifest"] if e["path"] in {"keep.py", "added.py"}]
+        supplied = Path(area) / "native-start.json"
+        supplied.write_text(json.dumps({"manifest": prefix}), encoding="utf-8")
+        under_scoped = refused(lambda: m.cmd_expected_target(
+            SimpleNamespace(base=base_sha, worktree=str(live), native_start=str(supplied)),
+            {}, live))
+        matching = Path(area) / "full.json"
+        matching.write_text(json.dumps({"manifest": target["manifest"]}), encoding="utf-8")
+        agrees = m.cmd_expected_target(
+            SimpleNamespace(base=base_sha, worktree=str(live), native_start=str(matching)),
+            {}, live)["native_start"]
+        # A mode flip alone, with every content byte identical.
+        flipped = [dict(e, mode="100755") if e["path"] == "keep.py" else e
+                   for e in target["manifest"]]
+        mode_file = Path(area) / "mode.json"
+        mode_file.write_text(json.dumps({"manifest": flipped}), encoding="utf-8")
+        mode_only = refused(lambda: m.cmd_expected_target(
+            SimpleNamespace(base=base_sha, worktree=str(live), native_start=str(mode_file)),
+            {}, live))
+    else:
+        under_scoped = agrees = mode_only = live_ok
+
+    # Run from a SUBDIRECTORY. `ls-tree` and `status` both emit repository-root-relative paths
+    # whatever directory they were run from, so joining them onto the passed worktree mislocates
+    # every file — the hash then fails, and the overlay reads that failure as "deleted". The target
+    # silently shrinks and still reports success, which is the #70 shape produced by the fix for it.
+    if live_ok is True:
+        (live / "sub").mkdir(exist_ok=True)
+        (live / "sub" / "deep.py").write_text("deep" + NL, encoding="utf-8")
+        git("add", "-A", cwd=live)
+        git("commit", "-qm", "a subdirectory", cwd=live)
+        (live / "sub" / "deep.py").write_text("deeper" + NL, encoding="utf-8")
+        from_sub = m.cmd_expected_target(
+            SimpleNamespace(base=base_sha, worktree=str(live / "sub"), native_start=None),
+            {}, live / "sub")
+        sub_paths = {e["path"] for e in from_sub["manifest"]}
+        # Every mode must be a real git mode, and on a filesystem with no executable bit nothing
+        # may be reported 100755 that the committed tree did not already record that way.
+        modes = {e["mode"] for e in from_sub["manifest"]}
+        subdir_ok = ("sub/deep.py" in sub_paths, sorted(modes))
+    else:
+        subdir_ok = live_ok
+
+    check("running from a subdirectory does not silently drop paths from the target",
+          subdir_ok, (True, ["100644"]))
+
+    # The command promises it can be run against a tree somebody is still working in. A plain
+    # `git status` refreshes and REWRITES `.git/index` and takes `index.lock` to do it, which
+    # breaks that promise for a cache update nobody asked for. Measured, not asserted in prose.
+    if live_ok is True:
+        index = live / ".git" / "index"
+        # Make the index STALE first: a tracked file whose mtime moved but whose content did not is
+        # exactly what makes `git status` refresh and rewrite the cache. Against a freshly written
+        # index there is nothing to refresh, and the check would pass without testing anything.
+        keep = live / "keep.py"
+        os.utime(keep, (os.path.getatime(keep) + 120, os.path.getmtime(keep) + 120))
+        before = index.read_bytes() if index.exists() else None
+        m.cmd_expected_target(
+            SimpleNamespace(base=base_sha, worktree=str(live), native_start=None), {}, live)
+        after = index.read_bytes() if index.exists() else None
+        untouched = before == after
+    else:
+        untouched = live_ok
+    check("deriving the target leaves the index byte-for-byte alone", untouched, True)
+
+    check("a review over the committed prefix alone cannot authorise the delivery",
+          under_scoped, "review-target-mismatch")
+    check("a review over the complete target is accepted", agrees, "matches")
+    check("a mode flip alone is a mismatch", mode_only, "review-target-mismatch")
 
 print()
 print(f"{CHECKS - len(FAILURES)}/{CHECKS} checks passed" + (f"; failures: {FAILURES}" if FAILURES else ""))

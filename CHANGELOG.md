@@ -2,6 +2,50 @@
 
 All notable changes to Issue Flow are documented here.
 
+## [1.14.0] - 2026-07-31
+
+### Added
+
+- `expected-target`, a read-only operation that emits the COMPLETE intended review target — the
+  exact recorded base through `HEAD` plus the uncommitted worktree — as a path/mode/blob manifest
+  with one digest over it. Given a reviewer's own target with `--native-start` it fails closed on
+  any disagreement, naming the paths that would otherwise ship without authority. Mode is part of
+  the identity, so a file becoming executable or replaced by a symlink is a change even when every
+  content byte is identical — and where the filesystem carries no executable bit, the committed
+  mode is kept rather than inferred from a permission check that answers "yes" to everything.
+  Symlinks are hashed as their link text, which is what mode 120000 stores. It writes no object and
+  leaves the index, worktree and refs untouched, including `--no-optional-locks` so that reading a
+  status does not take the index lock of a tree somebody is still working in.
+- `base-movement`, a read-only operation that classifies later base movement as none, compatible,
+  overlapping, conflicting or unknown, from exact refs, changed paths and `git merge-tree
+  --write-tree` (git 2.38 or newer; below that the answer is `unknown`). It touches no index,
+  worktree or branch, though it does fetch and does write the merged tree into the object store.
+  An unestablished merge is never compatible, and semantic impact is reported as the caller's
+  judgement rather than settled by textual disjointness.
+
+### Fixed
+
+- `publish-review` now applies the supplied title and body when it REUSES an existing pull request.
+  A resumed delivery whose scope changed previously advertised the old description over the new
+  head, so the reviewer read one change and approved another.
+- `publish-review` reads the published head and base back from the remote, polling until they agree
+  with what was pushed, instead of reporting what the pre-push listing returned. That listing is
+  served from an index that lags the push, so it can answer with the previous head — binding review
+  and CI to a revision that was never the delivery. A head that never catches up, or a base that
+  resolved elsewhere, now fails closed.
+
+### Changed
+
+- `start-branch` records the base TREE alongside the base commit. The commit says which revision
+  was branched from; the tree says what it contained, as durable evidence in the marker and the
+  readback. Nothing consumes it yet — `base-movement` classifies from commits — and it is recorded
+  now so that later checks have it without re-deriving it from a repository that may have moved.
+- Document the default transport behaviour and name `~/.agents/AGENTS.md` as the canonical operator
+  override when it exists, without copying its text: review the whole delivery rather than the half
+  in front of you, branch from an exact fetched base, and classify later movement instead of
+  merging the base as a routine step, which rewrites the review target and invalidates evidence
+  already bound to the old head.
+
 ## [1.13.0] - 2026-07-30
 
 ### Changed
