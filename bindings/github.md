@@ -50,6 +50,13 @@ when a read failed; a write may have landed in the instant before the failure su
 blindly duplicates it. `4` exists because without it an unhandled exception exits `1` with a
 traceback and no JSON — indistinguishable from a deliberate STOP, with no `action` to follow.
 
+`2` is not a lesser `1`, and the boundary between them is about AUTHORITY. Exit `1` says a check
+read the control surface and it answered stop; the instruction that follows is "do not retry". A
+malformed worktree template, a run ID that cannot name a directory, a missing `Worktree location`
+answer none of that — no authority changed hands, nothing was attempted, and a retry after fixing
+the configuration is exactly the right move. Reporting one as the other costs a run its work in the
+direction that matters: told it lost a race, it stands down and abandons a claim it still holds.
+
 **What is deliberately NOT scripted**: `merge`, `publish_version`, `close`, and the interpretation of
 `review_status` / `ci_status`. Those write irreversibly to the remote or require a verdict, and a
 defect in a script must not be able to merge, tag or close anything. The agent performs them itself,
@@ -171,7 +178,7 @@ Every ownership write uses a fresh lowercase 32-hex `--operation-id`, reused unc
 | `transition` | `SCRIPT transition --issue <n> --to <s> [--from <s>]` | mirrors the board **first**, swaps the label in **one** call, then reads **both** back and repairs a board that disagrees. Omitting `--from` removes whatever stale state labels it finds |
 | `comment` | `SCRIPT comment --issue <n> --body-file <f> [--run-id <id> --kind note\|blocker\|diagnosis]` | file-based body, always; `--run-id` and `--kind` are a pair. Every generic comment gets a non-control marker, and quoted issue-flow markers plus claim-shaped legacy prose are escaped, so generic text cannot become a control event or fall through to the prose parser |
 | `heartbeat` | `SCRIPT heartbeat --issue <n> --run-id <id> --expect-state <s> --body-file <f>` | renewal first, post second; **refuses to post** when the renewal says stop and escapes control-shaped text before appending its own heartbeat marker |
-| branch + worktree | `SCRIPT start-branch --issue <n> --branch <b> --base <base> --run-id <id>` | renews first, fetches before fallback discovery, resumes local or remote-only branch heads without moving them, and creates from the fetched base only when the branch is absent everywhere. The local worktree registry is read NUL-delimited and fails closed: a failed, truncated or contradictory read is a failed read, never an empty registry |
+| branch + worktree | `SCRIPT start-branch --issue <n> --branch <b> --base <base> --run-id <id>` | renews first, then serializes on a branch-scoped lock and reserves the whole local checkout **before any GitHub mutation**, so a lost reservation leaves no remote state. Resumes only a checkout whose durable ownership marker names this run; a branch-only template gains a run-scoped sibling in memory without rewriting `operator.local.md`. Ref existence is probed so absence and a failed read are different answers, a nonzero or timed-out `gh issue develop` is re-read rather than believed, and local head, published head and recorded base must agree before success is reported. The local worktree registry is read NUL-delimited and fails closed: a failed, truncated or contradictory read is a failed read, never an empty registry |
 | `publish_review` | `SCRIPT publish-review --issue <n> --branch <b> --base <base> --run-id <id> --pr-title <t> --pr-body-file <f> [--worktree <p>]` | pushes, **reuses** the single open PR or creates one, refuses on more than one, scans for closing keywords, and records the PR URL with its exact head and base SHAs |
 | `changelog-notes` | `SCRIPT changelog-notes --version <x.y.z> --file <changelog> [--out <f>]` | read-only. Extracts the version's entry for its tag and Release, anchored on the version **opening** the heading. Fails closed on a missing or empty entry — a tag is immutable, so notes invented at tag time are permanent |
 | `check closing keywords` | `SCRIPT check-closing-keywords --issue <n>` | run again before merging: the branch's commit messages can introduce one after the body is already clean. Historical merged closers and open PRs for another named branch/base are excluded from the current-delivery verdict |
@@ -244,6 +251,13 @@ not know it happened. Run the transition afterwards and the end state is correct
 `check-closing-keywords` and `publish-review` report the cause, not just the symptom: a keyword is a
 hard stop (exit `1`), a branch link is reported with the follow-up it mandates and does not block.
 
+**An issue that is not finished when its PR merges is a separate case**, because the auto-close does
+not care whether the delivery was the whole issue or one slice of it. Marking a partly-delivered
+parent `done` because GitHub closed it is the failure; the continuation model — a verified renewal
+under `--allow-closed-by-pr`, an explicit reopen, and a transition back into the state that should
+survive — is in *Closing* below. Nothing there is a shortcut around this section: it exists so a
+retained issue can outlive its own merge without ever being reported as delivered.
+
 **Write this, so the wording is not improvised per PR.** Knowing the rule is demonstrably not enough
 — `Fixes #<n>` is the muscle-memory opening of a PR body, and a run reaches for it while composing
 the caveat that forbids it. Seen live (2026-07-25, PR #97): the first line read, verbatim,
@@ -281,28 +295,147 @@ path and holding run-id on the issue either way. A branch nobody can find from t
 nobody can follow.
 
 The worktree path comes from the `Worktree location` configuration row, with `<repo>`, `<branch>`,
-`<issue>` and `<run-id>` substituted; every component is flattened, so a `docs/113-…` branch does not
-create a stray `docs/` directory under the worktree root.
+`<issue>` and `<run-id>` substituted; `<repo>`, `<branch>` and `<issue>` are flattened, so a
+`docs/113-…` branch does not create a stray `docs/` directory under the worktree root.
 
-**What the path must guarantee is that no two live runs share a directory** — not that it contains
-any particular token. Two templates achieve that differently, and the choice is a real trade:
+**`<run-id>` is the one value that is validated instead of flattened**, and the difference is the
+whole isolation guarantee. Flattening is not injective: `a/b` and `a-b` are two distinct valid run
+IDs that flatten onto ONE directory, and the run that arrives second finds a registered worktree
+carrying its own branch at its own path — the exact shape of a legitimate resume. So a run ID must
+already be a safe directory name and is refused otherwise: lowercase `a-z0-9` groups joined by
+single `-`, nothing else. Each exclusion is a collapse rather than tidiness — separators restructure
+the path, uppercase folds into lowercase on Windows and macOS so isolation would depend on the
+filesystem, and Windows silently strips trailing dots and spaces so `run-a.` and `run-a` are one
+directory to the OS and two keys to us. Reserved device names (`con`, `nul`, `com1`…) are refused in
+**every** substituted component, because they name a device rather than a directory in any case and
+with any extension.
 
-| Template | Collision is prevented by | Cost |
-|---|---|---|
-| `…/<branch>-<run-id>` | construction — no two runs ever compute the same path | one orphan directory per run that dies; they accumulate |
-| `…/<branch>` | git itself — `worktree add` refuses a branch already checked out elsewhere (`fatal: '<branch>' is already used by worktree at …`) | needs the resume check below to be correct |
+**What the path must guarantee is that no two live runs share a directory.** Every template is now
+made to carry that guarantee: one without `<run-id>` is migrated **in memory** to a run-scoped
+sibling — `…/<branch>` becomes `…/<branch>-<run-id>` — and `operator.local.md` is never rewritten. A
+transport command that silently edits the operator's own policy file is a worse failure than the one
+it fixes, and that file may be shared across machines where the migration is not wanted. The result
+reports `template_migrated` so the substitution is visible rather than assumed.
 
-The second is safe only because the branch carries the issue number, so two runs on one issue compute
-the same BRANCH and git blocks the second checkout. It was NOT safe in the original convention, where
-the path was derived from the issue while the branch varied — that is how, on 2026-07-24, two runs
-derived the same directory and the loser wrote its model, its migration and its tests into the
-winner's checkout mid-build.
+A sibling and not a child (`…/<branch>/<run-id>`), so that a legacy checkout is neither a parent nor
+a child of the new one — runs colliding inside a directory another run owns is the entire defect.
 
-**So `start-branch` asks whether the directory is YOURS, not whether it exists.** A registered
-worktree for this exact branch is a resume: it is reused and reported as `resumed_existing_worktree`.
-Anything else — a stranger's checkout, or an orphan left by a dead run — is refused, because writing
-into either is the failure above. Merely refusing every existing path would make resume impossible
-under a run-id-free template while protecting against nothing git had not already caught.
+Relying on git to catch the collision instead was tried and does not hold. `worktree add` refuses a
+branch already checked out elsewhere (`fatal: '<branch>' is already used by worktree at …`), but that
+is a read followed by a write with no lock between them: the review probe for issue #31 produced two
+successful concurrent worktrees for one branch on Git 2.55.0.windows.3. Git loses the race its check
+exists to win, so `start-branch` serializes on its own **branch-scoped lock** first (below). The
+2026-07-24 incident — two runs deriving one directory, the loser writing its model, its migration and
+its tests into the winner's checkout mid-build — is what a lost race costs.
+
+**So `start-branch` asks whether the directory is YOURS, and requires proof.** "The registry says
+this path holds this branch" is not proof: two runs of one branch satisfy it equally well, which is
+how the second one checks out on top of the first. So the registry answers only half, and a durable
+**ownership marker**, written by the run that created the checkout into that worktree's private git
+admin directory, answers the other half. It lives there rather than in the working tree because a
+marker that shows up in every `git status` is a marker people delete, and `git worktree remove`
+clears it along with everything else about the checkout, so a clean removal cannot leave a stale
+claim behind.
+
+Four outcomes, and only one of them proceeds:
+
+| What is at the path | Outcome |
+|---|---|
+| nothing | fresh checkout |
+| a registered worktree for this branch, marker names THIS run | `resumed_existing_worktree` |
+| a registered worktree for this branch, marker names another run | stop — it may hold unpushed work |
+| a registered worktree for this branch, **no marker** | stop — `worktree-ownership-unproven` |
+| anything else (stranger's checkout, orphan directory) | stop — `worktree-path-occupied` |
+
+The fourth row is the one worth defending: an unproven claim is not a permissive default. A
+registered checkout of your branch with no marker cannot be told apart from one a run is using right
+now, and the recovery for it is documented below rather than guessed at.
+
+A worktree directory that is itself a symlink or junction is refused as a configuration defect, since
+two run IDs pointing into one real directory defeats every rule above. An *ancestor* being a link —
+a worktree root parked on another volume, `/tmp` on macOS — is ordinary and is resolved rather than
+refused: it redirects every run's directory identically, so it cannot fold two runs together.
+
+### Nothing is created remotely until the local checkout is reserved
+
+The order of operations inside `start-branch` is a guarantee, not an implementation detail. The
+branch lock, the path decision, the local branch, the worktree and the ownership marker all happen
+**before** the first call that mutates GitHub. Reversed — which is how it worked until issue #31 —
+a run created a server-side branch and a sidebar link, then stopped on the local check, leaving
+remote state advertising work no checkout was ever made for.
+
+Once local isolation is reserved, `gh issue develop` runs. A **nonzero exit from it is not an
+answer.** It mutates two remote things at once, a ref and a link, and its failures are not one
+thing: "a branch of that name already exists" (the ordinary resume, where the link may well be
+present), a partial failure that created the ref and not the link, and a connection that dropped
+after the server had committed both. The exit code cannot tell them apart, and in the last two
+"not linked" is simply false. So a nonzero exit and a timeout are treated identically — **re-read
+the Development sidebar** and let the read decide:
+
+| Re-read says | Outcome |
+|---|---|
+| the branch is linked | success, `link_outcome: already-linked` |
+| conclusively not linked, and the command exited nonzero | proceed without a native link |
+| conclusively not linked, after a **timeout** | ambiguous write, exit `5` — a ref may exist right now |
+| the read itself failed | exit `3`; after a timeout, exit `5` |
+
+Existence probes follow the same rule. `git rev-parse --verify --quiet` was used before and cannot
+answer the question: it exits `1` for "no such ref" AND for a corrupt object store, an unreadable
+`.git`, a broken packed-refs file — every way the question can go unanswered. `git for-each-ref`
+separates them, because a successful exit with no output is a real absence and anything else is a
+read that did not answer. A run that reads "absent" from a failed read creates the branch again from
+the base, and a resumed branch silently restarts from zero.
+
+Finally, **a successful native creation must tell one story.** `gh issue develop` branches from the
+base as the SERVER sees it, which is not necessarily the base this run fetched and recorded. If the
+base moved in between, the branch starts at a commit the run never saw while the command reports the
+recorded base as its own — and every later `Reviewed-Base:` claim inherits that. So a fresh creation
+requires local head, published head and recorded base to be equal, and a resume requires the
+published head to be reachable from the local head. Local ahead of remote is ordinary unpushed work;
+remote ahead of local means somebody else pushed and continuing would build on a head this checkout
+has never seen. An ancestry that could not be established is not a pass.
+
+### Recovering a worktree or a branch lock
+
+Every stop above names a directory or a lock and refuses to touch it. That is deliberate — the thing
+being refused may hold work nobody has pushed — so the recovery is yours, in this order. It is the
+same on Windows and POSIX except where noted.
+
+1. **Look before deciding anything.** `git -C <path> status --short --branch` and
+   `git -C <path> log --oneline @{u}.. ` show uncommitted and unpushed work. `git worktree list`
+   shows what the clone thinks it owns; the lock file named in the stop payload shows who claimed
+   the branch, when, and from which host and PID.
+2. **Preserve anything useful first.** Commit and push to the branch, or `git -C <path> stash create`
+   and note the object, or simply copy the directory aside. Nothing below is reversible.
+3. **Prove the holder is stopped — do not infer it from elapsed time.** The lock records `pid` and
+   `host`. On the same host, `Get-Process -Id <pid>` (PowerShell) or `ps -p <pid>` (POSIX) answers
+   it; on a different host you need that host. A lock with no live process behind it is stale; a
+   lock whose process is running is not, no matter how old it looks. **This is why nothing here
+   expires on a timeout**: the case a timeout gets wrong is a slow-but-live run whose checkout is
+   taken while it is writing into it, which is the corruption all of this exists to prevent.
+4. **Remove the checkout cleanly.** `git worktree remove <path>` (add `--force` only when step 2 is
+   done and you accept the loss), then `git worktree prune`. Deleting the directory by hand leaves a
+   registry entry that keeps refusing the path; `prune` is what clears that.
+5. **Remove a proven-stale lock** by deleting the file named in the stop payload. It is a plain JSON
+   file under `<common-git-dir>/issue-flow/branch-locks/`. Only after step 3.
+6. **Re-run `start-branch` unchanged.** It is idempotent: it re-reads everything and either creates
+   the checkout or tells you what still refuses it. A lock naming your OWN run is your own retry and
+   never blocks you.
+
+Windows: `git worktree remove` fails while any process holds a handle in the directory — an editor,
+a terminal, an antivirus scan. Close them rather than forcing. POSIX: a worktree whose path contains
+newline bytes is legal and is handled by the NUL-delimited read below; quote paths in the shell.
+
+### Migrating a branch-only worktree
+
+A branch-only `Worktree location` gets the in-memory run-scoped sibling described above, and that is
+usually the end of it. The one hard case is a checkout from before run-scoping that is **still
+registered** at the legacy path: it may hold unpushed work, it is not run-scoped so it cannot be
+proven to belong to anybody, and starting a sibling beside it would leave two live checkouts of one
+branch. `start-branch` stops with `legacy-worktree-registered` and neither removes nor writes into
+it. Push or preserve its work, `git worktree remove` it, then re-run — steps 1, 2 and 4 above. An
+unregistered leftover directory at the legacy path blocks nothing, because the sibling is a
+different directory.
 
 **"Not registered" and "the registry could not be read" are different answers, and only one of them
 is a clearance.** That question is answered by `git worktree list`, so how it is read decides

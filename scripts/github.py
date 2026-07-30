@@ -192,12 +192,39 @@ class Stop(Exception):
         self.payload = payload
 
 
+class ConfigDefect(Stop):
+    """The operator's configuration or a substituted template value is wrong. Exit `2`, not `1`.
+
+    Exit `1` means a check READ the control surface and it answered stop — a lost race, a
+    stand-down, the wrong state. The instruction that follows is "do not retry, follow the
+    action". A malformed worktree template answers none of that: no authority changed hands and
+    nothing was attempted, so a retry after fixing the config is exactly right.
+
+    Collapsing the two costs a run its work in the direction that matters. A run told "you lost
+    the race" for what is really a typo in `operator.local.md` stands down and abandons a claim it
+    still holds; the same call re-run after an edit would have succeeded.
+
+    Subclassing `Stop` rather than standing alone keeps the payload contract identical — one JSON
+    object with a `reason` and an `action` — so only the exit code differs, which is the only
+    thing that should.
+    """
+
+
 # ---------------------------------------------------------------------------
 # process plumbing
 # ---------------------------------------------------------------------------
 
-def run(args: list[str], cwd: Path | None = None, check: bool = True,
-        writes: bool = False, binary: bool = False) -> subprocess.CompletedProcess:
+class Timeout(Exception):
+    """A command did not finish. Whether that is a read or a write problem is the caller's to say.
+
+    Deliberately not folded into `ReadFailure`/`WriteFailure`: a timeout on a mutating command is
+    the one outcome where neither "retry" nor "it did not happen" is safe to assume, and the
+    caller is the only layer that knows which command it launched and how to re-read its effect.
+    """
+
+
+def run(args: list[str], cwd: Path | None = None, check: bool = True, writes: bool = False,
+        binary: bool = False, timeout: float | None = None) -> subprocess.CompletedProcess:
     """Run a command with an argument LIST and no shell.
 
     No shell means no PowerShell backtick expansion, no word splitting, no quoting rules — the
@@ -219,10 +246,13 @@ def run(args: list[str], cwd: Path | None = None, check: bool = True,
             args,
             cwd=str(cwd) if cwd else None,
             capture_output=True,
+            timeout=timeout,
             **({} if binary else {"text": True, "encoding": "utf-8", "errors": "replace"}),
         )
     except FileNotFoundError as exc:
         raise ReadFailure(f"{args[0]} not found on PATH: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise Timeout(f"{' '.join(args[:3])} did not finish within {timeout}s") from exc
     if check and proc.returncode != 0:
         stderr = proc.stderr.decode("utf-8", "replace") if binary else proc.stderr
         detail = f"{' '.join(args[:3])} failed ({proc.returncode}): {stderr.strip()}"
@@ -2078,40 +2108,175 @@ def cmd_heartbeat(args, config, cwd) -> dict:
     return {"ok": True, "issue": args.issue, "renewed": verdict["checked"], "posted": True}
 
 
+# Reserved DOS device names. Windows resolves any path component spelled like one of these — in
+# any case, with or without an extension — to a device rather than to a file, so two run IDs that
+# differ only in a way that lands on `con` do not name two directories; they name one device.
+WINDOWS_DEVICE_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{digit}" for digit in range(1, 10)]
+    + [f"lpt{digit}" for digit in range(1, 10)]
+)
+
+# The alphabet a run ID may use. Lowercase by construction, because the identity that separates two
+# checkouts has to survive a filesystem that folds case — see `run_component`.
+RUN_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
+def run_component(run_id: str) -> str:
+    """Validate a run ID as a directory component, returning it UNCHANGED, or refuse it.
+
+    The point is that it returns the value unchanged. Every other substituted value is flattened —
+    `/` becomes `-` — and flattening is not injective: `a/b` and `a-b` are two distinct valid run
+    IDs that flatten onto one directory, and the run that arrives second finds a registered
+    worktree carrying its own branch at its own path and concludes it is resuming its own work.
+    Path uniqueness is the run ID's whole job here, so the run ID is the one value that may not be
+    transformed into another value's spelling. It is validated instead, and the identity map on a
+    restricted alphabet is injective by construction.
+
+    What the alphabet excludes, and why each exclusion is a real collapse rather than tidiness:
+
+    * separators (`/`, `\\`) — would restructure the path instead of naming one directory;
+    * uppercase — Windows and macOS fold case, so `Run-A` and `run-a` are one directory there and
+      two on Linux. Accepting both spellings would make isolation depend on the filesystem;
+    * `.` in any position — `..` traverses, a leading dot hides, and Windows silently strips
+      trailing dots, so `run-a.` and `run-a` are the same directory to the OS and different keys
+      to us. Forbidding the character outright is one rule instead of three;
+    * whitespace and every other punctuation mark — Windows also strips trailing spaces, and the
+      rest buys nothing that `-` does not;
+    * empty, and leading/trailing/doubled `-` — these are not collapses but they are unreadable,
+      and an alphabet with no degenerate spellings is easier to prove injective than to argue.
+
+    Reserved device names are rejected separately, by `assert_safe_component`, because they apply
+    to every component of the path and not only to this one.
+    """
+    text = str(run_id)
+    if not RUN_ID_RE.fullmatch(text):
+        raise ConfigDefect(
+            {
+                "ok": False,
+                "reason": "unsafe-run-id",
+                "run_id": text,
+                "action": "a run ID must be lowercase `a-z0-9` groups joined by single `-`; it "
+                          "names a directory that must not collide with another run's, and any "
+                          "transformation that could fold two distinct IDs into one is refused "
+                          "rather than applied",
+            }
+        )
+    assert_safe_component(text, "run-id")
+    return text
+
+
+def assert_safe_component(value: str, kind: str) -> None:
+    """Refuse a path component that does not name a plain directory on every supported platform."""
+    if value.lower() in WINDOWS_DEVICE_NAMES:
+        raise ConfigDefect(
+            {
+                "ok": False,
+                "reason": "reserved-device-component",
+                "component": value,
+                "kind": kind,
+                "action": f"`{value}` is a reserved Windows device name in any case, so it names "
+                          "a device rather than a directory — choose another value",
+            }
+        )
+
+
+def run_scoped_template(template: str) -> tuple[str, bool]:
+    """Return a template that carries `<run-id>`, and whether one had to be added.
+
+    A branch-only template — `<root>/<repo>/<branch>`, which is what the README has always shown —
+    gives every run of a branch the SAME directory. That is not a stale default to reject: it is
+    persisted operator policy, it is already in use, and a run that stops dead on it has lost work
+    to protect against losing work. So it is migrated IN MEMORY to a run-scoped sibling, and
+    `operator.local.md` is never rewritten: a transport command that silently edits the operator's
+    own policy file is a worse failure than the one it fixes, and the operator may be sharing that
+    file across machines where the migration is not wanted.
+
+    A sibling rather than a nested child (`<branch>/<run-id>`) so that the legacy directory, if it
+    exists, stays exactly where it is and is neither a parent of nor a child of the new one. Runs
+    that collide inside a directory another run owns is the whole defect; making the new path a
+    descendant of the old one would reproduce it.
+    """
+    if "<run-id>" in template:
+        return template, False
+    return template.rstrip("/\\") + "-<run-id>", True
+
+
 def worktree_path(template: str, repo: str, branch: str, run_id: str, issue: int) -> Path:
     """Resolve the configured worktree template.
 
-    Every substituted value is flattened, not just the branch. The branch is the one that carries
-    a `/` in normal use, but the reason — a separator in a substituted value silently restructures
-    the path instead of naming a directory — applies identically to the run-id, and applying it to
-    only one of them is the inconsistency that becomes a traversal later. `..` segments are
-    rejected outright for the same reason.
+    Every substituted value except the run ID is flattened, not just the branch. The branch is the
+    one that carries a `/` in normal use, but the reason — a separator in a substituted value
+    silently restructures the path instead of naming a directory — applies identically to the
+    repository name and the issue number. `..` segments are rejected outright for the same reason.
+    The run ID is the exception and `run_component` says why.
 
-    Path uniqueness comes from the run-id, and `cmd_start_branch` refuses a path that already
-    exists. Why that is not paranoia — the 2026-07-24 collision — is told once, in
+    Path uniqueness comes from the run-id, and `cmd_start_branch` refuses a path it cannot prove
+    belongs to this run. Why that is not paranoia — the 2026-07-24 collision — is told once, in
     `bindings/github.md` under *Branch, worktree and the linked issue*. It is deliberately NOT
     retold here: an incident narrated in three files goes stale in two of them.
     """
-    def flatten(value: str) -> str:
+    def flatten(value: str, kind: str) -> str:
         cleaned = re.sub(r"[/\\]+", "-", str(value)).strip()
         if not cleaned or cleaned != cleaned.replace("..", ""):
-            raise Stop(
+            raise ConfigDefect(
                 {
                     "ok": False,
                     "reason": "unsafe-worktree-component",
                     "component": str(value),
+                    "kind": kind,
                     "action": "a worktree path component may not be empty or contain `..`",
                 }
             )
+        assert_safe_component(cleaned, kind)
         return cleaned
 
     resolved = (
-        template.replace("<repo>", flatten(repo))
-        .replace("<branch>", flatten(branch))
-        .replace("<run-id>", flatten(run_id))
-        .replace("<issue>", flatten(issue))
+        template.replace("<repo>", flatten(repo, "repo"))
+        .replace("<branch>", flatten(branch, "branch"))
+        .replace("<run-id>", run_component(run_id))
+        .replace("<issue>", flatten(issue, "issue"))
     )
     return Path(resolved)
+
+
+def canonical_worktree_path(path: Path) -> Path:
+    """One real spelling for the run's directory, and a refusal when the directory itself is a link.
+
+    Two separate jobs, because the two kinds of link are not the same problem.
+
+    An ANCESTOR that is a symlink or a junction is ordinary — a worktree root parked on another
+    volume, `/tmp` on macOS. It redirects every run's directory identically, so it cannot fold two
+    run IDs together, and refusing it would break working setups for nothing. It is resolved
+    instead, so that the registry lookup, `git worktree add` and the ownership marker all speak of
+    one spelling rather than three.
+
+    The LEAF being a link is the collapse this issue names. `run-b`'s directory pointing at
+    `run-a`'s is two distinct valid run IDs resolving to one canonical directory, and no amount of
+    resolution fixes it: whichever run arrives second is standing in the first one's checkout.
+    That is refused. The ownership marker would catch it a moment later, but "your own template
+    aliases somebody else's directory" is a configuration defect and deserves to be reported as
+    one, at the point where nothing has been created yet.
+
+    Isolating the leaf from its ancestors is the whole trick: resolve the parent, re-attach the
+    name, and compare against resolving the path as a whole. They differ exactly when the last
+    component redirects on its own account.
+    """
+    parent_real = Path(os.path.realpath(path.parent))
+    canonical = parent_real / path.name
+    if not same_location(os.path.realpath(path), canonical):
+        raise ConfigDefect(
+            {
+                "ok": False,
+                "reason": "aliased-worktree-path",
+                "path": str(path),
+                "resolves_to": os.path.realpath(path),
+                "action": "this run's worktree directory is itself a symlink or junction pointing "
+                          "somewhere else, so two distinct run IDs can land in one real directory. "
+                          "Remove the link, or point the worktree template at a real directory tree",
+            }
+        )
+    return canonical
 
 
 def normalise_path(path) -> str:
@@ -2130,6 +2295,21 @@ def normalise_path(path) -> str:
     except OSError:
         text = str(path).replace("\\", "/").rstrip("/")
     return text.lower() if os.name == "nt" else text
+
+
+def same_location(left, right) -> bool:
+    """Do two already-spelled paths name the same place, WITHOUT resolving either?
+
+    `normalise_path` resolves, which is right for asking "who owns this directory" and wrong for
+    asking "does resolving change the answer" — resolving both sides of that question makes it
+    unanswerable. So this one normalises separators and trailing slashes only, and folds case
+    exactly where the filesystem does, for the same reason `normalise_path` does.
+    """
+    def spell(value) -> str:
+        text = str(value).replace("\\", "/").rstrip("/")
+        return text.lower() if os.name == "nt" else text
+
+    return spell(left) == spell(right)
 
 
 def branch_start_point(*, exists_local: bool, exists_remote: bool, branch: str, base: str) -> str | None:
@@ -2162,6 +2342,242 @@ def branch_start_point(*, exists_local: bool, exists_remote: bool, branch: str, 
     if exists_local:
         return None
     return f"origin/{branch}" if exists_remote else f"origin/{base}"
+
+
+OBJECT_ID_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def ref_object(cwd: Path, ref: str) -> str | None:
+    """The object a ref points at, `None` if the ref does not exist, or a failed read.
+
+    NOT `git rev-parse --verify --quiet`, which was here before and cannot answer this question:
+    it exits `1` for "no such ref" AND for a corrupt object store, an unreadable `.git`, a broken
+    packed-refs file — every way the question can go unanswered. A run that reads "absent" from a
+    failed read creates the branch again from the base, and a resumed branch silently restarts
+    from zero.
+
+    `for-each-ref` separates the two: a successful exit with no output is a real absence, a
+    successful exit with one object id is a real presence, and anything else — a nonzero exit,
+    several lines, an unparseable id — is a read that did not answer.
+
+    `--end-of-options` closes option parsing, so a ref pattern beginning with `-` is a pattern and
+    not a flag. Nothing upstream validates branch names.
+
+    Takes a FULL ref path. `for-each-ref` iterates the ref namespace, so `HEAD` and the other
+    pseudo-refs are outside what it can see and would be reported as absent — which is the one
+    wrong answer this function exists to avoid. Every caller passes `refs/heads/…` or
+    `refs/remotes/…`; the current checkout's head comes from `git rev-parse HEAD` instead.
+    """
+    proc = run(["git", "for-each-ref", "--format=%(objectname)", "--end-of-options", ref],
+               cwd=cwd, check=False)
+    if proc.returncode != 0:
+        raise ReadFailure(f"git for-each-ref {ref} failed ({proc.returncode}): {proc.stderr.strip()}")
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    if len(lines) > 1 or not OBJECT_ID_RE.fullmatch(lines[0].strip()):
+        raise ReadFailure(f"git for-each-ref {ref} answered ambiguously: {lines!r}")
+    return lines[0].strip()
+
+
+def branch_identity_verdict(*, fresh: bool, local: str | None, remote: str | None,
+                            base: str | None, remote_reachable_from_local: bool | None) -> dict:
+    """Are the local head, the remote branch head and the recorded base one coherent story?
+
+    Pure, and fed answers rather than asked to obtain them, for the same reason
+    `branch_start_point` is: the failure it guards is a RACE, and a race cannot be reproduced by
+    calling the real thing in a test. Every branch below is a state some concurrent writer can
+    actually produce.
+
+    A FRESH native creation is the strict case. `gh issue develop` branches from the base as the
+    SERVER sees it, which is not necessarily the base this run fetched and recorded. If the base
+    moved in between, the remote branch starts at a commit the run never saw, and reporting the
+    recorded base as this branch's base is a lie that outlives the command — every later
+    "reviewed-base" claim inherits it. So fresh requires local == remote == base, exactly.
+
+    A RESUME is looser in one direction only. Local ahead of remote is ordinary unpushed work.
+    Remote ahead of local is not: it means someone else pushed to this branch, and continuing would
+    build on a head this checkout has never seen. `remote_reachable_from_local` carries the
+    ancestry answer; `None` means it could not be established, which is not a pass.
+    """
+    if remote is None:
+        # Nothing was published, so there is nothing for local to disagree with. A branch that
+        # exists only locally is a legitimate state; it is `publish-review` that ends it.
+        return {"coherent": True, "reason": "local-only"}
+    if fresh:
+        if local == remote == base and base is not None:
+            return {"coherent": True, "reason": "fresh-at-base"}
+        return {
+            "coherent": False,
+            "reason": "base-moved-during-creation" if local == base else "fresh-branch-diverged",
+        }
+    if local == remote:
+        return {"coherent": True, "reason": "resumed-in-sync"}
+    if remote_reachable_from_local is True:
+        return {"coherent": True, "reason": "resumed-local-ahead"}
+    return {
+        "coherent": False,
+        "reason": "remote-ahead-of-local" if remote_reachable_from_local is False
+                  else "ancestry-unknown",
+    }
+
+
+def common_git_dir(cwd: Path) -> Path:
+    """The clone's shared admin directory — the one place every worktree of it can agree on.
+
+    `--git-dir` inside a linked worktree answers that worktree's private directory, which is
+    exactly the wrong scope for a lock meant to serialize DIFFERENT worktrees of one clone.
+    """
+    text = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+               cwd=cwd).stdout.strip()
+    if not text:
+        raise ReadFailure("git did not report a common git directory")
+    return Path(text)
+
+
+def branch_lock_path(cwd: Path, branch: str) -> Path:
+    """One lock file per branch, named by digest rather than by the branch itself.
+
+    A branch name may contain `/`, and it may differ from another branch only in case — both of
+    which turn a name-derived filename into either a nested path or a collision. A digest has one
+    length, one alphabet and no separators, and the branch is recorded INSIDE the file for anyone
+    reading it, so nothing is lost by not spelling it in the name.
+    """
+    digest = hashlib.sha256(branch.encode("utf-8")).hexdigest()[:32]
+    return common_git_dir(cwd) / "issue-flow" / "branch-locks" / f"{digest}.json"
+
+
+@contextlib.contextmanager
+def branch_reservation(cwd: Path, branch: str, run_id: str, issue: int):
+    """Serialize `start-branch` for one branch within one clone, and never break a lock on a guess.
+
+    Two `git worktree add` processes CAN both register the same branch: the review probe for this
+    issue produced exactly that on Git 2.55.0.windows.3, two successful concurrent worktrees for
+    one branch. Git's own "already used by worktree at" check is a read followed by a write with no
+    lock between them, so it loses the race it exists to win.
+
+    `O_CREAT | O_EXCL` is the whole mechanism. It is one atomic filesystem operation on both
+    platforms, so exactly one of two concurrent runs creates the file and the other gets `EEXIST` —
+    there is no window to lose because there is no separate read.
+
+    **Stale locks are never broken on a timeout.** A timeout is a guess about a process nobody
+    looked at, and the case it guesses wrong is the expensive one: a slow-but-live run gets its
+    checkout taken while it is writing into it, which is the corruption this whole issue exists to
+    prevent. So a held lock STOPS, reports who holds it and where, and points at the recovery
+    procedure that requires proving the holder is gone. The one exception needs no proof about
+    anyone else: a lock naming THIS run is this run's own retry.
+    """
+    lock = branch_lock_path(cwd, branch)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "run_id": run_id,
+        "issue": issue,
+        "branch": branch,
+        "host": os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or "",
+        "pid": os.getpid(),
+        "acquired_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    held = False
+    try:
+        handle = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        existing = read_lock_record(lock)
+        if existing.get("run_id") != run_id:
+            raise Stop(
+                {
+                    "ok": False,
+                    "reason": "branch-locked-by-another-run",
+                    "branch": branch,
+                    "lock": str(lock),
+                    "held_by": existing,
+                    "action": "another start-branch holds this branch. Wait for it, or follow "
+                              "*Recovering a worktree or a branch lock* in bindings/github.md — "
+                              "which requires PROVING the holder's process is stopped before the "
+                              "lock is removed. Never delete it on an assumption about elapsed time",
+                }
+            ) from None
+    except OSError as exc:
+        raise WriteFailure(f"could not create the branch lock {lock}: {exc}") from exc
+    else:
+        held = True
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(record, stream, indent=2)
+    try:
+        yield lock
+    finally:
+        # Only the acquirer removes it. A run that found its OWN stale lock and proceeded keeps it
+        # in place for the run that is still using it, if there is one.
+        if held:
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+
+
+def read_lock_record(lock: Path) -> dict:
+    """Read a held lock, or say so. An unreadable lock is a failed read, not an absent holder."""
+    try:
+        text = lock.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ReadFailure(f"a branch lock exists at {lock} but could not be read: {exc}") from exc
+    try:
+        record = json.loads(text)
+    except json.JSONDecodeError:
+        # Do NOT treat this as unheld. Something created the file; who and why is unknown, and
+        # "unknown holder" must not be spelled the same as "no holder".
+        return {"run_id": None, "unreadable": True, "raw": text[:400]}
+    return record if isinstance(record, dict) else {"run_id": None, "unreadable": True}
+
+
+OWNERSHIP_FILE = "issue-flow-owner.json"
+
+
+def ownership_path(worktree: Path) -> Path:
+    """Where a worktree records which run owns it.
+
+    Inside the worktree's PRIVATE git admin directory, not the working tree: a marker committed by
+    accident, or shown as an untracked file in every `git status`, is a marker people delete. It is
+    also removed by `git worktree remove` along with everything else about that checkout, so a
+    clean removal cannot leave a stale claim behind.
+    """
+    text = run(["git", "rev-parse", "--path-format=absolute", "--git-dir"],
+               cwd=worktree).stdout.strip()
+    if not text:
+        raise ReadFailure(f"git did not report an admin directory for {worktree}")
+    return Path(text) / OWNERSHIP_FILE
+
+
+def read_ownership(worktree: Path) -> dict | None:
+    """The run that owns this checkout, `None` if it has never been marked, or a failed read.
+
+    The three answers are deliberately distinct. `None` means "no issue-flow run has claimed this
+    directory", which is a fact. An unreadable or malformed marker means the fact is UNKNOWN, and
+    the whole point of this file is that unknown may not be spelled like a permissive fact.
+    """
+    marker_file = ownership_path(worktree)
+    if not marker_file.exists():
+        return None
+    try:
+        record = json.loads(marker_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReadFailure(f"the ownership marker at {marker_file} could not be read: {exc}") from exc
+    if not isinstance(record, dict) or not isinstance(record.get("run_id"), str):
+        raise ReadFailure(f"the ownership marker at {marker_file} names no run")
+    return record
+
+
+def write_ownership(worktree: Path, run_id: str, issue: int, branch: str) -> dict:
+    record = {
+        "run_id": run_id,
+        "issue": issue,
+        "branch": branch,
+        "worktree": str(worktree),
+        "claimed_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    marker_file = ownership_path(worktree)
+    marker_file.parent.mkdir(parents=True, exist_ok=True)
+    marker_file.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return record
 
 
 WORKTREE_OBJECT_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
@@ -2293,22 +2709,117 @@ def registered_worktrees(cwd: Path) -> dict[str, str | None]:
             for record in parse_worktree_registry(text)}
 
 
-def cmd_start_branch(args, config, cwd) -> dict:
-    """Create the branch server-side (already linked to the issue), then an isolated worktree.
+DEVELOP_TIMEOUT_SECONDS = 120
 
-    `gh issue develop` is one command that replaces branch creation AND recording: it branches
-    from the fresh base and links it in the issue's Development sidebar. A branch nobody can find
-    from the issue is work nobody can follow.
+LINKED_BRANCHES_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      linkedBranches(first: 100) { nodes { ref { name target { oid } } } }
+    }
+  }
+}
+"""
+
+
+def linked_branch_names(issue: int, cwd: Path) -> set[str]:
+    """The branches GitHub records in the issue's Development sidebar, or a failed read.
+
+    This is the read-back that turns an ambiguous `gh issue develop` into a fact. Every shape that
+    is not a complete answer is refused, because the caller uses "not in this set" to conclude the
+    link does not exist, and that conclusion may not rest on a response that simply omitted it.
+    """
+    owner, name = repo_identity(cwd)
+    data = gh_json(["api", "graphql", "-f", f"query={LINKED_BRANCHES_QUERY}",
+                    "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={issue}"], cwd=cwd)
+    if not isinstance(data, dict) or data.get("errors"):
+        raise ReadFailure("linked-branch GraphQL response is partial or malformed")
+    repository = ((data or {}).get("data") or {}).get("repository")
+    issue_node = repository.get("issue") if isinstance(repository, dict) else None
+    connection = (issue_node or {}).get("linkedBranches")
+    if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
+        raise ReadFailure("linked-branch response omitted the branch connection")
+    names = set()
+    for node in connection["nodes"]:
+        ref = (node or {}).get("ref") if isinstance(node, dict) else None
+        if not isinstance(ref, dict) or not isinstance(ref.get("name"), str):
+            raise ReadFailure("linked-branch response contains a malformed ref node")
+        names.add(ref["name"])
+    return names
+
+
+def develop_link(issue: int, branch: str, base: str, cwd: Path) -> dict:
+    """Link the branch natively, and never report an unread outcome as a known one.
+
+    `gh issue develop` is one command that replaces branch creation AND recording: it branches from
+    the fresh base and links it in the issue's Development sidebar. A branch nobody can find from
+    the issue is work nobody can follow.
+
+    What changed here is what a NONZERO exit means. It used to mean "not linked", and the run fell
+    straight through to creating the branch locally. But the command mutates two remotes at once —
+    a ref and a link — and its failures are not one thing: "a branch of that name already exists"
+    (the ordinary resume, where the link may well be present), a partial failure that created the
+    ref and not the link, and a connection that dropped after the server had already committed
+    both. Those three states are indistinguishable from the exit code, and the last two are
+    precisely the states where "not linked" is false.
+
+    So a nonzero exit and a timeout are treated identically: RE-READ the sidebar. The read decides.
+    If it says the branch is linked, this is the ordinary already-exists resume and the outcome is
+    success. If it conclusively says it is not, the caller may proceed without a native link. If
+    the read itself fails, that is exit `3`, not a verdict — and a timeout whose re-read is
+    inconclusive is an ambiguous WRITE, because the ref may exist on the server right now.
+    """
+    timed_out = False
+    try:
+        developed = run(["gh", "issue", "develop", str(issue), "--name", branch, "--base", base],
+                        cwd=cwd, check=False, timeout=DEVELOP_TIMEOUT_SECONDS)
+        if developed.returncode == 0:
+            return {"linked": True, "outcome": "created"}
+        detail = (developed.stderr or "").strip()[:400]
+    except Timeout as exc:
+        timed_out, detail = True, str(exc)
+
+    try:
+        linked = branch in linked_branch_names(issue, cwd)
+    except ReadFailure:
+        if timed_out:
+            # The wait expired AND the state is unreadable. The one thing that must not happen is
+            # reporting this as "nothing was created": the ref may exist on the server right now.
+            raise WriteFailure(
+                f"gh issue develop for {branch} timed out and its outcome could not be re-read: "
+                f"{detail}"
+            ) from None
+        raise
+
+    if linked:
+        return {"linked": True, "outcome": "already-linked", "detail": detail}
+    if timed_out:
+        raise WriteFailure(
+            f"gh issue develop for {branch} timed out; the sidebar shows no link, but a ref may "
+            f"still have been created — re-read `refs/remotes/origin/{branch}` before retrying"
+        )
+    return {"linked": False, "outcome": "not-linked", "detail": detail}
+
+
+def cmd_start_branch(args, config, cwd) -> dict:
+    """Reserve an isolated checkout LOCALLY, then link the branch on the remote.
+
+    The order is the point, and it is the reverse of what this command used to do. Every local
+    reservation that can fail — the branch lock, the path, the ownership marker, the worktree
+    itself — runs before the first remote mutation, so a run that loses the race, or finds a
+    stranger's directory, or cannot prove it owns its own, leaves NOTHING behind on GitHub. The
+    old order created a server-side branch and a sidebar link first and could then stop on the
+    local check, leaving remote state advertising work that no checkout was ever made for.
     """
     # A claim binds only what the tracker can see, so renew it before the first thing it cannot.
     # Nothing has been created yet, so standing down here costs one comment.
     do_verify_claim(args.issue, args.run_id, args.expect_state, cwd)
-    # Invalid protocol values must fail before `gh issue develop` can create remote state.
+    # Invalid protocol values must fail before anything creates state.
     marker("branch", run_id=args.run_id, branch=args.branch, base=args.base)
 
     template = args.worktree_root or cfg(config, "worktree location")
     if not template or template.lower() == "unset":
-        raise Stop(
+        raise ConfigDefect(
             {
                 "ok": False,
                 "reason": "no-worktree-location",
@@ -2317,99 +2828,183 @@ def cmd_start_branch(args, config, cwd) -> dict:
         )
 
     _, repo_name = repo_identity(cwd)
-    path = worktree_path(template, repo_name, args.branch, args.run_id, args.issue)
+    scoped, migrated = run_scoped_template(template)
+    path = worktree_path(scoped, repo_name, args.branch, args.run_id, args.issue)
+    legacy = (worktree_path(template, repo_name, args.branch, args.run_id, args.issue)
+              if migrated else None)
+    path = canonical_worktree_path(path)
 
-    # An existing path means one of three different things, and they are not interchangeable.
-    #
-    # This matters because the template is configurable. With `<run-id>` in it a path is unique per
-    # run, so ANY existing path is foreign. Without it — `<repo>/<branch>` — an existing path is
-    # usually your OWN branch's worktree, and refusing it would make every resume impossible while
-    # protecting against nothing: git already refuses a second checkout of a branch that is live
-    # elsewhere ("fatal: '<branch>' is already used by worktree at ..."), which is the collision
-    # that actually costs work.
-    #
-    # So the question is not "does it exist" but "is it MINE": a registered worktree for this exact
-    # branch is a resume; anything else is a stranger's tree or an orphan directory left by a dead
-    # run, and writing into either is the #58 failure.
-    resuming = False
-    if path.exists():
-        registered = registered_worktrees(cwd)
-        owner_branch = registered.get(normalise_path(path))
-        if owner_branch == args.branch:
-            resuming = True
-        else:
-            raise Stop(
-                {
-                    "ok": False,
-                    "reason": "worktree-path-occupied",
-                    "path": str(path),
-                    "occupied_by_branch": owner_branch,
-                    "action": "this directory is not a registered worktree for your branch — it is "
-                              "another checkout or an orphan from a dead run. Do NOT write into it; "
-                              "verify the holder, or remove the orphan first",
-                }
-            )
+    with branch_reservation(cwd, args.branch, args.run_id, args.issue):
+        # A branch-only template that ALREADY has a checkout is the migration's one hard case. The
+        # directory holds real work, it is registered, and it is not run-scoped — so it cannot be
+        # proven to belong to anybody. Silently starting a sibling beside it would leave two live
+        # checkouts of one branch, which is the failure. It stops, and the operator decides.
+        if legacy is not None and legacy.exists():
+            owner_branch = registered_worktrees(cwd).get(normalise_path(legacy))
+            if owner_branch is not None:
+                raise Stop(
+                    {
+                        "ok": False,
+                        "reason": "legacy-worktree-registered",
+                        "legacy_path": str(legacy),
+                        "run_scoped_path": str(path),
+                        "occupied_by_branch": owner_branch,
+                        "action": "your worktree template is branch-only, and a checkout from "
+                                  "before run-scoping is still registered at the legacy path. It "
+                                  "may hold unpushed work, so nothing here removes it. Follow "
+                                  "*Migrating a branch-only worktree* in bindings/github.md: "
+                                  "push or preserve its work, then `git worktree remove` it, then "
+                                  "re-run this command",
+                    }
+                )
 
-    developed = run(
-        ["gh", "issue", "develop", str(args.issue), "--name", args.branch, "--base", args.base],
-        cwd=cwd,
-        check=False,
-    )
-    linked = developed.returncode == 0
-    if not linked:
-        # Discover every remote branch before deciding this one is absent. Fetching only the base
-        # leaves a remote-only resumed branch invisible and restarts it from the base.
-        #
-        # `--` closes option parsing. Without it a branch name beginning with `-` is read as a
-        # flag: `git branch --force -D origin/main` deletes the branch literally named
-        # `origin/main` instead of creating one called `-D`. Nothing upstream validates the value,
-        # and this call runs with check=False, so the damage would be silent.
+        resuming = resolve_worktree_ownership(cwd, path, args)
+
+        # ---- local reservation, before any remote write ----------------------------------
         run(["git", "fetch", "origin"], cwd=cwd)
-
-        exists_local = run(
-            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{args.branch}"],
-            cwd=cwd, check=False,
-        ).returncode == 0
-        exists_remote = run(
-            ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{args.branch}"],
-            cwd=cwd, check=False,
-        ).returncode == 0
+        # Recorded BEFORE the remote mutation, because this is the base the branch is actually
+        # made from and the value every later "reviewed-base" claim inherits. Reading it after
+        # `gh issue develop` would record whatever the base had moved to by then — a value this
+        # branch was never built on, and one that would make the coherence check below compare
+        # the server's answer against itself.
+        base_sha = run(["git", "rev-parse", f"origin/{args.base}"], cwd=cwd).stdout.strip()
+        local_head = ref_object(cwd, f"refs/heads/{args.branch}")
+        remote_head = ref_object(cwd, f"refs/remotes/origin/{args.branch}")
         start_point = branch_start_point(
-            exists_local=exists_local, exists_remote=exists_remote,
+            exists_local=local_head is not None, exists_remote=remote_head is not None,
             branch=args.branch, base=args.base,
         )
         if start_point is not None:
-            run(["git", "branch", "--", args.branch, start_point],
-                cwd=cwd, writes=True)
+            # `--` closes option parsing. Without it a branch name beginning with `-` is read as a
+            # flag: `git branch --force -D origin/main` deletes the branch literally named
+            # `origin/main` instead of creating one called `-D`. Nothing upstream validates the
+            # value, so the damage would be silent.
+            run(["git", "branch", "--", args.branch, start_point], cwd=cwd, writes=True)
+        fresh = local_head is None and remote_head is None
 
-    if linked:
+        if not resuming:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            run(["git", "worktree", "add", "--", str(path), args.branch], cwd=cwd, writes=True)
+        ownership = write_ownership(path, args.run_id, args.issue, args.branch)
+
+        # ---- first remote mutation ------------------------------------------------------
+        develop = develop_link(args.issue, args.branch, args.base, cwd)
         run(["git", "fetch", "origin"], cwd=cwd)
-    if not resuming:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        run(["git", "worktree", "add", "--", str(path), args.branch], cwd=cwd, writes=True)
 
-    head = run(["git", "rev-parse", "HEAD"], cwd=path).stdout.strip()
-    base_sha = run(["git", "rev-parse", f"origin/{args.base}"], cwd=cwd).stdout.strip()
+        head = run(["git", "rev-parse", "HEAD"], cwd=path).stdout.strip()
+        published = ref_object(cwd, f"refs/remotes/origin/{args.branch}")
+        verdict = branch_identity_verdict(
+            fresh=fresh, local=head, remote=published, base=base_sha,
+            remote_reachable_from_local=(
+                None if published is None
+                else run(["git", "merge-base", "--is-ancestor", published, head],
+                         cwd=cwd, check=False).returncode == 0
+            ),
+        )
+        if not verdict["coherent"]:
+            raise Stop(
+                {
+                    "ok": False,
+                    "reason": verdict["reason"],
+                    "branch": args.branch,
+                    "local_head": head,
+                    "remote_head": published,
+                    "recorded_base": base_sha,
+                    "worktree": str(path),
+                    "action": "the local head, the published head and the recorded base do not "
+                              "tell one story — most likely the base moved while the branch was "
+                              "being created, or someone else pushed to it. Nothing was reported "
+                              "as delivered. Re-run this command to resume the branch as it now "
+                              "stands, or reconcile the heads by hand first",
+                }
+            )
 
-    with body_file(
-        f"Branch: `{args.branch}` (base `{args.base}` @ `{base_sha}`)\n"
-        f"Worktree: `{path}`\n"
-        f"Held by `{args.run_id}`.\n\n"
-        f"{marker('branch', run_id=args.run_id, branch=args.branch, base=base_sha)}\n"
-    ) as note:
-        run(["gh", "issue", "comment", str(args.issue), "--body-file", note], cwd=cwd, writes=True)
+        with body_file(
+            f"Branch: `{args.branch}` (base `{args.base}` @ `{base_sha}`)\n"
+            f"Worktree: `{path}`\n"
+            f"Held by `{args.run_id}`.\n\n"
+            f"{marker('branch', run_id=args.run_id, branch=args.branch, base=base_sha)}\n"
+        ) as note:
+            run(["gh", "issue", "comment", str(args.issue), "--body-file", note],
+                cwd=cwd, writes=True)
 
     return {
         "ok": True,
         "issue": args.issue,
         "branch": args.branch,
-        "natively_linked": linked,
+        "natively_linked": develop["linked"],
+        "link_outcome": develop["outcome"],
         "worktree": str(path),
+        "template_migrated": migrated,
         "resumed_existing_worktree": resuming,
+        "ownership": ownership,
         "head": head,
         "base_sha": base_sha,
+        "identity": verdict["reason"],
         "reminder": "gitignored files (.env, credentials, local settings) are NOT in a fresh worktree",
     }
+
+
+def resolve_worktree_ownership(cwd: Path, path: Path, args) -> bool:
+    """Decide resume versus refuse for an existing path, and require PROOF for resume.
+
+    An existing path means one of three different things, and they are not interchangeable: your
+    own checkout, a stranger's, or an orphan left by a dead run. The question is not "does it
+    exist" but "is it MINE", and that used to be answered by "the registry says this path holds
+    this branch" — which is not the same question. Two runs of the same branch satisfy it equally
+    well, and the second one then checks out on top of the first while it is writing.
+
+    So the registry answers only the first half, and a durable ownership marker written by the run
+    that created the checkout answers the second. Every outcome other than "the marker names me" is
+    a stop, including the marker being absent: a registered checkout of my branch with no marker is
+    an unproven claim, not a permissive default, and the recovery for it is documented rather than
+    guessed.
+    """
+    if not path.exists():
+        return False
+
+    owner_branch = registered_worktrees(cwd).get(normalise_path(path))
+    if owner_branch != args.branch:
+        raise Stop(
+            {
+                "ok": False,
+                "reason": "worktree-path-occupied",
+                "path": str(path),
+                "occupied_by_branch": owner_branch,
+                "action": "this directory is not a registered worktree for your branch — it is "
+                          "another checkout or an orphan from a dead run. Do NOT write into it; "
+                          "verify the holder, or remove the orphan first",
+            }
+        )
+
+    owner = read_ownership(path)
+    if owner is None:
+        raise Stop(
+            {
+                "ok": False,
+                "reason": "worktree-ownership-unproven",
+                "path": str(path),
+                "branch": args.branch,
+                "action": "this checkout carries your branch but no run has ever recorded owning "
+                          "it, so it cannot be told apart from a directory another run is using. "
+                          "Follow *Recovering a worktree or a branch lock* in bindings/github.md: "
+                          "preserve any work, prove no process is using it, remove it with "
+                          "`git worktree remove`, then re-run this command",
+            }
+        )
+    if owner.get("run_id") != args.run_id:
+        raise Stop(
+            {
+                "ok": False,
+                "reason": "worktree-owned-by-another-run",
+                "path": str(path),
+                "owner": owner,
+                "action": "another run owns this checkout. Do NOT write into it and do NOT delete "
+                          "it — it may hold unpushed work. Use a run-scoped worktree template so "
+                          "your run gets its own directory",
+            }
+        )
+    return True
 
 
 CLOSING_REFS_MAX_PAGES = 100
@@ -3185,6 +3780,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         result = COMMANDS[args.command](args, load_config(), cwd)
+    except ConfigDefect as defect:
+        # Ordered before `Stop` deliberately: `ConfigDefect` IS a `Stop`, so a broader handler
+        # first would swallow it and hand back exit 1 — the code that means "authority changed".
+        print(json.dumps(defect.payload, indent=2))
+        return 2
     except Stop as stop:
         print(json.dumps(stop.payload, indent=2))
         return 2 if stop.payload.get("reason") in {"invalid-operation-id", "invalid-horizon"} else 1
@@ -3197,6 +3797,18 @@ def main(argv: list[str] | None = None) -> int:
             "action": "fail closed: write nothing, retry the read. Do not treat this as a stop or a pass.",
         }, indent=2))
         return 3
+    except Timeout as failure:
+        # Only a call that passed an explicit `timeout` can reach here, and today every such call
+        # mutates. "It timed out" says nothing about whether the mutation landed, so the honest
+        # answer is the ambiguous-write instruction, never "it did not happen".
+        print(json.dumps({
+            "ok": False,
+            "reason": "ambiguous-write",
+            "detail": str(failure),
+            "action": "the command may have completed remotely after the wait expired — RE-READ "
+                      "the branch, link and refs before retrying. Do not assume it did nothing.",
+        }, indent=2))
+        return 5
     except WriteFailure as failure:
         print(json.dumps({
             "ok": False,
