@@ -2035,17 +2035,25 @@ def ledger_tables(text: str) -> dict:
         if line.startswith("## "):
             heading, header = line[3:].strip(), None
             continue
-        if not line.lstrip().startswith("|"):
+        # GitHub-Flavoured Markdown makes the LEADING pipe optional, so a row written without one
+        # renders inside the table exactly like its neighbours. Skipping on `startswith("|")` let
+        # such a row carry any verdict at all, unseen. Anything containing a pipe is treated as a
+        # candidate row and made to justify itself.
+        if "|" not in line:
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if all(c and set(c) <= set("-: ") for c in cells):
             continue                                    # the |---|---| separator
         lowered = [c.lower() for c in cells]
         if header is None:
-            # The status LEGEND sits above the first `##` and its body row's first cell reads
-            # "Old source retired", which any header test on cell text alone mistakes for a header.
+            # The status LEGEND is the one table above the first `##`, and its body row's first
+            # cell reads "Old source retired" — which any header test on cell text alone mistakes
+            # for a header. It is skipped BY NAME rather than by position: skipping everything
+            # above the first heading let a row hoisted up there disappear instead of raising.
             if heading is None:
-                continue
+                if lowered[0] in ("status", "owner copied", "old source retired"):
+                    continue
+                raise LedgerError(f"line {number}: a table row precedes the first section heading")
             if "old source retired" not in lowered:
                 raise LedgerError(f"line {number}: a table row precedes its header under {heading!r}")
             for title in ("old source retired", "owner copied"):
@@ -2069,16 +2077,27 @@ try:
                    for rows in LEDGER.values() for rid, copied, retired in rows]
     unfinished = sorted(rid for rid, copied, retired in ledger_rows
                         if copied != "yes" or retired != "yes")
-    shape = {name: len(rows) for name, rows in LEDGER.items()}
+    shape = {name: sorted(rid for rid, _, _ in rows) for name, rows in LEDGER.items()}
 except LedgerError as exc:
     unfinished, shape = [f"the ledger could not be parsed: {exc}"], {}
 check("the migration ledger records every row as copied and retired, in every table", unfinished, [])
-# Pinned rather than derived from the file, because a table that is DELETED takes its heading with
-# it — so any expectation read out of the ledger agrees with its own deletion. The four tables and
-# their sizes are this migration's shape, and a slice that legitimately changes them says so here.
-check("every ledger table is present, with the rows the migration accounted for", shape,
-      {"Current sections": 21, "Analyst issue template": 7,
-       "Named incidents and failure cases": 21, "Invariant families": 39})
+
+
+def ids(prefix, last):
+    return [f"{prefix}{n:02d}" for n in range(1, last + 1)]
+
+
+# Pinned by row IDENTITY, not by count, and stated here rather than derived from the file.
+#
+# Derived-from-the-file fails twice over: a table that is DELETED takes its heading with it, so any
+# expectation read out of the ledger agrees with its own deletion — and a count is satisfied by any
+# swap, so one row vanishing while another appears reads as no change at all. Identities are
+# immune to both, and these 88 IDs are the migration's actual shape; a slice that legitimately adds
+# or removes one has to say so on this line.
+check("every ledger table holds exactly the rows the migration accounted for", shape,
+      {"Current sections": ids("S", 21), "Analyst issue template": ids("T", 7),
+       "Named incidents and failure cases": sorted(ids("I", 11) + ids("X", 10)),
+       "Invariant families": ids("K", 39)})
 
 print()
 print(f"{CHECKS - len(FAILURES)}/{CHECKS} checks passed" + (f"; failures: {FAILURES}" if FAILURES else ""))

@@ -30,11 +30,13 @@ All notable changes to Issue Flow are documented here.
   that no ledger row is left uncopied or unretired, and the contract's exact line count. The ledger
   guard parses the tables by their column titles rather than matching row text, so cell padding,
   alignment, casing and extra columns cannot hide a row from it, and it refuses to guess: a row
-  wider or narrower than its header, a duplicated column title, a row above its header, or a row
-  with no id raises rather than being skipped, because a ledger that cannot be parsed is exactly
-  the state in which "no unretired rows found" is worthless. The set of tables and their row counts
-  is pinned explicitly, since a deleted table takes its heading with it and any expectation read
-  out of the ledger would agree with its own deletion.
+  wider or narrower than its header, a duplicated column title, a row preceding any header, and a
+  row with no id all raise rather than being skipped, because a ledger that cannot be parsed is
+  exactly the state in which "no unretired rows found" is worthless. A row is recognised without
+  its leading pipe, which GitHub-Flavoured Markdown allows and which otherwise renders identically
+  while being invisible to the guard. The tables and the identity of every row in them are pinned
+  explicitly rather than counted: a deleted table takes its heading with it, so an expectation read
+  out of the ledger would agree with its own deletion, and a count is satisfied by any swap.
 - Show `references/` and `assets/` in the README layout, since they now own most of the knowledge,
   and say why the always-loaded contract is short while its companions are not.
 
