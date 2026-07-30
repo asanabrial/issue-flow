@@ -12,7 +12,11 @@ All notable changes to Issue Flow are documented here.
   detailed review gate left standing for this slice were all already copied into
   `assets/analyst-issue-template.md`, `references/repository-delivery.md` and
   `references/safety-incidents.md`; each was verified present in its surviving owner before the
-  source was removed. `references/migration-inventory.md` now records every slice as retired.
+  source was removed. `references/migration-inventory.md` now records every row of all four of its
+  tables as retired — the named-incident and template rows cite subranges of the same text, so
+  flipping only the section rows would have left ten incidents claiming a source that no longer
+  exists. Repository instructions are named again (`AGENTS.md`, `CLAUDE.md`) in the delivery
+  fallback, and the citations that pointed into deleted headings now point at their new owners.
 - Keep the contract self-sufficient for the decisions a run makes on every activation. What a
   renewal's stop answer requires, what a failed read forbids, when a holder becomes reclaimable and
   what a reclaimer must preserve, and when work should be put down are decision gates rather than
@@ -20,8 +24,9 @@ All notable changes to Issue Flow are documented here.
   `References` section gives each companion an explicit load condition.
 - Add boundary tests for the contract itself: frontmatter completeness, the required section order,
   that every linked companion exists and every companion on disk is reachable, that the nine
-  invariants issue #7 requires remain directly actionable, that no retired heading reappears, and
-  that the ledger records no unretired slice.
+  invariants issue #7 requires remain directly actionable — searched in the body, so a rule cannot
+  be satisfied by the frontmatter that merely describes it — that no retired heading reappears, and
+  that no row of any ledger table still claims a live source.
 - Show `references/` and `assets/` in the README layout, since they now own most of the knowledge,
   and say why the always-loaded contract is short while its companions are not.
 

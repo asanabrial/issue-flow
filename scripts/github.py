@@ -6,7 +6,7 @@ WHY THIS FILE EXISTS
 `SKILL.md` and `bindings/github.md` already described every step below correctly, in prose,
 and runs still skipped them. The two incidents this script was written against:
 
-  * SKILL.md "Optional: a board view over this workflow" (2026-07-25, issues #61/#62) — a run
+  * Incident I11 in references/safety-incidents.md (2026-07-25, issues #61/#62) — a run
     moved labels correctly through the whole state machine, closed, merged and tagged, and
     mirrored the project board ZERO times in an entire session with the `project` scope present
     the whole way. Not a missing permission, not an unclear config: the instruction was present
@@ -38,7 +38,7 @@ would drift, which is the exact failure this file exists to remove.
 OUTPUT CONTRACT
 ---------------
 Every subcommand prints exactly one JSON object on stdout and nothing else. Exit codes carry the
-distinction `SKILL.md` calls "a failed read is not a failed answer":
+distinction this workflow calls "a failed read is not a failed answer":
 
   0  the operation completed AND its read-back verified
   1  STOP — a check answered "stop" (lost race, stand-down, wrong state, closed issue).

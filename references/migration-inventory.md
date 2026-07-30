@@ -37,13 +37,13 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 
 | ID | Current source | Final owner/path | Intentional-consolidation rationale | Owner copied | Old source retired |
 |---|---|---|---|---|---|
-| T01 | Description for dumb humans (`SKILL.md:391-402`) | `assets/analyst-issue-template.md` | Preserve the fixed heading, configured sentence language, and GitHub NOTE syntax. | yes | no |
-| T02 | Problem (`SKILL.md:404-406`) | `assets/analyst-issue-template.md` | Preserve the evidence-first problem contract verbatim. | yes | no |
-| T03 | Why it matters (`SKILL.md:408-410`) | `assets/analyst-issue-template.md` | Preserve explicit impact or honest low-impact disclosure. | yes | no |
-| T04 | Proposed approach (`SKILL.md:412-414`) | `assets/analyst-issue-template.md` | Preserve alternatives and uncertainty disclosure. | yes | no |
-| T05 | Acceptance criteria (`SKILL.md:416-418`) | `assets/analyst-issue-template.md` | Preserve measurable outcomes and non-change invariants. | yes | no |
-| T06 | Out of scope (`SKILL.md:420-422`) | `assets/analyst-issue-template.md` | Preserve the scope-creep boundary. | yes | no |
-| T07 | Evidence (`SKILL.md:424-431`) | `assets/analyst-issue-template.md` | Preserve reproducibility plus trailing attribution and analysis-marker placeholders. | yes | no |
+| T01 | Description for dumb humans (`SKILL.md:391-402`) | `assets/analyst-issue-template.md` | Preserve the fixed heading, configured sentence language, and GitHub NOTE syntax. | yes | yes |
+| T02 | Problem (`SKILL.md:404-406`) | `assets/analyst-issue-template.md` | Preserve the evidence-first problem contract verbatim. | yes | yes |
+| T03 | Why it matters (`SKILL.md:408-410`) | `assets/analyst-issue-template.md` | Preserve explicit impact or honest low-impact disclosure. | yes | yes |
+| T04 | Proposed approach (`SKILL.md:412-414`) | `assets/analyst-issue-template.md` | Preserve alternatives and uncertainty disclosure. | yes | yes |
+| T05 | Acceptance criteria (`SKILL.md:416-418`) | `assets/analyst-issue-template.md` | Preserve measurable outcomes and non-change invariants. | yes | yes |
+| T06 | Out of scope (`SKILL.md:420-422`) | `assets/analyst-issue-template.md` | Preserve the scope-creep boundary. | yes | yes |
+| T07 | Evidence (`SKILL.md:424-431`) | `assets/analyst-issue-template.md` | Preserve reproducibility plus trailing attribution and analysis-marker placeholders. | yes | yes |
 
 ## Named incidents and failure cases
 
@@ -53,21 +53,21 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | I02 | Five-minute loop nearly selected second work (`SKILL.md:444-460`) | `references/safety-incidents.md` | Preserve why self-held work is checked before queues. | yes | yes |
 | I03 | Issue #58 loser wrote into winner checkout (`SKILL.md:497-505`) | `references/safety-incidents.md` | Preserve the pre-filesystem claim-renewal incident. | yes | yes |
 | I04 | Dev marker attached only at close (`SKILL.md:510-516`) | `references/safety-incidents.md` | Preserve why attribution is projected during transition. | yes | yes |
-| I05 | Issue #58 shared worktree collision (`SKILL.md:656-664`) | `references/repository-delivery.md` | Preserve why worktree identity must prevent cross-run writes. | yes | no |
-| I06 | Five claims never transitioned (`SKILL.md:751-759`) | `references/safety-incidents.md` | Preserve the claim/transition partial-failure case. | yes | no |
-| I07 | Claim loser worked 48 minutes after adjudication (`SKILL.md:777-802`) | `references/safety-incidents.md` | Preserve why every heartbeat reads before writing. | yes | no |
-| I08 | Agent-team tasks left incomplete (`SKILL.md:761-766`) | `references/runtime-notes.md` | Preserve the external-session recovery limitation. | yes | no |
-| I09 | Wrong handoff state buried recoverable work (`SKILL.md:841-867`) | `references/safety-incidents.md` | Preserve why analysis, blocked, and review are distinct. | yes | no |
-| I10 | Long run repeated its documented `$?` mistake (`SKILL.md:887-900`) | `references/safety-incidents.md` | Preserve the evidence-based handoff threshold. | yes | no |
-| I11 | Issues #61/#62 never mirrored to the board (`SKILL.md:984-1005`) | `references/safety-incidents.md` | Preserve why transition verifies both state projections. | yes | no |
+| I05 | Issue #58 shared worktree collision (`SKILL.md:656-664`) | `references/repository-delivery.md` | Preserve why worktree identity must prevent cross-run writes. | yes | yes |
+| I06 | Five claims never transitioned (`SKILL.md:751-759`) | `references/safety-incidents.md` | Preserve the claim/transition partial-failure case. | yes | yes |
+| I07 | Claim loser worked 48 minutes after adjudication (`SKILL.md:777-802`) | `references/safety-incidents.md` | Preserve why every heartbeat reads before writing. | yes | yes |
+| I08 | Agent-team tasks left incomplete (`SKILL.md:761-766`) | `references/runtime-notes.md` | Preserve the external-session recovery limitation. | yes | yes |
+| I09 | Wrong handoff state buried recoverable work (`SKILL.md:841-867`) | `references/safety-incidents.md` | Preserve why analysis, blocked, and review are distinct. | yes | yes |
+| I10 | Long run repeated its documented `$?` mistake (`SKILL.md:887-900`) | `references/safety-incidents.md` | Preserve the evidence-based handoff threshold. | yes | yes |
+| I11 | Issues #61/#62 never mirrored to the board (`SKILL.md:984-1005`) | `references/safety-incidents.md` | Preserve why transition verifies both state projections. | yes | yes |
 | X01 | Codex rejects the slash skill sigil (`SKILL.md:27-34`) | `references/runtime-notes.md` | Consolidate runtime invocation differences. | yes | yes |
 | X02 | Unknown labels fail at issue creation (`SKILL.md:121-125,967-971`) | `references/safety-incidents.md` | Preserve why create/ensure operations provision labels first. | yes | yes |
 | X03 | Different priority scales cannot be globally ranked (`SKILL.md:130-141`) | `references/domain-composition.md` | Preserve partitioned selection semantics. | yes | yes |
 | X04 | Loading the wrong routing-arrow side applies the wrong job rules (`SKILL.md:277-287`) | `references/domain-composition.md` | Preserve explicit analyst/dev rule-book selection. | yes | yes |
 | X05 | Shell write access and teammate skill loading limits (`SKILL.md:352-364`) | `references/runtime-notes.md` | Consolidate runtime enforcement caveats. | yes | yes |
-| X06 | Fresh worktrees omit ignored credentials and settings (`SKILL.md:666-672`) | `references/repository-delivery.md` | Preserve environment reuse requirements. | yes | no |
-| X07 | Rebase invalidates SHA evidence and shared refs (`SKILL.md:706-714`) | `references/repository-delivery.md` | Preserve the merge-by-default rationale. | yes | no |
-| X08 | Missing acceptance criteria invites a fabricated done bar (`SKILL.md:902-918`) | `references/safety-incidents.md` | Preserve the pre-build criteria gate. | yes | no |
+| X06 | Fresh worktrees omit ignored credentials and settings (`SKILL.md:666-672`) | `references/repository-delivery.md` | Preserve environment reuse requirements. | yes | yes |
+| X07 | Rebase invalidates SHA evidence and shared refs (`SKILL.md:706-714`) | `references/repository-delivery.md` | Preserve the merge-by-default rationale. | yes | yes |
+| X08 | Missing acceptance criteria invites a fabricated done bar (`SKILL.md:902-918`) | `references/safety-incidents.md` | Preserve the pre-build criteria gate. | yes | yes |
 | X09 | Human-decision blockers become abandoned (`SKILL.md:937-958`) | `references/safety-incidents.md` | Preserve precise exit-condition and discharger requirements. | yes | yes |
 | X10 | Parallel A/B died from machine contention (`SKILL.md:1053-1060`) | `references/runtime-notes.md` | Preserve resource-coordination and sequential-rerun guidance. | yes | yes |
 

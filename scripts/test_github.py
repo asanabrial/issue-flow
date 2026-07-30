@@ -1972,18 +1972,24 @@ check("every companion on disk is reachable from the contract",
       sorted(on_disk - linked - {"references/migration-inventory.md"}), [])
 
 # The nine invariants issue #7 requires to stay DIRECTLY actionable in the contract itself.
+#
+# Searched in the BODY, not the whole file. Two of these first matched the frontmatter
+# `description` and the binding operations list instead of the rules they name, so gutting the Hard
+# Rule left them green — a test that reports on a sentence nobody has to obey. The body begins at
+# the first `##` heading.
+BODY = SKILL[SKILL.index("## Activation Contract"):]
 for name, needle in [
     ("analyst repository read-only", "read-only for the repository"),
-    ("at most one finding", "at most one evidenced issue"),
+    ("at most one finding", "files at most one evidenced issue"),
     ("state exclusivity", "Keep exactly one of"),
-    ("claim verification and renewal", "verify_claim"),
+    ("claim verification and renewal", "Run `verify_claim` before the first repository write"),
     ("stale-work recovery", "Reclaimable from"),
     ("isolated repository work", "isolated checkout"),
     ("independent SHA-bound review", "every push invalidates both"),
     ("verified tracker projections", "read back"),
     ("immutable delivery gates", "annotated tag"),
 ]:
-    check(f"the contract still states {name} directly", needle in SKILL, True)
+    check(f"the contract still states {name} directly", needle in BODY, True)
 
 # The ledger and the contract must agree. A row marked retired whose heading is still in SKILL.md
 # is the exact bookkeeping lie the ledger exists to prevent.
@@ -1991,8 +1997,16 @@ retired_headings = ["What the analyst produces", "Working in a repository", "Aba
                     "Where to put work you cannot finish", "Optional: a board view"]
 check("no retired section heading survives in the contract",
       [h for h in retired_headings if h in SKILL], [])
-check("the migration ledger records every slice as retired",
-      re.findall(r"^\| S\d\d \|.*\| (no) \|\s*$", INVENTORY, re.M), [])
+# EVERY row id, not just `S`. The ledger has four tables — sections, template parts, named
+# incidents and failure cases — and the incident rows cite SUBRANGES of the same `SKILL.md` text
+# the section rows cite. A guard anchored on `S` alone reported a clean ledger while eighteen rows,
+# ten of them named incidents, still claimed their source was live. That is the precise failure the
+# ledger exists to prevent, committed by the ledger's own guard.
+check("the migration ledger records every row as retired, in every table",
+      re.findall(r"^\| ([TIXS]\d\d) \|.*\| no \|\s*$", INVENTORY, re.M), [])
+check("the ledger guard actually covers all four tables",
+      sorted({rid[0] for rid in re.findall(r"^\| ([TIXS]\d\d) \|", INVENTORY, re.M)}),
+      ["I", "S", "T", "X"])
 
 print()
 print(f"{CHECKS - len(FAILURES)}/{CHECKS} checks passed" + (f"; failures: {FAILURES}" if FAILURES else ""))

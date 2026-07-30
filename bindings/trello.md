@@ -95,7 +95,7 @@ GET /members/me?key=<key>&token=<token>
 | `list_state` | `GET /lists/<state>/cards?fields=id,idShort,shortLink,name,idMembers,dateLastActivity,labels` then keep those with an empty `idMembers` |
 | `claim` | `POST /cards/{id}/idMembers` with your member id, write the claim comment, then **read the `commentCard` actions** — an earlier claim than yours means you lost. Re-reading `idMembers` catches the race only when every agent is a distinct member |
 | `reclaim` | unsupported / fail-closed |
-| `verify_claim` | one read — `GET /cards/{id}?fields=idList,closed&actions=commentCard` — then three checks, any failed check is a stop instruction, not a retry: `closed` is false (archived is Trello's killed); the card is in the list you are working under; and no `commentCard` action created after your own claim comment names your run-id in a stand-down, reclaim or adjudication. Semantics in `SKILL.md`, *A heartbeat is a claim renewal* |
+| `verify_claim` | one read — `GET /cards/{id}?fields=idList,closed&actions=commentCard` — then three checks, any failed check is a stop instruction, not a retry: `closed` is false (archived is Trello's killed); the card is in the list you are working under; and no `commentCard` action created after your own claim comment names your run-id in a stand-down, reclaim or adjudication. Semantics in `references/safety-incidents.md`, *Renewal and reclaim procedure* |
 | `heartbeat` | unsupported / fail-closed |
 | `transition` | `PUT /cards/{id}?idList=<target list>` — single field, nothing to remove |
 | `comment` | `POST /cards/{id}/actions/comments?text=<text>` |

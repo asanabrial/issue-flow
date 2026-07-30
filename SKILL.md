@@ -77,7 +77,7 @@ into this file. Each owns its subject once, so a rule that changes is changed in
 |---|---|
 | [domain composition](references/domain-composition.md) | A finding is handed over or routed, a priority scale must be validated, a queue is partitioned, or no domain applies and the autonomous `general` contract is needed. |
 | [repository delivery](references/repository-delivery.md) | The repository's own rules do not fully define isolation, integration, review-unit sizing, or cleanup — the default fallback for repository work. |
-| [safety incidents](references/safety-incidents.md) | Claim, reclaim, handoff, board-projection, or failure rationale is needed, or an incident's evidence must be cited. It is the ledger of *why*; the rules it justifies are already above. |
+| [safety incidents](references/safety-incidents.md) | Claim, reclaim, handoff, board-projection, or failure rationale is needed; a claimed issue turns out to have no acceptance criteria; or an incident's evidence must be cited. It is the ledger of *why*; the rules it justifies are already above. |
 | [runtime notes](references/runtime-notes.md) | Invocation sigils, delegation, independent-context acquisition, agent-team lifetime, or a runtime's honest limits are in question. |
 | [analyst issue template](assets/analyst-issue-template.md) | Filling a new finding's body. It owns the heading order, the fixed first heading, alert syntax, attribution, and the machine marker. |
 

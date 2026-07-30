@@ -28,8 +28,10 @@ never waives exact-SHA review, tests, CI, authority checks, or any stricter repo
 
 ## Start from a fresh base
 
-1. Read the repository instructions before choosing branch, worktree, integration, test, or merge
-   behavior. History can reveal naming style, but it cannot define concurrency safety.
+1. Read the repository instructions — conventionally `AGENTS.md` or `CLAUDE.md` at the root, plus
+   anything they include — before choosing branch, worktree, integration, test, or merge behavior.
+   **The repository's own rules win, always**, and this document is only the fallback for what they
+   do not define. History can reveal naming style, but it cannot define concurrency safety.
 2. Fetch the configured base and create the issue branch from that fresh remote revision. Record the
    branch and base through the selected binding as soon as they exist.
 3. Do not edit or commit on the base branch. Move unpublished accidental commits to the issue branch;

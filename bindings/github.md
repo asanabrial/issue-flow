@@ -30,7 +30,8 @@ prose does (the block between the config markers in `SKILL.md`, overridden by `o
 so it never becomes a third source of truth. `python <skill>/scripts/github.py config` prints what it
 resolved — run it once if you are unsure what the board or worktree row currently says.
 
-**Exit codes carry the distinction `SKILL.md` calls *a failed read is not a failed answer*:**
+**Exit codes carry the distinction this workflow calls *a failed read is not a failed answer* —
+stated as a decision gate in `SKILL.md` and evidenced in `references/safety-incidents.md`:**
 
 | Exit | Meaning | What you do |
 |---|---|---|
