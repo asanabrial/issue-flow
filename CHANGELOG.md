@@ -12,11 +12,12 @@ All notable changes to Issue Flow are documented here.
   detailed review gate left standing for this slice were all already copied into
   `assets/analyst-issue-template.md`, `references/repository-delivery.md` and
   `references/safety-incidents.md`; each was verified present in its surviving owner before the
-  source was removed. `references/migration-inventory.md` now records every row of all four of its
-  tables as retired — the named-incident and template rows cite subranges of the same text, so
-  flipping only the section rows would have left ten incidents claiming a source that no longer
+  source was removed. `references/migration-inventory.md` now records every row of every table as
+  retired — sections, template parts, named incidents and failure cases, and invariant families.
+  The later tables cite subranges of the same text, so flipping only the section rows would have
+  left ten named incidents and thirty-nine invariant families claiming a source that no longer
   exists. Repository instructions are named again (`AGENTS.md`, `CLAUDE.md`) in the delivery
-  fallback, and the citations that pointed into deleted headings now point at their new owners.
+  fallback, and every citation that pointed into a deleted heading now points at its new owner.
 - Keep the contract self-sufficient for the decisions a run makes on every activation. What a
   renewal's stop answer requires, what a failed read forbids, when a holder becomes reclaimable and
   what a reclaimer must preserve, and when work should be put down are decision gates rather than
@@ -26,7 +27,9 @@ All notable changes to Issue Flow are documented here.
   that every linked companion exists and every companion on disk is reachable, that the nine
   invariants issue #7 requires remain directly actionable — searched in the body, so a rule cannot
   be satisfied by the frontmatter that merely describes it — that no retired heading reappears, and
-  that no row of any ledger table still claims a live source.
+  that no row of any ledger table still claims a live source. The ledger guard matches rows by
+  shape rather than by an allowlist of ID letters, and a second check pins that no verdict-bearing
+  row escapes it, so a table added later cannot be silently outside its scope.
 - Show `references/` and `assets/` in the README layout, since they now own most of the knowledge,
   and say why the always-loaded contract is short while its companions are not.
 

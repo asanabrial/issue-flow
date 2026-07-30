@@ -1997,16 +1997,25 @@ retired_headings = ["What the analyst produces", "Working in a repository", "Aba
                     "Where to put work you cannot finish", "Optional: a board view"]
 check("no retired section heading survives in the contract",
       [h for h in retired_headings if h in SKILL], [])
-# EVERY row id, not just `S`. The ledger has four tables — sections, template parts, named
-# incidents and failure cases — and the incident rows cite SUBRANGES of the same `SKILL.md` text
-# the section rows cite. A guard anchored on `S` alone reported a clean ledger while eighteen rows,
-# ten of them named incidents, still claimed their source was live. That is the precise failure the
-# ledger exists to prevent, committed by the ledger's own guard.
+# Every row of every table, discovered by SHAPE rather than by an enumerated set of ID letters.
+#
+# This guard has now been wrong twice, the same way each time. It first anchored on `^\| S\d\d \|`
+# and reported a clean ledger while eighteen template and incident rows still claimed a source that
+# had been deleted. Widened to `[TIXS]`, it reported a clean ledger while all thirty-nine rows of
+# the invariant-families table — the table issue #7's criterion 5 actually names — said the same.
+#
+# An allowlist of ID letters cannot find the table nobody remembered, and a companion check that
+# asserts "all four tables are covered" using that same allowlist proves nothing: it derives its
+# coverage claim from the thing it is meant to audit. So the row pattern is structural — any
+# `| <id> | … | yes/no | yes/no |` line is a ledger row — and its completeness is pinned against a
+# second, independent shape: every line that ENDS in a yes/no verdict pair must have been read.
+# A future table with a different ID convention fails that comparison instead of hiding behind it.
+LEDGER_ROW = re.compile(r"^\| (\w+\d\d) \|.*\| (?:yes|no) \| (yes|no) \|\s*$", re.M)
+VERDICT_LINE = re.compile(r"^\|.*\| (?:yes|no) \| (?:yes|no) \|\s*$", re.M)
 check("the migration ledger records every row as retired, in every table",
-      re.findall(r"^\| ([TIXS]\d\d) \|.*\| no \|\s*$", INVENTORY, re.M), [])
-check("the ledger guard actually covers all four tables",
-      sorted({rid[0] for rid in re.findall(r"^\| ([TIXS]\d\d) \|", INVENTORY, re.M)}),
-      ["I", "S", "T", "X"])
+      [rid for rid, retired in LEDGER_ROW.findall(INVENTORY) if retired == "no"], [])
+check("no ledger row escapes that guard's row pattern",
+      len(LEDGER_ROW.findall(INVENTORY)), len(VERDICT_LINE.findall(INVENTORY)))
 
 print()
 print(f"{CHECKS - len(FAILURES)}/{CHECKS} checks passed" + (f"; failures: {FAILURES}" if FAILURES else ""))

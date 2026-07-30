@@ -11,7 +11,8 @@ and runs still skipped them. The two incidents this script was written against:
     mirrored the project board ZERO times in an entire session with the `project` scope present
     the whole way. Not a missing permission, not an unclear config: the instruction was present
     and the run never executed it.
-  * SKILL.md "Abandoned work" — five issues claimed and commented, none ever relabeled, because
+  * Incident I06 in references/safety-incidents.md — five issues claimed and commented, none ever
+    relabeled, because
     `claim` and `transition` are two separate calls and nothing forced the second.
 
 Prose cannot fix a run that does not execute prose. Everything here is a step that is
@@ -1418,9 +1419,9 @@ def do_verify_claim(issue: int, run_id: str, expect_state: str, cwd: Path,
                     allow_closed_by_pr: int | None = None) -> dict:
     """One ownership read, four checks. A failed CHECK is a stop; a failed READ is nothing.
 
-    That distinction is the whole point: SKILL.md records a run that lost a claim race by five
-    seconds, was told so 33 seconds later, and then worked another ~48 minutes because nothing in
-    its heartbeat loop ever read the timeline again.
+    That distinction is the whole point: incident I07 in references/safety-incidents.md records a
+    run that lost a claim race by five seconds, was told so 33 seconds later, and then worked
+    another ~48 minutes because nothing in its heartbeat loop ever read the timeline again.
 
     `allow_closed_by_pr` exists for exactly one moment: the renewal that runs immediately before
     `close`, after your own merge. Under `gh issue develop` the merge auto-closes the issue, so a

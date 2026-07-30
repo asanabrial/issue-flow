@@ -5,7 +5,7 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 | Status | Meaning |
 |---|---|
 | Owner copied | This migration has copied the complete knowledge into its planned final owner. |
-| Old source retired | The corresponding text has been removed from its current `SKILL.md` location. |
+| Old source retired | The corresponding baseline text has been removed from its `SKILL.md` location. Where the final owner IS `SKILL.md`, the verbose baseline is gone and only the condensed runtime rule remains. |
 
 ## Current sections
 
@@ -75,42 +75,42 @@ This ledger prevents the issue #7 refactor from silently deleting policy, ration
 
 | ID | Invariant family | Final owner/path | Intentional-consolidation rationale | Owner copied | Old source retired |
 |---|---|---|---|---|---|
-| K01 | Bounded target is scope; local rules still apply. | `SKILL.md` | Activation must remain direct. | yes | no |
-| K02 | Analyst conditions are optional; no-condition runs discover autonomously. | `SKILL.md` | Preserve valid standalone invocation. | yes | no |
-| K03 | Review uses a context that did not write the change. | `SKILL.md` | Keep independence non-negotiable. | yes | no |
-| K04 | Transport and business rules remain separate owners. | `references/domain-composition.md` | Prevent domain/tracker coupling. | yes | no |
-| K05 | Analyst findings carry identity, title, priority, body, metadata, and domain. | `references/domain-composition.md` | Preserve complete handoff data. | yes | no |
-| K06 | Priority scales are declared, ordered only internally, and never globally compared. | `references/domain-composition.md` | Preserve deterministic mixed-domain selection. | yes | no |
-| K07 | Mechanical reversible operations use the selected binding executable. | `SKILL.md` | Prevent remembered-but-unexecuted steps. | yes | no |
-| K08 | Bindings declare unsupported capabilities and fail closed. | `SKILL.md` | Make transport gaps visible. | yes | no |
-| K09 | One stable run-id is reused for every write. | `references/domain-composition.md` | Preserve traceable ownership. | yes | no |
-| K10 | Runtime is a bounded label; run-id remains text. | `references/domain-composition.md` | Prevent unbounded label growth. | yes | no |
-| K11 | Dev markers track live holding and are removed on release, not delivery. | `references/domain-composition.md` | Preserve query correctness. | yes | no |
-| K12 | Domain label plus metadata arrow route each role to the correct rule book. | `references/domain-composition.md` | Prevent silent routing inference. | yes | no |
-| K13 | Analyst repository work is read-only and yields at most one issue. | `SKILL.md` | Keep the hard role boundary loaded. | yes | no |
-| K14 | Analyst drains analysis, then blocked, before new discovery. | `SKILL.md` | Preserve recovery-first queue order. | yes | no |
-| K15 | Analyst tool restrictions enforce the write boundary where possible. | `references/runtime-notes.md` | Consolidate runtime-specific enforcement. | yes | no |
-| K16 | Autonomous discovery deduplicates and files only the strongest evidenced finding. | `references/domain-composition.md` | Preserve the built-in domain bar. | yes | no |
-| K17 | The fixed NOTE is first and uses the configured sentence language. | `assets/analyst-issue-template.md` | Give the body contract one owner. | yes | no |
-| K18 | Create carries every marker; incomplete analysis names a precise blocker. | `SKILL.md` | Preserve filing semantics. | yes | no |
-| K19 | A dev resumes self-held work before selecting another issue. | `SKILL.md` | Enforce one task per run. | yes | no |
-| K20 | Unassigned review work is selected before ready work. | `SKILL.md` | Finish published work first. | yes | no |
-| K21 | Claim ownership is timeline-adjudicated; earliest live claim wins. | `SKILL.md` | Preserve race resolution. | yes | no |
-| K22 | Claim is renewed before the first repository write and every irreversible boundary. | `SKILL.md` | Cap displaced-work cost. | yes | no |
-| K23 | Ready transitions once to in-progress with the dev marker and no duplicate claim. | `SKILL.md` | Preserve state and race evidence. | yes | no |
-| K24 | Issue criteria plus routed domain and repository rules define done. | `SKILL.md` | Prevent invented implementation scope. | yes | no |
-| K25 | Review target is published before transition to review. | `SKILL.md` | Bind review to shared bytes. | yes | no |
-| K26 | Review and CI name exact head/base SHAs; every push invalidates both. | `SKILL.md` | Prevent stale verdicts. | yes | no |
-| K27 | Built but undeliverable work stays in review and is never bypassed. | `SKILL.md` | Preserve honest delivery state. | yes | no |
-| K28 | Merge only the reviewed/green head and verify delivered topology. | `SKILL.md` | Preserve reviewed history. | yes | no |
-| K29 | Version tags are immutable, remote-verified, and release-aware. | `SKILL.md` | Keep publication a delivery gate. | yes | no |
-| K30 | Base is read-only; each issue uses one branch and isolated worktree. | `references/repository-delivery.md` | Consolidate repository isolation. | yes | no |
-| K31 | Worktree paths cannot be shared; the path is unique per run, and a resume needs durable evidence this run owns the checkout — registration alone is not ownership. | `references/repository-delivery.md` | Preserve collision safety. | yes | no |
-| K32 | Fresh worktrees restore required ignored inputs and reuse the established environment. | `references/repository-delivery.md` | Prevent checkout-only failures. | yes | no |
-| K33 | Integrate current base and merge rather than rebase by default. | `references/repository-delivery.md` | Preserve SHA-bound evidence. | yes | no |
-| K34 | Horizons, read-before-write heartbeats, and reclaim retain prior work. | `references/safety-incidents.md` | Consolidate abandoned-work recovery. | yes | no |
-| K35 | Analysis, blocked, and review handoffs remain distinct and documented on the issue. | `references/safety-incidents.md` | Prevent recoverable work burial. | yes | no |
-| K36 | Acceptance criteria precede implementation; partial fixes never ship as complete. | `references/safety-incidents.md` | Preserve the done bar. | yes | no |
-| K37 | Exactly one workflow state exists; done is explicit before tracker closure. | `SKILL.md` | Keep state integrity direct. | yes | no |
-| K38 | Labels are authoritative; configured board projections are mirrored and read back. | `SKILL.md` | Preserve verified state projection. | yes | no |
-| K39 | Session teams and resource signals never replace durable tracker state. | `references/runtime-notes.md` | Consolidate runtime lifetime and machine-limit caveats. | yes | no |
+| K01 | Bounded target is scope; local rules still apply. | `SKILL.md` | Activation must remain direct. | yes | yes |
+| K02 | Analyst conditions are optional; no-condition runs discover autonomously. | `SKILL.md` | Preserve valid standalone invocation. | yes | yes |
+| K03 | Review uses a context that did not write the change. | `SKILL.md` | Keep independence non-negotiable. | yes | yes |
+| K04 | Transport and business rules remain separate owners. | `references/domain-composition.md` | Prevent domain/tracker coupling. | yes | yes |
+| K05 | Analyst findings carry identity, title, priority, body, metadata, and domain. | `references/domain-composition.md` | Preserve complete handoff data. | yes | yes |
+| K06 | Priority scales are declared, ordered only internally, and never globally compared. | `references/domain-composition.md` | Preserve deterministic mixed-domain selection. | yes | yes |
+| K07 | Mechanical reversible operations use the selected binding executable. | `SKILL.md` | Prevent remembered-but-unexecuted steps. | yes | yes |
+| K08 | Bindings declare unsupported capabilities and fail closed. | `SKILL.md` | Make transport gaps visible. | yes | yes |
+| K09 | One stable run-id is reused for every write. | `references/domain-composition.md` | Preserve traceable ownership. | yes | yes |
+| K10 | Runtime is a bounded label; run-id remains text. | `references/domain-composition.md` | Prevent unbounded label growth. | yes | yes |
+| K11 | Dev markers track live holding and are removed on release, not delivery. | `references/domain-composition.md` | Preserve query correctness. | yes | yes |
+| K12 | Domain label plus metadata arrow route each role to the correct rule book. | `references/domain-composition.md` | Prevent silent routing inference. | yes | yes |
+| K13 | Analyst repository work is read-only and yields at most one issue. | `SKILL.md` | Keep the hard role boundary loaded. | yes | yes |
+| K14 | Analyst drains analysis, then blocked, before new discovery. | `SKILL.md` | Preserve recovery-first queue order. | yes | yes |
+| K15 | Analyst tool restrictions enforce the write boundary where possible. | `references/runtime-notes.md` | Consolidate runtime-specific enforcement. | yes | yes |
+| K16 | Autonomous discovery deduplicates and files only the strongest evidenced finding. | `references/domain-composition.md` | Preserve the built-in domain bar. | yes | yes |
+| K17 | The fixed NOTE is first and uses the configured sentence language. | `assets/analyst-issue-template.md` | Give the body contract one owner. | yes | yes |
+| K18 | Create carries every marker; incomplete analysis names a precise blocker. | `SKILL.md` | Preserve filing semantics. | yes | yes |
+| K19 | A dev resumes self-held work before selecting another issue. | `SKILL.md` | Enforce one task per run. | yes | yes |
+| K20 | Unassigned review work is selected before ready work. | `SKILL.md` | Finish published work first. | yes | yes |
+| K21 | Claim ownership is timeline-adjudicated; earliest live claim wins. | `SKILL.md` | Preserve race resolution. | yes | yes |
+| K22 | Claim is renewed before the first repository write and every irreversible boundary. | `SKILL.md` | Cap displaced-work cost. | yes | yes |
+| K23 | Ready transitions once to in-progress with the dev marker and no duplicate claim. | `SKILL.md` | Preserve state and race evidence. | yes | yes |
+| K24 | Issue criteria plus routed domain and repository rules define done. | `SKILL.md` | Prevent invented implementation scope. | yes | yes |
+| K25 | Review target is published before transition to review. | `SKILL.md` | Bind review to shared bytes. | yes | yes |
+| K26 | Review and CI name exact head/base SHAs; every push invalidates both. | `SKILL.md` | Prevent stale verdicts. | yes | yes |
+| K27 | Built but undeliverable work stays in review and is never bypassed. | `SKILL.md` | Preserve honest delivery state. | yes | yes |
+| K28 | Merge only the reviewed/green head and verify delivered topology. | `SKILL.md` | Preserve reviewed history. | yes | yes |
+| K29 | Version tags are immutable, remote-verified, and release-aware. | `SKILL.md` | Keep publication a delivery gate. | yes | yes |
+| K30 | Base is read-only; each issue uses one branch and isolated worktree. | `references/repository-delivery.md` | Consolidate repository isolation. | yes | yes |
+| K31 | Worktree paths cannot be shared; the path is unique per run, and a resume needs durable evidence this run owns the checkout — registration alone is not ownership. | `references/repository-delivery.md` | Preserve collision safety. | yes | yes |
+| K32 | Fresh worktrees restore required ignored inputs and reuse the established environment. | `references/repository-delivery.md` | Prevent checkout-only failures. | yes | yes |
+| K33 | Integrate current base and merge rather than rebase by default. | `references/repository-delivery.md` | Preserve SHA-bound evidence. | yes | yes |
+| K34 | Horizons, read-before-write heartbeats, and reclaim retain prior work. | `references/safety-incidents.md` | Consolidate abandoned-work recovery. | yes | yes |
+| K35 | Analysis, blocked, and review handoffs remain distinct and documented on the issue. | `references/safety-incidents.md` | Prevent recoverable work burial. | yes | yes |
+| K36 | Acceptance criteria precede implementation; partial fixes never ship as complete. | `references/safety-incidents.md` | Preserve the done bar. | yes | yes |
+| K37 | Exactly one workflow state exists; done is explicit before tracker closure. | `SKILL.md` | Keep state integrity direct. | yes | yes |
+| K38 | Labels are authoritative; configured board projections are mirrored and read back. | `SKILL.md` | Preserve verified state projection. | yes | yes |
+| K39 | Session teams and resource signals never replace durable tracker state. | `references/runtime-notes.md` | Consolidate runtime lifetime and machine-limit caveats. | yes | yes |
