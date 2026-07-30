@@ -363,10 +363,22 @@ A worktree directory that is itself a symlink or junction is refused as a config
 (`aliased-worktree-path`), since two run IDs pointing into one real directory defeats every rule
 above. An *ancestor* being a link — a worktree root parked on another volume, `/tmp` on macOS — is
 ordinary and is resolved rather than refused: it redirects every run's directory identically, so it
-cannot fold two runs together. The exception is an ancestor link that resolves the RUN-SCOPED part
-of the path away, which a leaf-only check cannot see; that is refused as `run-scope-lost-to-alias`,
-compared component-wise and case-folded exactly where the filesystem folds, because `realpath` on
-Windows restores each component's on-disk case and a fail-closed false positive is still one.
+cannot fold two runs together.
+
+**Two junctions that fold two runs together are caught, but not here — and the distinction is worth
+stating because three attempts to catch it here all shipped defects.** With a hand-written
+`…/<run-id>/checkout` template, links at `run-a` and `run-b` both pointing at one directory collapse
+two runs while every leaf resolves cleanly. That is not a property of one path: the other run's
+junction does not appear in your spelling, so no inspection of it can answer the question. Each
+heuristic that tried failed in a different direction — refusing a link that redirects every run
+identically, refusing a path that merely mentions the run ID twice, and failing open whenever the
+run ID happened to survive elsewhere in the path.
+
+What answers it is the layer that can see both runs. The registry is keyed on **resolved** paths, so
+the second run's lookup lands on the first run's checkout, and the ownership marker names the first
+run: `worktree-owned-by-another-run`, from evidence rather than inference, and a more accurate
+message than any path heuristic could have produced. A single path refuses only what a single path
+can prove — its own leaf being an alias.
 
 ### Nothing is created remotely until the local checkout is reserved
 

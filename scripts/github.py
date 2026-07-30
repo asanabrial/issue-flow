@@ -2258,7 +2258,7 @@ def worktree_path(template: str, repo: str, branch: str, run_id: str, issue: int
     return Path(resolved)
 
 
-def canonical_worktree_path(path: Path, run_id: str | None = None) -> Path:
+def canonical_worktree_path(path: Path) -> Path:
     """One real spelling for the run's directory, and a refusal when the directory itself is a link.
 
     Two separate jobs, because the two kinds of link are not the same problem.
@@ -2294,38 +2294,28 @@ def canonical_worktree_path(path: Path, run_id: str | None = None) -> Path:
                           "Remove the link, or point the worktree template at a real directory tree",
             }
         )
-    # The leaf check above covers a template whose run-scoped part IS the last component, which is
-    # every template this command produces. A hand-written `…/<run-id>/checkout` puts it in an
-    # ancestor, where a junction could redirect it while the leaf resolves cleanly — and the only
-    # symptom such a redirection cannot hide is that the run ID stops appearing in the real path.
+    # WHAT THIS DELIBERATELY DOES NOT TRY TO DO, and why the omission is the safer engineering.
     #
-    # The question is exactly that, and nothing narrower: **is the run ID still somewhere in the
-    # resolved path?** Two sharper-looking forms were tried and each was wrong in its own
-    # direction. Requiring the run ID to survive as a whole COMPONENT refuses `…/<w>/repo/fix-6~w`,
-    # where a junction at `w` redirects every run identically and the scope plainly survives inside
-    # the leaf. Counting occurrences refuses a path that merely mentions the run ID twice and
-    # resolves an unrelated one away. Substring containment asks the real question and has one
-    # residual, in the safe direction: a very short run ID may appear in the resolved path by
-    # coincidence, which makes the check permissive rather than refusing.
+    # A hand-written `…/<run-id>/checkout` template puts the run scope in an ANCESTOR, where two
+    # junctions — `run-a` and `run-b` both pointing at one directory — fold two runs together while
+    # every leaf resolves cleanly. Three successive attempts to detect that from the path alone
+    # each shipped a defect, in alternating directions: requiring the run ID to survive as a whole
+    # component refused `…/<wrun>/repo/fix-6~wrun`, where the link redirects every run identically
+    # and nothing is folded; counting occurrences refused a path that merely mentions the run ID
+    # twice; substring containment failed OPEN whenever the run ID happened to occur in the
+    # surviving prefix.
     #
-    # Case-folded where the filesystem folds, because `realpath` on Windows restores each
-    # component's ON-DISK case: an ancestor the operator created as `Run-A` would otherwise read as
-    # "the run scope disappeared" with no link present anywhere, and a fail-closed false positive
-    # is still a false positive.
-    if run_id and fold_case(run_id) in fold_case(str(path).replace("\\", "/")) \
-            and fold_case(run_id) not in fold_case(str(canonical).replace("\\", "/")):
-        raise ConfigDefect(
-            {
-                "ok": False,
-                "reason": "run-scope-lost-to-alias",
-                "path": str(path),
-                "resolves_to": str(canonical),
-                "run_id": run_id,
-                "action": "a link above this directory resolves the run-scoped part of the path "
-                          "away, so the real directory is not this run's own. Point the worktree "
-                          "template at a real directory tree",
-            }
-        )
+    # The reason none of them worked is that the property is not a property of one path. "Do two
+    # run IDs land in one directory" cannot be answered by looking at one run's spelling — the
+    # other run's junction is not in it. What CAN answer it is the layer that already exists:
+    # `registered_worktrees` is keyed on RESOLVED paths, so the second run's lookup finds the first
+    # run's checkout at the shared real directory, and the ownership marker names the first run.
+    # The second run is refused with `worktree-owned-by-another-run` — the accurate message, from
+    # evidence rather than inference. `resolve_worktree_ownership` carries this, and a test drives
+    # exactly this collapse through it.
+    #
+    # So this function refuses what a single path CAN prove — its own leaf being an alias — and
+    # leaves what only two paths can prove to the layer that can see both.
     return canonical
 
 
@@ -2938,7 +2928,7 @@ def cmd_start_branch(args, config, cwd) -> dict:
     path = worktree_path(scoped, repo_name, args.branch, args.run_id, args.issue)
     legacy = (worktree_path(template, repo_name, args.branch, args.run_id, args.issue)
               if migrated else None)
-    path = canonical_worktree_path(path, args.run_id)
+    path = canonical_worktree_path(path)
 
     with branch_reservation(cwd, args.branch, args.run_id, args.issue):
         # A branch-only template that ALREADY has a checkout is the migration's one hard case. The

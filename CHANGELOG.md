@@ -12,9 +12,10 @@ All notable changes to Issue Flow are documented here.
   in memory without rewriting `operator.local.md`, and a still-registered legacy checkout stops with
   migration guidance rather than being orphaned. The migrated sibling joins branch and run ID with
   `~`, which neither half can contain, so two different branches cannot compose onto one directory.
-  A worktree directory that is itself a symlink or junction is refused, and a link that resolves the
-  run-scoped part of the path away is refused, while an ordinary ancestor link is resolved rather
-  than rejected.
+  A worktree directory that is itself a symlink or junction is refused, while an ordinary ancestor
+  link is resolved rather than rejected — and two links that fold two runs onto one real directory
+  are caught by the resolved-path registry and the ownership marker, which can see both runs, rather
+  than by inspecting one run's path, which cannot.
 - Resume a checkout only against durable ownership evidence written by the run that created it.
   Branch and path equality no longer authorise a resume, and an unproven or foreign claim stops with
   documented recovery instead of being treated as a permissive default.
@@ -27,10 +28,9 @@ All notable changes to Issue Flow are documented here.
 - Re-read the Development sidebar instead of believing a nonzero or timed-out `gh issue develop`,
   and report an outcome that cannot be established as an ambiguous write. A truncated sidebar page
   can still prove the branch linked, but never prove it absent. Ref existence is probed with
-  `git for-each-ref` and
-  matched on the exact refname, so a real absence is told apart both from a failed read and from a
-  child ref that the pattern would otherwise match; a successful native creation must prove local
-  head, published head and recorded base agree before reporting success.
+  `git for-each-ref` and matched on the exact refname, so a real absence is told apart both from a
+  failed read and from a child ref that the pattern would otherwise match; a successful native
+  creation must prove local head, published head and recorded base agree before reporting success.
 - Return exit `2` for configuration and template defects, keeping exit `1` for authority loss, `3`
   for a failed read and `5` for an ambiguous write.
 - Document worktree and branch-lock recovery, branch-only template migration, and the existing

@@ -1881,46 +1881,38 @@ with tempfile_module.TemporaryDirectory() as root:
         aliased = f"this platform refused to create the link: {exc}"
     check("a run directory that is itself a link is refused", aliased, "aliased-worktree-path")
 
-    check("a path whose run scope survives is accepted",
-          m.same_location(m.canonical_worktree_path(real / "sub", "real"), real / "sub"), True)
+    check("an ancestor link is resolved rather than refused",
+          m.same_location(m.canonical_worktree_path(link / "sub"), real / "sub"), True)
 
-    # The run-scope check asks one question — is the run ID still SOMEWHERE in the resolved path —
-    # and the two sharper-looking forms tried before it were each wrong in a different direction.
-    # These three checks pin all three behaviours, because every previous form passed some of them.
-    #
-    # (a) The ancestor IS named after the run ID and IS a link, but the run ID also survives inside
-    #     the leaf. The link redirects every run identically — `fix-6~wrun` and `fix-6~other` stay
-    #     two directories under it — so nothing is folded together and refusing is a false
-    #     positive. Requiring the run ID to survive as a whole COMPONENT refuses exactly this.
-    run_link = Path(root) / "wrun"
+# The collapse a single path CANNOT prove, and the layer that can. Two junctions — `run-a` and
+# `run-b` both pointing at one directory — fold two runs together while every leaf resolves
+# cleanly, and no amount of inspecting ONE run's spelling can see the other run's junction. Three
+# path-only heuristics were tried here and each shipped a defect in a different direction.
+#
+# The registry is keyed on RESOLVED paths, so the second run's lookup finds the first run's
+# checkout at the shared real directory, and the ownership marker names the first run. This drives
+# exactly that collapse and asserts the accurate refusal, from evidence rather than inference.
+with tempfile_module.TemporaryDirectory() as root:
+    shared = Path(root) / "shared"
+    shared.mkdir()
+    clone = Clone(root)
     try:
-        run_link.symlink_to(real, target_is_directory=True)
-        survives_in_leaf = refused(
-            lambda: m.canonical_worktree_path(run_link / "repo" / "fix-6~wrun", "wrun"))
+        (Path(root) / "run-a").symlink_to(shared, target_is_directory=True)
+        (Path(root) / "run-b").symlink_to(shared, target_is_directory=True)
+        (shared / "fix-6").mkdir()
+        with patch.object(m, "run", clone.run):
+            m.write_ownership(shared / "fix-6", "run-a", 6, "fix/6")
+        # `run-b` computes `<root>/run-b/fix-6` — a different spelling of run-a's real directory.
+        # Its own path betrays nothing; the registry lookup resolves onto run-a's checkout.
+        with patch.multiple(m, run=clone.run, registered_worktrees=lambda _cwd: {
+                m.normalise_path(shared / "fix-6"): "fix/6"}):
+            collapsed = refused(lambda: m.resolve_worktree_ownership(
+                Path("."), m.canonical_worktree_path(Path(root) / "run-b" / "fix-6"),
+                SimpleNamespace(run_id="run-b", branch="fix/6")))
     except (OSError, NotImplementedError) as exc:
-        survives_in_leaf = f"this platform refused to create the link: {exc}"
-    check("a run scope surviving inside the leaf is not a resolved-away run scope",
-          survives_in_leaf, "accepted")
-
-    # (b) An on-disk case difference with NO link present anywhere. `realpath` on Windows restores
-    #     the on-disk spelling, so a case-sensitive comparison sees the run scope vanish and
-    #     refuses a legitimate configuration with exit 2. A fail-closed false positive is still one.
-    (Path(root) / "CASED" / "sub").mkdir(parents=True)
-    spelled = Path(root) / "cased" / "sub"
-    folds_case = spelled.exists()
-    check("an on-disk case difference is not mistaken for a resolved-away run scope",
-          refused(lambda: m.canonical_worktree_path(spelled, "cased")) if folds_case else "accepted",
-          "accepted")
-
-    # (c) The genuine defect it exists to catch: the run-scoped part is resolved away entirely.
-    lost = Path(root) / "alias" / "checkout"
-    try:
-        link.exists()
-        lost_verdict = refused(lambda: m.canonical_worktree_path(lost, "alias"))
-    except OSError as exc:
-        lost_verdict = f"this platform refused to create the link: {exc}"
-    check("a link that resolves the run scope out of the path entirely is refused",
-          lost_verdict, "run-scope-lost-to-alias")
+        collapsed = f"this platform refused to create the link: {exc}"
+    check("two junctions folding two runs into one checkout are caught by ownership, not by the path",
+          collapsed, "worktree-owned-by-another-run")
 
 print()
 print(f"{CHECKS - len(FAILURES)}/{CHECKS} checks passed" + (f"; failures: {FAILURES}" if FAILURES else ""))
