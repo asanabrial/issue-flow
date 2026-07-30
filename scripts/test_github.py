@@ -1881,17 +1881,24 @@ with tempfile_module.TemporaryDirectory() as root:
         aliased = f"this platform refused to create the link: {exc}"
     check("a run directory that is itself a link is refused", aliased, "aliased-worktree-path")
 
-    check("an ancestor link is resolved rather than refused",
-          m.same_location(m.canonical_worktree_path(link / "sub"), real / "sub"), True)
+    try:
+        ancestor_link = m.same_location(m.canonical_worktree_path(link / "sub"), real / "sub")
+    except m.Stop as stop:
+        ancestor_link = f"an ordinary ancestor link was refused: {stop.payload.get('reason')}"
+    except (OSError, NotImplementedError) as exc:
+        ancestor_link = f"this platform refused to create the link: {exc}"
+    check("an ancestor link is resolved rather than refused", ancestor_link, True)
 
 # The collapse a single path CANNOT prove, and the layer that can. Two junctions — `run-a` and
 # `run-b` both pointing at one directory — fold two runs together while every leaf resolves
 # cleanly, and no amount of inspecting ONE run's spelling can see the other run's junction. Three
 # path-only heuristics were tried here and each shipped a defect in a different direction.
 #
-# The registry is keyed on RESOLVED paths, so the second run's lookup finds the first run's
-# checkout at the shared real directory, and the ownership marker names the first run. This drives
-# exactly that collapse and asserts the accurate refusal, from evidence rather than inference.
+# What decides it is two steps, and the first is the load-bearing one: `canonical_worktree_path`
+# resolves both spellings to ONE string, so both runs hand the registry and `git worktree add` the
+# same key instead of two keys for one directory. The lookup then lands on the first run's checkout
+# and the ownership marker names the first run. Both steps are asserted below — the first directly,
+# because everything under it is asking about a path nobody registered if it does not hold.
 with tempfile_module.TemporaryDirectory() as root:
     shared = Path(root) / "shared"
     shared.mkdir()
@@ -1900,6 +1907,21 @@ with tempfile_module.TemporaryDirectory() as root:
         (Path(root) / "run-a").symlink_to(shared, target_is_directory=True)
         (Path(root) / "run-b").symlink_to(shared, target_is_directory=True)
         (shared / "fix-6").mkdir()
+        # The step everything downstream rests on, asserted directly: two aliased SPELLINGS of one
+        # directory canonicalise to one identical string. Without it the registry lookup and
+        # `git worktree add` are handed two different keys for one directory, and every layer below
+        # is asking about a path nobody has registered.
+        one_spelling = (m.canonical_worktree_path(Path(root) / "run-a" / "fix-6")
+                        == m.canonical_worktree_path(Path(root) / "run-b" / "fix-6"))
+    except m.Stop as stop:
+        # Reported rather than raised: a canonicaliser that refuses these paths outright is a
+        # failure of this check, and a crashing test says less than a failing one.
+        one_spelling = f"canonicalisation refused the path: {stop.payload.get('reason')}"
+    except (OSError, NotImplementedError) as exc:
+        one_spelling = f"this platform refused to create the link: {exc}"
+    check("two aliased spellings of one directory canonicalise to one string", one_spelling, True)
+
+    try:
         with patch.object(m, "run", clone.run):
             m.write_ownership(shared / "fix-6", "run-a", 6, "fix/6")
         # `run-b` computes `<root>/run-b/fix-6` — a different spelling of run-a's real directory.

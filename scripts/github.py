@@ -3097,8 +3097,9 @@ def resolve_worktree_ownership(cwd: Path, path: Path, args) -> bool:
                 "path": str(path),
                 "owner": owner,
                 "action": "another run owns this checkout. Do NOT write into it and do NOT delete "
-                          "it — it may hold unpushed work. Use a run-scoped worktree template so "
-                          "your run gets its own directory",
+                          "it — it may hold unpushed work. If your template is not run-scoped, "
+                          "make it so; if it is, then the two paths resolve to one real directory "
+                          "and a symlink or junction above them is aliasing your run onto theirs",
             }
         )
     return True

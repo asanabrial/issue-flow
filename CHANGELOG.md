@@ -13,9 +13,10 @@ All notable changes to Issue Flow are documented here.
   migration guidance rather than being orphaned. The migrated sibling joins branch and run ID with
   `~`, which neither half can contain, so two different branches cannot compose onto one directory.
   A worktree directory that is itself a symlink or junction is refused, while an ordinary ancestor
-  link is resolved rather than rejected — and two links that fold two runs onto one real directory
-  are caught by the resolved-path registry and the ownership marker, which can see both runs, rather
-  than by inspecting one run's path, which cannot.
+  link is resolved rather than rejected. Two links that fold two runs onto one real directory are
+  caught by resolving each path to a single canonical spelling — so both runs name one directory
+  to the registry instead of two — and then by the ownership marker, which names the run that got
+  there first. Inspecting one run's path cannot decide it: the other run's link is not in it.
 - Resume a checkout only against durable ownership evidence written by the run that created it.
   Branch and path equality no longer authorise a resume, and an unproven or foreign claim stops with
   documented recovery instead of being treated as a permissive default.

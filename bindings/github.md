@@ -345,7 +345,7 @@ marker that shows up in every `git status` is a marker people delete, and `git w
 clears it along with everything else about the checkout, so a clean removal cannot leave a stale
 claim behind.
 
-Four outcomes, and only one of them proceeds:
+Five outcomes, and only two of them proceed:
 
 | What is at the path | Outcome |
 |---|---|
@@ -374,11 +374,19 @@ heuristic that tried failed in a different direction — refusing a link that re
 identically, refusing a path that merely mentions the run ID twice, and failing open whenever the
 run ID happened to survive elsewhere in the path.
 
-What answers it is the layer that can see both runs. The registry is keyed on **resolved** paths, so
-the second run's lookup lands on the first run's checkout, and the ownership marker names the first
-run: `worktree-owned-by-another-run`, from evidence rather than inference, and a more accurate
-message than any path heuristic could have produced. A single path refuses only what a single path
-can prove — its own leaf being an alias.
+What answers it is two steps, and the first carries the weight. Each path is resolved to a **single
+canonical spelling**, so both runs hand the registry and `git worktree add` one key rather than two
+keys for one directory — without that, every layer below is asking about a path nobody registered.
+The lookup then lands on the first run's checkout and the ownership marker names the first run:
+`worktree-owned-by-another-run`, from evidence rather than inference, and a more accurate message
+than any path heuristic could have produced. A single path refuses only what a single path can
+prove — its own leaf being an alias.
+
+That refusal is exact for the case it names: the two runs are on ONE branch, so they share a branch
+lock and the second one arrives after the first has recorded ownership. Two runs on *different*
+branches take different locks, and a template that aliases them onto one directory is an operator
+misconfiguration rather than a race; the loser is refused by git's own checkout guard instead of by
+this one.
 
 ### Nothing is created remotely until the local checkout is reserved
 
